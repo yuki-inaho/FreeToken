@@ -142,6 +142,12 @@ class ModelCard(BaseModel):
     # (not []) when the model has no effort knob or the probe could not run.
     supported_reasoning_efforts: list[str] | None = None
     default_reasoning_effort: str | None = None
+    # Open WebUI reads this extension from OpenAI-compatible model cards. FreeToken
+    # supports a terminal streaming usage chunk, so advertise it without requiring
+    # every WebUI installation to create a duplicate custom-model override.
+    info: dict[str, Any] = Field(
+        default_factory=lambda: {"meta": {"capabilities": {"usage": True}}}
+    )
 
 
 class ModelList(BaseModel):

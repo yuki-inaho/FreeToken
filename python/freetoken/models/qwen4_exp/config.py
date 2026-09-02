@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from fnmatch import fnmatch
 from typing import Any, Tuple
 
@@ -40,6 +40,22 @@ class Qwen4ExpArgs:
     index_head_dim: int
     index_budget: int
     index_ratio: int
+    # MTP (multi-token-prediction) draft head, from ``text_config.mtp``. Zero layers means the
+    # checkpoint ships no head. The head is only built/loaded when mtp_load_enabled().
+    mtp_num_layers: int = 0
+    mtp_layer_types: Tuple[str, ...] = ()
+    mtp_use_dedicated_embeddings: bool = False
+    # Load-time FP8 of the checkpoint's bf16 dense linears (--dense-quant fp8): the selected
+    # parts (see models.config.DENSE_FP8_ALL_PARTS). Empty = the checkpoint's own dtypes.
+    dense_fp8_parts: Tuple[str, ...] = ()
+
+    def part_quant(self, part: str, quant: str) -> str:
+        """The quant mode a dense part is built/loaded with. ``quant`` is the checkpoint-
+        derived flag (attn_quant / dense_quant / lm_head_quant); under load-time FP8 only
+        the selected parts take it, the rest stay bf16."""
+        if not self.dense_fp8_parts:
+            return quant
+        return quant if part in self.dense_fp8_parts else "none"
 
     @property
     def index_topk_blocks(self) -> int:
@@ -91,6 +107,38 @@ def ple_slot_states(args: Qwen4ExpArgs) -> Tuple[SlotStateSpec, ...]:
             fill_value=float(args.ngram_boundary_token_id),
         ),
     )
+
+
+# Load-time FP8 targets by state-dict suffix, per part (the constructors build the matching
+# Fp8PerTensor* module for exactly these). ``mtp.*`` names are targets only under the ``mtp``
+# part; ``mtp.fc_*`` never.
+_DENSE_FP8_SUFFIXES: dict[str, tuple[str, ...]] = {
+    "gdn": (".linear_attn.in_proj_qkvz.weight", ".linear_attn.out_proj.weight"),
+    "attn": (".self_attn.qkv_proj.weight", ".self_attn.o_proj.weight"),
+    "index": (".self_attn.indexer.index_qk_proj.weight",),
+    "hc": (
+        ".input_mix_weight_down_block_inject.weight",
+        ".input_mix_weight_up.weight",
+        ".input_mix_weight_down.weight",
+    ),
+    "shared": (".mlp.shared_expert.gate_up_proj.weight", ".mlp.shared_expert.down_proj.weight"),
+    "ple": (".ple.key_proj.weight", ".ple.value_proj.weight"),
+}
+
+
+def dense_fp8_part_of(name: str, parts) -> str | None:
+    """Which FP8 part (if any) the state-dict tensor ``name`` belongs to under ``parts``."""
+    if not parts:
+        return None
+    if name == "lm_head.weight":
+        return "lm_head" if "lm_head" in parts else None
+    if name.startswith("mtp."):
+        if "mtp" not in parts or name.startswith("mtp.fc_"):
+            return None
+    for part, suffixes in _DENSE_FP8_SUFFIXES.items():
+        if part in parts and name.endswith(suffixes):
+            return part
+    return None
 
 
 def _quant_get(hf_config: Any):
@@ -179,6 +227,20 @@ def parse_config(hf_config: Any) -> ModelConfig:
             attn_quant = _quant(f"{prefix}.self_attn.q_proj")
             lm_head_quant = _quant("lm_head")
 
+    # --dense-quant fp8: upgrade the bf16 dense parts to per-channel FP8 quantized at load.
+    # Only ever upgrades "none" (a checkpoint-native quant is never overridden); the part
+    # set refines which modules take the flag (Qwen4ExpArgs.part_quant).
+    from freetoken.models.config import dense_fp8_parts
+
+    fp8_parts = dense_fp8_parts()
+    if fp8_parts:
+        if attn_quant == "none" and fp8_parts & {"gdn", "attn", "index"}:
+            attn_quant = "fp8_pertensor"
+        if dense_quant == "none" and fp8_parts & {"hc", "shared", "ple"}:
+            dense_quant = "fp8_pertensor"
+        if lm_head_quant == "none" and "lm_head" in fp8_parts:
+            lm_head_quant = "fp8_pertensor"
+
     layer_types = _layer_types(text)
     full_ids = tuple(i for i, t in enumerate(layer_types) if t == "full_attention")
     linear_ids = tuple(i for i, t in enumerate(layer_types) if t == "linear_attention")
@@ -233,6 +295,14 @@ def parse_config(hf_config: Any) -> ModelConfig:
     if isinstance(eos_token_id, (list, tuple)):
         eos_token_id = eos_token_id[0]
 
+    # ``text.mtp`` is a plain dict in shipped configs; tolerate an object for typed configs.
+    mtp = getattr(text, "mtp", None)
+    mtp_get = (mtp.get if isinstance(mtp, dict) else lambda k, d=None: getattr(mtp, k, d)) if mtp else (lambda k, d=None: d)
+    mtp_num_layers = int(
+        mtp_get("num_hidden_layers", getattr(text, "mtp_num_hidden_layers", 0) or 0) or 0
+    )
+    mtp_layer_types = tuple(mtp_get("layer_types", ()) or ())
+
     qwen4_args = Qwen4ExpArgs(
         hidden_size=text.hidden_size,
         hc_count=int(text.hc_count),
@@ -251,6 +321,10 @@ def parse_config(hf_config: Any) -> ModelConfig:
         index_head_dim=int(text.indexer_head_dim),
         index_budget=int(text.indexer_budget),
         index_ratio=int(text.indexer_compress_ratio),
+        mtp_num_layers=mtp_num_layers,
+        mtp_layer_types=mtp_layer_types,
+        mtp_use_dedicated_embeddings=bool(getattr(text, "mtp_use_dedicated_embeddings", False)),
+        dense_fp8_parts=tuple(sorted(fp8_parts)),
     )
 
     return ModelConfig(
@@ -290,4 +364,43 @@ def parse_config(hf_config: Any) -> ModelConfig:
     )
 
 
-__all__ = ["PLE_CONV_STATE", "PLE_NGRAM_STATE", "Qwen4ExpArgs", "parse_config", "ple_slot_states"]
+def extend_config_for_speculative(config: ModelConfig, num_draft_tokens: int) -> ModelConfig:
+    """Register the MTP draft layer for speculative decoding.
+
+    The MTP layer (id ``num_layers``) joins the full-attention group so the QSA backend, the
+    KV pool (13th slab + index tier) and ``is_linear_layer`` all resolve it; ``num_layers``
+    itself stays the main tower's count (it drives decoder construction and the MoE-offload
+    layer count). ``num_speculative_tokens`` sizes the QSA pending ring in both the pool
+    factory and the KV cost model.
+    """
+    if not config.qwen4_args.mtp_num_layers:
+        raise ValueError("this checkpoint ships no MTP head; speculative mtp is unavailable")
+    if num_draft_tokens < 1:
+        raise ValueError(f"num_draft_tokens must be >= 1, got {num_draft_tokens}")
+    mtp_layer_id = config.num_layers
+    groups = tuple(
+        replace(
+            g,
+            layer_ids=g.layer_ids + (mtp_layer_id,),
+            num_index_layers=g.num_index_layers + 1,
+        )
+        if isinstance(g, FullAttentionGroupConfig) and mtp_layer_id not in g.layer_ids
+        else g
+        for g in config.attention_groups
+    )
+    return replace(
+        config,
+        attention_groups=groups,
+        num_extra_kv_layers=1,
+        num_speculative_tokens=num_draft_tokens,
+    )
+
+
+__all__ = [
+    "PLE_CONV_STATE",
+    "PLE_NGRAM_STATE",
+    "Qwen4ExpArgs",
+    "extend_config_for_speculative",
+    "parse_config",
+    "ple_slot_states",
+]

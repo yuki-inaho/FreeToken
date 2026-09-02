@@ -30,6 +30,12 @@ class DetokenizeMsg(BaseTokenizerMsg):
     next_token: int
     finished: bool
     finish_reason: str | None = None
+    # Tokens emitted BEFORE ``next_token`` in the same step (speculative decoding emits a
+    # run per verify). ``next_token`` stays the run's LAST token, so the finished/eos/stop
+    # semantics keyed on it are unchanged. The detokenizer requires at most ONE message per
+    # uid per batch (its two-phase batch decode snapshots offsets), which is why a run must
+    # ride one message instead of several.
+    extra_tokens: list[int] | None = None
     # The stop string that ended generation (if any), so the detokenizer can trim it
     # and everything after it from the final output.
     matched_stop: str | None = None
@@ -48,6 +54,9 @@ class DetokenizeMsg(BaseTokenizerMsg):
     swa_total_tokens: int = 0
     # Bytes this engine process holds on the GPU (torch reserved pool). 0 on CPU.
     gpu_mem_bytes: int = 0
+    # Per-request engine telemetry (prefill/decode wall time, decode steps, speculative
+    # draft/accept counters); set on the finishing message only, else None.
+    engine_stats: dict | None = None
 
 
 @dataclass

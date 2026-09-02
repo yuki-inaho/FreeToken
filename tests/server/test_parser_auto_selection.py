@@ -94,3 +94,16 @@ def test_an_explicit_choice_beats_inference():
         pinned, _ = parse_args(["--model", ANON_PATH, "--reasoning-parser", "qwen3"])
     assert off.reasoning_parser is None
     assert pinned.reasoning_parser == "qwen3"
+
+
+def test_default_reasoning_effort_can_disable_checkpoint_default():
+    config = _Config({"architectures": ["Qwen4ExpForCausalLM"], "torch_dtype": "bfloat16"})
+    with patch("freetoken.utils.cached_load_hf_config", lambda _path: config):
+        off, _ = parse_args(
+            ["--model", ANON_PATH, "--default-reasoning-effort", "none"]
+        )
+        model_default, _ = parse_args(
+            ["--model", ANON_PATH, "--default-reasoning-effort", "model"]
+        )
+    assert off.default_reasoning_effort == "none"
+    assert model_default.default_reasoning_effort is None

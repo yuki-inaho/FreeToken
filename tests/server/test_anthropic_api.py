@@ -602,6 +602,31 @@ def test_convert_native_thinking_toggle():
     assert absent.chat_template_kwargs == {}
 
 
+def test_default_reasoning_effort_only_applies_without_native_thinking():
+    base = {
+        "model": "claude-x",
+        "max_tokens": 64,
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    plain = AnthropicMessagesRequest.model_validate(base)
+    spec = A.convert_anthropic_to_genspec(
+        plain, {}, default_reasoning_effort="none"
+    )
+    assert spec.chat_template_kwargs == {
+        "enable_thinking": False, "thinking_mode": "disabled"
+    }
+
+    enabled = AnthropicMessagesRequest.model_validate(
+        {**base, "thinking": {"type": "enabled", "budget_tokens": 1024}}
+    )
+    spec = A.convert_anthropic_to_genspec(
+        enabled, {}, default_reasoning_effort="none"
+    )
+    assert spec.chat_template_kwargs == {
+        "enable_thinking": True, "thinking_mode": "enabled"
+    }
+
+
 # --------------------------------------------------------------------------- #
 # /v1/messages/count_tokens (route + neutral count_prompt_tokens primitive)
 # --------------------------------------------------------------------------- #

@@ -369,3 +369,24 @@ def test_fused_topk_softmax_is_cuda_graph_capturable():
     torch.cuda.synchronize()
     assert (ids[:3] != -1).all()
     assert (ids[3:] == -1).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_moe_sum_reduce_addend(dtype):
+    from freetoken.kernel import moe_sum_reduce_triton
+
+    torch.manual_seed(0)
+    token_num, topk, hidden = 3, 10, 2560
+    ic3 = torch.randn(token_num, topk, hidden, device="cuda", dtype=dtype)
+    addend = torch.randn(token_num, hidden, device="cuda", dtype=dtype)
+    out = torch.empty(token_num, hidden, device="cuda", dtype=dtype)
+    plain = torch.empty_like(out)
+    moe_sum_reduce_triton(ic3, plain)
+    moe_sum_reduce_triton(ic3, out, addend=addend)
+    ref = (ic3.float().sum(1) + addend.float()).to(dtype)
+    torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(plain, ic3.float().sum(1).to(dtype), atol=2e-2, rtol=2e-2)
+    # the addend is folded in fp32 before the single downcast, so it equals plain + addend
+    # up to one rounding of the output dtype
+    torch.testing.assert_close(out.float(), (plain.float() + addend.float()), atol=3e-2, rtol=2e-2)

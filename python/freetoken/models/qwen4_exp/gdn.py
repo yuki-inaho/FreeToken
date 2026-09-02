@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn.functional as F
 from freetoken.core import get_global_ctx
@@ -8,8 +10,20 @@ from freetoken.layers import BaseOP, LinearColParallelMerged
 
 from freetoken.kernel.triton.fp8_block_linear import Fp8BlockColMerged
 from freetoken.kernel.triton.fp8_pertensor_linear import Fp8PerTensorColMerged
-from freetoken.models.qwen3_5_moe.gdn_kernels import gdn_decode_fla, gdn_prefill_chunk_fla
+from freetoken.models.qwen3_5_moe.gdn_kernels import (
+    gdn_decode_fla,
+    gdn_prefill_chunk_fla,
+    gdn_verify_fla,
+)
 from freetoken.models.quant_linear import make_replicated_quant
+
+# Speculative verify (one request, k+1 <= 4 tokens): the dedicated small-T causal conv
+# instead of the varlen prefill kernel (+ its transpose / reshape copies). Same numerics
+# class (fp32 accumulate, silu); FREETOKEN_GDN_SMALL_CONV=0 restores the varlen path.
+_SMALL_CONV = os.getenv("FREETOKEN_GDN_SMALL_CONV", "1") != "0"
+# Decode: the GDN in_proj_qkvz GEMV carries in_proj_ba as a second segment of the same launch
+# (fp8_pertensor_linear.rows_gemv_direct_pair). FREETOKEN_ROWS_GEMV_PAIR=0 restores the separate launches.
+_ROWS_GEMV_PAIR = os.getenv("FREETOKEN_ROWS_GEMV_PAIR", "1") != "0"
 
 
 _GATE_ACTIVATIONS = ("silu", "swish", "sigmoid")
@@ -171,17 +185,84 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
             batch.fla_metadata = fla
 
         if self._fp8:
-            qkvz = self.in_proj_qkvz.forward(hidden_states)
+            qkvz = None
+            ba = None
+            if _ROWS_GEMV_PAIR and total <= 4 and hidden_states.is_cuda:
+                # decode: qkvz (big DIRECT GEMV) and b|a (tiny partner) in ONE launch
+                from freetoken.kernel.triton.fp8_pertensor_linear import rows_gemv_direct_pair
+
+                pair = rows_gemv_direct_pair(
+                    self.in_proj_qkvz, hidden_states, None, self.in_proj_ba,
+                    ("split", self.num_v_heads, self.num_v_heads),
+                )
+                if pair is not None:
+                    qkvz, ba = pair
+            if qkvz is None:
+                qkvz = self.in_proj_qkvz.forward(hidden_states)
             conv_in, z = torch.split(qkvz, [self.conv_dim, self.value_dim], dim=-1)
-            ba = self.in_proj_ba.forward(hidden_states)
-            b, a = torch.split(ba, [self.num_v_heads, self.num_v_heads], dim=-1)
+            if ba is None and total <= 4 and hidden_states.is_cuda:
+                # decode: the rows GEMV writes b and a as two contiguous tensors (the
+                # recurrent kernels would otherwise copy the strided halves)
+                from freetoken.kernel.triton.fp8_pertensor_linear import rows_gemv_with_epilogue
+
+                ba = rows_gemv_with_epilogue(
+                    self.in_proj_ba, hidden_states, ("split", self.num_v_heads, self.num_v_heads)
+                )
+            if ba is not None:
+                b, a = ba
+            else:
+                ba = self.in_proj_ba.forward(hidden_states)
+                b, a = torch.split(ba, [self.num_v_heads, self.num_v_heads], dim=-1)
         else:
             proj = self.in_proj.forward(hidden_states)
             conv_in, z, b, a = torch.split(proj, self._in_proj_split, dim=-1)
         z = z.reshape(total, self.num_v_heads, self.head_v_dim)
         li = pool.local_index(self.layer_id)
 
-        if batch.is_decode:
+        if batch.is_decode and batch.spec is not None:
+            # Speculative verify: k+1 tokens through the same fused recurrent kernel, live
+            # recurrent state untouched (per-token intermediates recorded for the commit).
+            # The conv state advances in place to k+1 -- allowed, because SpecStateScratch
+            # stashes the pre-verify window + this step's raw inputs and the commit rewrites
+            # it to the accepted prefix.
+            scratch = batch.spec.scratch
+            small = (
+                _SMALL_CONV
+                and total <= 4
+                and fla.cache_indices.numel() == 1
+                and self.conv_kernel_size == 4
+                and conv_in.is_cuda
+            )
+            if small:
+                # One request, k+1 <= 4 tokens: the small-T conv writes q/k/v contiguously
+                # (no transpose in, no reshape copies out), refreshes the state in place and
+                # records the scratch's rollback stash (pre-verify window + raw inputs) in
+                # the same launch.
+                from freetoken.kernel.triton.gdn_small_conv import causal_conv1d_small_t
+
+                qf, kf, vf = causal_conv1d_small_t(
+                    conv_in, pool.conv_states[li], self._conv_weight(), fla.cache_indices,
+                    self.key_dim, self.value_dim,
+                    stash=(scratch.conv_pre[li], scratch.conv_in[li]),
+                )
+            else:
+                scratch.stash_gdn(li, pool.conv_states[li], fla.cache_indices, conv_in)
+                mixed = self._conv_prefill(
+                    conv_in, pool, fla.cu_seqlens, fla.cache_indices, fla.has_initial_state)
+                qf, kf, vf = torch.split(mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
+            q = qf.reshape(1, total, self.num_k_heads, self.head_k_dim).to(dtype)
+            k = kf.reshape(1, total, self.num_k_heads, self.head_k_dim).to(dtype)
+            v = vf.reshape(1, total, self.num_v_heads, self.head_v_dim).to(dtype)
+            core_out = gdn_verify_fla(
+                q, k, v, a, b, A_log=self.A_log, dt_bias=self.dt_bias,
+                state_source=pool.recurrent_states[li],
+                indices=fla.cache_indices.to(torch.int32),
+                cu_seqlens=fla.cu_seqlens.to(torch.int32),
+                intermediate_states=scratch.gdn_states[li],
+                intermediate_indices=scratch.gdn_state_indices,
+                scale=self.head_k_dim ** -0.5,
+            )
+        elif batch.is_decode:
             # Fused fla decode kernel: gating + in-kernel l2norm + recurrent update +
             # per-request state read/write-by-index, all in one kernel (no gather/scatter,
             # no clone, no external l2norm). q/k stay at num_k_heads (kernel handles GQA).

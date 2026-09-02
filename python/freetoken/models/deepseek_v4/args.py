@@ -69,14 +69,45 @@ class DeepseekV4Args:
     hc_sinkhorn_iters: int = 20
     hc_eps: float = 1e-6
 
+    # ----- DSpark block drafter (0731 checkpoints; ``mtp.{0..n_mtp_layers-1}.*``) -----
+    # One draft forward emits ``dspark_block_size`` tokens from the target's hidden states
+    # after ``dspark_target_layer_ids`` (see dspark.py). ``dspark_block_size == 0`` means the
+    # checkpoint ships no drafter (the preview's plain MTP layer is not supported).
+    dspark_block_size: int = 0
+    dspark_noise_token_id: int = 0
+    dspark_target_layer_ids: Tuple[int, ...] = ()
+    dspark_markov_rank: int = 256
+
+    # ----- runtime (set by extend_config_for_speculative) -----
+    # Window-only KV layers past ``n_layers``: the DSpark stages' draft KV over the main
+    # sequence (layer ids n_layers .. n_layers+k-1). Sizes the window tier ONLY; the
+    # compressed / indexer tiers and their state rings stay at ``n_layers``.
+    n_extra_window_layers: int = 0
+
     def __post_init__(self) -> None:
         # JSON lists -> tuple so the dataclass stays hashable / immutable-ish.
         if isinstance(self.compress_ratios, list):
             self.compress_ratios = tuple(self.compress_ratios)
+        if isinstance(self.dspark_target_layer_ids, list):
+            self.dspark_target_layer_ids = tuple(self.dspark_target_layer_ids)
 
     @property
     def nope_head_dim(self) -> int:
         return self.head_dim - self.rope_head_dim
+
+    @property
+    def dspark_enabled(self) -> bool:
+        """Whether the checkpoint ships a DSpark drafter (block size, stages and target layers)."""
+        return (
+            self.dspark_block_size > 0
+            and self.n_mtp_layers > 0
+            and len(self.dspark_target_layer_ids) > 0
+        )
+
+    @property
+    def n_window_layers(self) -> int:
+        """Layers with a window-tier KV pool: the main tower plus any DSpark stages."""
+        return self.n_layers + self.n_extra_window_layers
 
 
 def _config_path(model_path: str) -> str:

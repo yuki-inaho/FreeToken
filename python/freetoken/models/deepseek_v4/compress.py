@@ -362,6 +362,108 @@ class Compressor(nn.Module):
         )
         self.attn.scatter_compressed(self.layer_id, self.tier, cmp_dst, compressed.view(B, -1))
 
+    def verify_rows(
+        self, x: torch.Tensor, pos: torch.Tensor, prev_window_slot0: torch.Tensor,
+        window_slots: torch.Tensor, rows: torch.Tensor, intermediates: torch.Tensor,
+        boundary_row: int | None = None,
+    ) -> None:
+        """Speculative-verify compressor update: ``k1`` CONSECUTIVE tokens of ONE request in one
+        call (``x`` ``[k1, dim]``, ``pos`` ``[k1]`` = c..c+k). The batched ``decode_step`` cannot
+        serve this (every row would read the same pre-step ring block and the writes would
+        collide), so the rows are folded SEQUENTIALLY through one carry read at row 0's
+        previous page (``prev_window_slot0`` ``[1]``) -- exactly the per-row math of
+        ``decode_step`` chained -- and every row's post-fold carry block is stashed into
+        ``intermediates`` ``[k1, ring_size, 2*item]`` so :meth:`commit_carry` can re-point the
+        ring to the ACCEPTED prefix later. Completed blocks scatter to their arithmetic rows
+        (``rows`` = the verify snapshot rows, one per token), the rest to per-row scratch. The
+        chain's final carry is written to the last row's page (the accept-all case);
+        ``commit_carry`` overwrites it for shorter acceptances. ``boundary_row`` (the first
+        row on a new window page, if the rows cross one) also gets the old page its
+        pre-boundary carry -- what sequential decode leaves there and what a radix hit at the
+        boundary seeds from."""
+        assert self.cmp_pool is not None
+        k1 = x.size(0)
+        ratio, overlap, d, rd = self.compress_ratio, self.overlap, self.head_dim, self.rope_head_dim
+        dtype = x.dtype
+        item = self.item_size
+        x = x.view(k1, -1)
+        kv = bf16_linear_fp32(x, self.wkv.weight).view(k1, 1, item)
+        score = bf16_linear_fp32(x, self.wgate.weight).view(k1, 1, item)
+        idx_mod = pos % ratio  # [k1]
+        score = score + self.ape.index_select(0, idx_mod).view(k1, 1, item)
+        should = (pos + 1) % ratio == 0  # [k1]
+
+        block = self.attn.read_carry_blocks(  # [1, ring_size, 2*item]
+            self.layer_id, self.tier, prev_window_slot0.view(1), self.ring_size
+        )
+        ks = block[..., :item].clone()
+        ss = block[..., item:].clone()
+        outs = []
+        for i in range(k1):
+            kv_i, sc_i = kv[i : i + 1], score[i : i + 1]  # [1, 1, item]
+            sh_i = should[i].view(1, 1, 1)
+            if overlap:
+                wslot = (ratio + idx_mod[i : i + 1]).view(1, 1, 1).expand(1, 1, item)
+                ks.scatter_(1, wslot, kv_i)
+                ss.scatter_(1, wslot, sc_i)
+                kv_eff = torch.cat([ks[:, :ratio, :d], ks[:, ratio:, d:]], dim=1)
+                score_eff = torch.cat([ss[:, :ratio, :d], ss[:, ratio:, d:]], dim=1)
+                outs.append(gated_pool(kv_eff, score_eff, dtype))
+                ks[:, :ratio] = torch.where(sh_i, ks[:, ratio:], ks[:, :ratio])
+                ss[:, :ratio] = torch.where(sh_i, ss[:, ratio:], ss[:, :ratio])
+            else:
+                slot = idx_mod[i : i + 1].view(1, 1, 1).expand(1, 1, item)
+                ks.scatter_(1, slot, kv_i)
+                ss.scatter_(1, slot, sc_i)
+                outs.append(gated_pool(ks, ss, dtype))
+            intermediates[i].copy_(torch.cat([ks[0], ss[0]], dim=-1))
+        if boundary_row is not None and boundary_row >= 1:
+            self.attn.write_carry_blocks(
+                self.layer_id, self.tier, window_slots[boundary_row - 1 : boundary_row],
+                self.ring_size, intermediates[boundary_row - 1 : boundary_row],
+            )
+        self.attn.write_carry_blocks(
+            self.layer_id, self.tier, window_slots[-1:], self.ring_size,
+            torch.cat([ks, ss], dim=-1),
+        )
+
+        compressed = self.norm(torch.cat(outs, dim=0))  # [k1, 1, item]
+        freqs_t = self.freqs_cis.index_select(0, (pos + 1 - ratio).clamp_min(0))
+        apply_rotary_emb_decode(compressed[..., -rd:], freqs_t)
+        if self.rotate:
+            compressed = hadamard_transform(compressed)
+            fp4_act_quant_inplace(compressed, 32)
+        else:
+            act_quant_fp8_inplace(compressed[..., :-rd], 64)
+        cmp_dst = self.attn.decode_compress_rows(
+            rows, pos, ratio, self.layer_id, self.tier, should
+        )
+        self.attn.scatter_compressed(self.layer_id, self.tier, cmp_dst, compressed.view(k1, -1))
+
+    def commit_carry(
+        self, intermediates: torch.Tensor, num_accepted: torch.Tensor,
+        window_slots: torch.Tensor, boundary_row: int | None,
+    ) -> None:
+        """Re-point the ring to the carry after the first ``num_accepted`` (``[1]`` device
+        scalar >= 1) verify rows: the page of row ``n-1`` gets ``intermediates[n-1]`` (what the
+        next decode step reads via its previous-token page). When the verify crossed a window
+        page boundary at row ``boundary_row`` (the first row on the new page), the OLD page must
+        hold the carry after row ``boundary_row-1`` -- the block a later radix hit at that
+        boundary seeds from -- so it is written from ``intermediates[min(n-1, boundary_row-1)]``
+        (the same write again when the acceptance stops before the boundary). Idempotent, so
+        a drain-side truncation can re-run it with a smaller count."""
+        sel = (num_accepted - 1).clamp_min(0).view(1)
+        self.attn.write_carry_blocks(
+            self.layer_id, self.tier, window_slots.index_select(0, sel), self.ring_size,
+            intermediates.index_select(0, sel),
+        )
+        if boundary_row is not None and boundary_row >= 1:
+            sel2 = torch.minimum(sel, torch.full_like(sel, boundary_row - 1))
+            self.attn.write_carry_blocks(
+                self.layer_id, self.tier, window_slots.index_select(0, sel2), self.ring_size,
+                intermediates.index_select(0, sel2),
+            )
+
 
 class Indexer(nn.Module):
     """Lightning Indexer: scores compressed KV and returns top-k positions to attend."""
@@ -477,6 +579,37 @@ class Indexer(nn.Module):
             weights.reshape(B, self.n_heads),
             valid, n_stage, ratio, self.layer_id,
         ).view(B, 1, n_stage)
+        return self.attn.indexer_select_decode(
+            index_score, valid=valid, topk=self.index_topk, offset=offset
+        )
+
+    def verify_rows(
+        self, x: torch.Tensor, qr: torch.Tensor, pos: torch.Tensor, offset: int,
+        prev_window_slot0: torch.Tensor, window_slots: torch.Tensor, rows: torch.Tensor,
+        n_stage: int, intermediates: torch.Tensor, boundary_row: int | None = None,
+    ) -> torch.Tensor:
+        """:meth:`decode_step` for a speculative verify: ``k1`` consecutive tokens of one request
+        (``x`` ``[k1, 1, dim]``, ``qr`` ``[k1, 1, q_lora]``, ``pos`` ``[k1]``). The indexer's own
+        compressor is folded row by row (``Compressor.verify_rows``, carry intermediates into
+        ``intermediates``); the scoring is per row already (each row's ``valid`` bound sees the
+        blocks earlier rows completed, since they scatter before the scores gather)."""
+        k1 = x.size(0)
+        ratio, rd = self.compress_ratio, self.rope_head_dim
+        q = self.wq_b(qr).unflatten(-1, (self.n_heads, self.head_dim))
+        apply_rotary_emb_decode(q[..., -rd:], self.freqs_cis.index_select(0, pos))
+        q = hadamard_transform(q)
+        fp4_act_quant_inplace(q, 32)
+        self.compressor.verify_rows(
+            x.view(k1, -1), pos, prev_window_slot0, window_slots, rows, intermediates,
+            boundary_row=boundary_row,
+        )
+        weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads ** -0.5)
+        valid = (pos + 1) // ratio
+        index_score = self.attn.indexer_decode_scores(
+            q.reshape(k1, self.n_heads, self.head_dim),
+            weights.reshape(k1, self.n_heads),
+            valid, n_stage, ratio, self.layer_id,
+        ).view(k1, 1, n_stage)
         return self.attn.indexer_select_decode(
             index_score, valid=valid, topk=self.index_topk, offset=offset
         )

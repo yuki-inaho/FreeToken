@@ -166,7 +166,14 @@ def moe_align_block_size_triton(
     return sorted_token_ids, expert_ids, num_tokens_post_pad
 
 
-def moe_sum_reduce_triton(input: torch.Tensor, output: torch.Tensor) -> None:
+def moe_sum_reduce_triton(
+    input: torch.Tensor, output: torch.Tensor, addend: torch.Tensor | None = None,
+    route_ids: torch.Tensor | None = None,
+) -> None:
+    """``output[t] = sum_k input[t, k]`` (+ ``addend[t]`` when given, same shape/dtype as
+    ``output``) -- the optional addend saves the hybrid MoE backend one add kernel per
+    layer per step. ``route_ids`` [t, k] int32: routes with a negative id are skipped
+    (their ``input`` rows may be unwritten)."""
     import triton
 
     from .triton.fused_moe import moe_sum_reduce_kernel
@@ -176,6 +183,10 @@ def moe_sum_reduce_triton(input: torch.Tensor, output: torch.Tensor) -> None:
 
     token_num, topk_num, hidden_dim = input.shape
     assert output.shape[0] == token_num and output.shape[1] == hidden_dim
+    if addend is not None:
+        assert addend.shape == output.shape and addend.is_contiguous(), (addend.shape, output.shape)
+    if route_ids is not None:
+        assert route_ids.shape == (token_num, topk_num) and route_ids.is_contiguous()
 
     block_m = 1 if token_num <= 16 else 2
     block_dim = min(triton.next_power_of_2(hidden_dim), 1024)
@@ -194,6 +205,11 @@ def moe_sum_reduce_triton(input: torch.Tensor, output: torch.Tensor) -> None:
         BLOCK_M=block_m,
         BLOCK_DIM=block_dim,
         NUM_STAGE=4,
+        addend_ptr=output if addend is None else addend,
+        addend_stride_0=0 if addend is None else addend.stride(0),
+        HAS_ADDEND=addend is not None,
+        ids_ptr=output if route_ids is None else route_ids,
+        SKIP_NEG=route_ids is not None,
     )
 
 

@@ -63,12 +63,14 @@ def build_fla_metadata(batch: "Batch", device: torch.device) -> FLAMetadata:
     def gdn_slot(r):
         return r.linear_slot_idx if r.linear_slot_idx is not None else r.table_idx
 
-    if batch.is_decode:
+    if batch.is_decode and batch.spec is None:
         bs = len(reqs)
         cu_seqlens = torch.arange(bs + 1, dtype=torch.int32, device=device)
         # the scheduler stages linear_table_idx from gdn_slot (decode), reused as-is here
         assert batch.linear_table_idx is not None
         return FLAMetadata(cu_seqlens=cu_seqlens, cache_indices=batch.linear_table_idx)
+    # A speculative verify batch (phase "decode", batch.spec set) is ragged like prefill:
+    # k+1 tokens per sequence, always continuing (has_initial_state True), never tracking.
 
     # prefill: cumsum of query (extend) lengths, per-request slot + continuation flags.
     lens = [r.extend_len for r in reqs]

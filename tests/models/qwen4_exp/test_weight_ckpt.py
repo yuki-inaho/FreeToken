@@ -230,6 +230,53 @@ def test_no_mtp_visual_expert_or_table_tensor_is_loaded(dense_pass):
         assert not name.endswith((".weight_scale", ".weight_scale_2", ".input_scale"))
 
 
+def _mtp_fusion_preimage(model_key: str) -> list[str]:
+    """Raw checkpoint keys that produce one fused model key (same-name when unfused)."""
+    if model_key.endswith(".self_attn.qkv_proj.weight"):
+        base = model_key[: -len("qkv_proj.weight")]
+        return [f"{base}{p}_proj.weight" for p in ("q", "k", "v")]
+    if model_key.endswith(".input_mix_weight_down_block_inject.weight"):
+        base = model_key[: -len("input_mix_weight_down_block_inject.weight")]
+        return [f"{base}input_mix_weight_down.weight", f"{base}block_inject_weight.weight"]
+    if model_key.endswith(".shared_expert.gate_up_proj.weight"):
+        base = model_key[: -len("gate_up_proj.weight")]
+        return [f"{base}gate_proj.weight", f"{base}up_proj.weight"]
+    return [model_key]
+
+
+def test_mtp_subtree_matches_the_checkpoint_when_enabled(monkeypatch, reader):
+    monkeypatch.setenv("FREETOKEN_LOAD_MTP", "1")
+    from freetoken.layers import rotary
+    from freetoken.models.qwen4_exp.model import Qwen4ExpForCausalLM
+
+    # A private meta-device model: the module-scoped model_state_dict_keys fixture must keep
+    # its env-off view for the dense-pass tests.
+    config = parse_config(cached_load_hf_config(MODEL_PATH))
+    saved = rotary._ROPE_DEVICE
+    rotary.set_rope_device(torch.device("cpu"))
+    rotary.get_rope.cache_clear()
+    try:
+        with torch.device("meta"):
+            keys = set(Qwen4ExpForCausalLM(config).state_dict())
+    finally:
+        rotary.set_rope_device(saved)
+        rotary.get_rope.cache_clear()
+
+    mtp_keys = {k for k in keys if k.startswith("mtp.")}
+    assert mtp_keys, "the model must declare the mtp subtree when FREETOKEN_LOAD_MTP is set"
+    expected_raw = {raw for key in mtp_keys for raw in _mtp_fusion_preimage(key)}
+    raw_mtp = {k for k in reader._map if k.startswith("mtp.")}
+    assert raw_mtp == expected_raw
+
+    # One fused sample end to end: the MTP qkv concat matches the checkpoint parts.
+    q = reader.get("mtp.layers.0.self_attn.q_proj.weight")
+    k = reader.get("mtp.layers.0.self_attn.k_proj.weight")
+    v = reader.get("mtp.layers.0.self_attn.v_proj.weight")
+    assert q.shape == (2 * 24 * 256, H) and k.shape == v.shape == (2 * 256, H)
+    stacked = reader.get("mtp.layers.0.mlp.experts.gate_up_proj")
+    assert stacked.shape == (E, 2 * I, H) and stacked.dtype is torch.bfloat16
+
+
 @pytest.mark.parametrize("name, raw_names, mode", SAMPLES, ids=[s[0] for s in SAMPLES])
 def test_sampled_tensor_matches_the_checkpoint(dense_pass, reader, name, raw_names, mode):
     _names, sampled = dense_pass

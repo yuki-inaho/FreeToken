@@ -99,11 +99,12 @@ def test_hybrid_fraction_gpu_matches_cpu_reference():
 
     gpu, ref = make(), make()
     frac_q16 = round(frac * Q)
+    gpu.collect_stats = ref.collect_stats = True
     for step in range(64):
         ids = torch.randperm(num_experts)[:top_k].to(torch.int32)
         g, c = ids.clone().cuda(), ids.clone()  # a CPU ids tensor drives the reference path
-        gpu.ensure_experts_hybrid(0, g)
-        ref.ensure_experts_hybrid(0, c)
+        g_cpu_ids = gpu.ensure_experts_hybrid(0, g)
+        c_cpu_ids = ref.ensure_experts_hybrid(0, c)
         missing = int(gpu.num_missing_full.item())
         fetched = int(gpu.num_indices.item())
         assert missing == int(ref.num_missing_full.item())
@@ -113,6 +114,16 @@ def test_hybrid_fraction_gpu_matches_cpu_reference():
         assert torch.equal(gpu.slot_for_id.cpu(), ref.slot_for_id.cpu())
         assert torch.equal(gpu.id_of_slot.cpu(), ref.id_of_slot.cpu())
         assert (g >= 0).sum().item() == len(set(ids.tolist())) - (missing - fetched)
+        # the CPU route list emitted by the same launch: raw id where the slot is -1
+        expect_cpu = torch.where(c >= 0, torch.full_like(ids, -1), ids)
+        assert torch.equal(g_cpu_ids.cpu(), expect_cpu)
+        assert torch.equal(c_cpu_ids.cpu(), expect_cpu)
+    # in-kernel stats match the CPU mirror's accumulation
+    for name in ("stat_missing", "stat_fetched", "stat_active", "stat_calls",
+                 "stat_missing_layer", "stat_fetched_layer", "stat_active_layer",
+                 "stat_steps_layer"):
+        assert torch.equal(getattr(gpu, name).cpu(), getattr(ref, name).cpu()), name
+    assert int(gpu.stat_calls.item()) == 64
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")

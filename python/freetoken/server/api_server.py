@@ -704,6 +704,17 @@ def _reasoning_geometry(state: Any) -> dict | None:
     if derived is None:
         return None
     gears, default, kwargs = derived
+    configured_default = getattr(state.config, "default_reasoning_effort", None)
+    if configured_default == "none" and "off" in gears:
+        default = "off"
+    elif configured_default:
+        from freetoken.tokenizer.effort import quantize_effort
+
+        mapped_default = quantize_effort(
+            configured_default, manager.effort_profile()
+        )
+        if mapped_default in gears:
+            default = mapped_default
     return {"gears": list(gears), "default": default, "kwargs": kwargs}
 
 

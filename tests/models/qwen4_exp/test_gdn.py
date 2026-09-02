@@ -173,3 +173,149 @@ def test_output_gate_comes_from_the_config():
     torch.testing.assert_close(out_sig.float(), _ref_out(ref_sig, hidden[0]), rtol=RTOL, atol=ATOL)
 
     assert (out_sig.float() - out_silu.float()).abs().max().item() > 10 * ATOL
+
+
+def test_spec_verify_matches_sequential_decode_and_commits():
+    """The speculative verify branch: k+1 tokens in one forward must reproduce k+1 sequential
+    decode steps (outputs), leave the live recurrent state untouched until commit, and after
+    ``SpecStateScratch.commit(n)`` the pool's conv + recurrent state must equal the state the
+    sequential path had after n tokens -- for every possible acceptance count n."""
+    from types import SimpleNamespace
+
+    from freetoken.engine.spec import SpecBatchInfo, SpecStateScratch
+
+    ratio, steps, prefix = 3, 3, 128
+    op, _ref = _make_layer(ratio, seed=7)
+    ctx = _ctx(ratio)
+    pool = ctx.linear_state_pool
+    _hidden, reqs, _ = _prefill(op, ctx, [prefix], seed=23)
+    req = reqs[0]
+    slot = req.table_idx
+
+    conv0 = pool.conv_states[:, slot].clone()
+    rec0 = pool.recurrent_states[:, slot].clone()
+
+    torch.manual_seed(29)
+    nxt = torch.randn(steps, HIDDEN, device=DEV, dtype=torch.bfloat16)
+
+    # Sequential reference: one decode step per token, snapshotting the state after each.
+    seq_out, seq_conv, seq_rec = [], [], []
+    for t in range(steps):
+        seq_out.append(_decode(op, ctx, reqs, nxt[t : t + 1]))
+        seq_conv.append(pool.conv_states[:, slot].clone())
+        seq_rec.append(pool.recurrent_states[:, slot].clone())
+    seq_out = torch.cat(seq_out, dim=0)
+
+    # Restore the post-prefill state and run the same tokens as one verify batch.
+    pool.conv_states[:, slot] = conv0
+    pool.recurrent_states[:, slot] = rec0
+
+    group = LinearGatedDeltaGroupConfig(
+        name="linear", layer_ids=(0,), num_key_heads=HEADS[ratio][0],
+        num_value_heads=HEADS[ratio][1], key_head_dim=HEAD_DIM, value_head_dim=HEAD_DIM,
+        conv_kernel_dim=CONV_K, output_gate="sigmoid",
+    )
+    model_config = SimpleNamespace(linear_attention_group=lambda: group, vocab_size=64)
+
+    def run_verify() -> tuple[torch.Tensor, SpecStateScratch]:
+        req.cached_len, req.device_len = prefix, prefix + steps
+        scratch = SpecStateScratch(model_config, steps - 1, DEV, torch.bfloat16)
+        batch = Batch(reqs=reqs, phase="decode")
+        batch.padded_reqs = reqs
+        batch.fla_metadata = None
+        batch.spec = SpecBatchInfo(scratch=scratch, num_input_tokens=steps)
+        with ctx.forward_batch(batch):
+            out = op.forward(nxt)
+        return out, scratch
+
+    ver_out, scratch = run_verify()
+    torch.testing.assert_close(ver_out.float(), seq_out.float(), rtol=RTOL, atol=ATOL)
+    # live recurrent state untouched by the verify forward
+    torch.testing.assert_close(pool.recurrent_states[:, slot], rec0, rtol=0, atol=0)
+
+    for n in range(1, steps + 1):
+        pool.conv_states[:, slot] = conv0
+        pool.recurrent_states[:, slot] = rec0
+        _, scratch = run_verify()
+        scratch.commit(
+            pool,
+            gdn_slot=torch.tensor([slot], device=DEV),
+            ngram_slot=None,
+            num_inputs=torch.tensor([n], device=DEV),
+            token_pool_row=None,
+            new_device_len=None,
+        )
+        # conv state is raw inputs -> matches the sequential path to GEMM rounding
+        torch.testing.assert_close(
+            pool.conv_states[:, slot].float(), seq_conv[n - 1].float(), rtol=RTOL, atol=ATOL
+        )
+        torch.testing.assert_close(
+            pool.recurrent_states[:, slot], seq_rec[n - 1], rtol=1e-4, atol=1e-4
+        )
+
+
+@pytest.mark.parametrize("T", [1, 2, 3, 4])
+def test_small_t_conv_matches_varlen_conv(T):
+    """The verify path's T<=4 causal conv (contiguous q/k/v, in-place state refresh) vs the
+    varlen kernel it replaces: outputs within bf16 rounding, identical state update."""
+    from freetoken.kernel.causal_conv1d import causal_conv1d_varlen
+    from freetoken.kernel.triton.gdn_small_conv import causal_conv1d_small_t
+
+    torch.manual_seed(T)
+    num_k, num_v = HEADS[3]
+    key_dim, value_dim = num_k * HEAD_DIM, num_v * HEAD_DIM
+    C, K = 2 * key_dim + value_dim, CONV_K
+    slots = 5
+    weight = (torch.randn(C, K, device=DEV) * 0.3).to(torch.bfloat16)
+    state0 = (torch.randn(slots, C, K - 1, device=DEV) * 0.5).to(torch.bfloat16)
+    x = (torch.randn(T, C, device=DEV) * 0.5).to(torch.bfloat16)
+    slot = torch.tensor([3], dtype=torch.int32, device=DEV)
+
+    # reference: varlen kernel on the channels-first copy
+    st_ref = state0.clone()
+    # .clone(): for T == 1 the transposed [C, 1] view already counts as contiguous, and the
+    # varlen kernel writes its output in place -- without the copy it would clobber ``x``.
+    xr = x.transpose(0, 1).clone().contiguous()
+    cu = torch.tensor([0, T], dtype=torch.int32, device=DEV)
+    out = causal_conv1d_varlen(xr, weight, st_ref, cu, slot, torch.ones(1, dtype=torch.bool, device=DEV))
+    mixed = out.transpose(0, 1)
+    qr, kr, vr = torch.split(mixed, [key_dim, key_dim, value_dim], dim=-1)
+
+    st_new = state0.clone()
+    q, k, v = causal_conv1d_small_t(x, st_new, weight, slot, key_dim, value_dim)
+    torch.cuda.synchronize()
+    for a, b in ((q, qr), (k, kr), (v, vr)):
+        assert a.is_contiguous() and a.shape == b.shape
+        torch.testing.assert_close(a.float(), b.float(), rtol=2e-2, atol=2e-2)
+    # state: the last K-1 raw inputs (identical bytes), other slots untouched
+    assert torch.equal(st_new[3], st_ref[3])
+    mask = torch.ones(slots, dtype=torch.bool, device=DEV); mask[3] = False
+    assert torch.equal(st_new[mask], state0[mask])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("T", [1, 2, 3, 4])
+def test_small_conv_stash_records_pre_state_and_inputs(T):
+    """The fused stash must equal what SpecStateScratch.stash_gdn recorded: the state window
+    BEFORE the in-place refresh and the raw inputs transposed into columns 0..T-1."""
+    from freetoken.kernel.triton.gdn_small_conv import causal_conv1d_small_t
+
+    dev = "cuda"
+    C, K, KD, VD = 2048 + 2048 + 4096, 4, 2048, 4096
+    torch.manual_seed(T)
+    w = (torch.randn(C, K, device=dev) * 0.3).to(torch.bfloat16)
+    st = (torch.randn(6, C, K - 1, device=dev) * 0.5).to(torch.bfloat16)
+    x = (torch.randn(T, C, device=dev) * 0.5).to(torch.bfloat16)
+    slot = torch.tensor([4], dtype=torch.int32, device=dev)
+    pre_ref = st[4].clone()
+    st2 = st.clone()
+    q0, k0, v0 = causal_conv1d_small_t(x, st2, w, slot, KD, VD)          # no stash
+    pre = torch.zeros(C, K - 1, dtype=torch.bfloat16, device=dev)
+    xin = torch.zeros(C, 5, dtype=torch.bfloat16, device=dev)             # k1 = 5 columns like the scratch
+    q1, k1, v1 = causal_conv1d_small_t(x, st, w, slot, KD, VD, stash=(pre, xin))
+    torch.cuda.synchronize()
+    assert torch.equal(q0, q1) and torch.equal(k0, k1) and torch.equal(v0, v1)
+    assert torch.equal(st, st2)                       # same in-place refresh
+    assert torch.equal(pre, pre_ref)                  # pre-update window
+    assert torch.equal(xin[:, :T], x.t())             # raw inputs, channels first
+    assert torch.equal(xin[:, T:], torch.zeros_like(xin[:, T:]))

@@ -9,7 +9,7 @@ from freetoken.layers import BaseOP, LinearColParallelMerged
 from freetoken.kernel.triton.fp8_block_linear import Fp8BlockColMerged
 from freetoken.kernel.triton.fp8_pertensor_linear import Fp8PerTensorColMerged
 
-from .gdn_kernels import gdn_decode_fla, gdn_prefill_chunk_fla
+from .gdn_kernels import gdn_decode_fla, gdn_prefill_chunk_fla, gdn_verify_fla
 from .quant_linear import make_replicated_quant
 
 
@@ -172,7 +172,30 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         z = z.reshape(total, self.num_v_heads, self.head_v_dim)
         li = pool.local_index(self.layer_id)
 
-        if batch.is_decode:
+        if batch.is_decode and getattr(batch, "spec", None) is not None:
+            # Speculative verify: k+1 tokens through the fused recurrent kernel with the live
+            # recurrent state untouched (per-token intermediates recorded for the commit). The
+            # conv state advances in place to k+1 -- allowed, because SpecStateScratch stashes
+            # the pre-verify window + this step's raw inputs and the commit rewrites it to the
+            # accepted prefix.
+            scratch = batch.spec.scratch
+            scratch.stash_gdn(li, pool.conv_states[li], fla.cache_indices.long(), conv_in)
+            mixed = self._conv_prefill(
+                conv_in, pool, fla.cu_seqlens, fla.cache_indices, fla.has_initial_state)
+            qf, kf, vf = torch.split(mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
+            q = qf.reshape(1, total, self.num_k_heads, self.head_k_dim).to(dtype)
+            k = kf.reshape(1, total, self.num_k_heads, self.head_k_dim).to(dtype)
+            v = vf.reshape(1, total, self.num_v_heads, self.head_v_dim).to(dtype)
+            core_out = gdn_verify_fla(
+                q, k, v, a, b, A_log=self.A_log, dt_bias=self.dt_bias,
+                state_source=pool.recurrent_states[li],
+                indices=fla.cache_indices.to(torch.int32),
+                cu_seqlens=fla.cu_seqlens.to(torch.int32),
+                intermediate_states=scratch.gdn_states[li],
+                intermediate_indices=scratch.gdn_state_indices,
+                scale=self.head_k_dim ** -0.5,
+            )
+        elif batch.is_decode:
             # Fused fla decode kernel: gating + in-kernel l2norm + recurrent update +
             # per-request state read/write-by-index, all in one kernel (no gather/scatter,
             # no clone, no external l2norm). q/k stay at num_k_heads (kernel handles GQA).

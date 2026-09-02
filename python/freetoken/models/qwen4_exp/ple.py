@@ -334,7 +334,7 @@ def build_ple_metadata(
     fla = getattr(batch, "fla_metadata", None)
     slots_dev = getattr(batch, "linear_table_idx", None)
 
-    if batch.is_decode and slots_dev is not None:
+    if batch.is_decode and slots_dev is not None and getattr(batch, "spec", None) is None:
         slots = slots_dev.long()
         bs = slots.numel()
         return PLEMetadata(
@@ -346,6 +346,8 @@ def build_ple_metadata(
             fresh_slots=None,
             is_decode=True,
         )
+    # A speculative verify batch (phase "decode", batch.spec set) takes the ragged branch:
+    # k+1 tokens per sequence with the fla continuation flags, like a chunked prefill.
 
     lens = [r.extend_len for r in reqs]
     if fla is not None and fla.has_initial_state is not None:
@@ -366,7 +368,9 @@ def build_ple_metadata(
         ngram_context=context,
         state_slots=slots,
         fresh_slots=fresh,
-        is_decode=batch.is_decode,
+        # a spec-verify batch reaches here with phase "decode" but must use the ragged
+        # conv/commit forms, so is_decode reflects the chosen branch, not the phase
+        is_decode=False,
     )
 
 
@@ -605,6 +609,12 @@ class PLELayer(BaseOP):
         gated = (gate * value.unsqueeze(-2)).flatten(-2)
         states = conv_states if conv_states is not None else self._conv_state_slab(R)
         x = self.norm_conv.forward(gated)
+        spec = getattr(batch, "spec", None)
+        if spec is not None:
+            # Speculative verify: stash the pre-verify conv window and this step's activation
+            # rows so the commit can rewrite the (about to be over-advanced) state to the
+            # accepted prefix. The extra state read is one [width, state_len] gather.
+            spec.scratch.stash_ple(self.layer_id, self._read_state(meta, states, x.dtype), x)
         fla = getattr(batch, "fla_metadata", None)
         if fla is not None and fla.track_boundary_row is not None:
             self._write_track_snapshot(states, x, fla)

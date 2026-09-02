@@ -104,6 +104,56 @@ def iter_weights(
         if reader.has(f"{prefix}.scale"):
             yield f"{prefix}.scale", get(f"{prefix}.scale")
 
+    def block(prefix: str, *, ratio: int, hash_gate: bool):
+        # One decoder block's resident tensors (main tower ``layers.L`` or DSpark ``mtp.s``;
+        # the two share the block layout, DSpark stages being window-only bias-routed blocks).
+        a = f"{prefix}.attn"
+        yield from linear(f"{a}.wq_a")
+        yield f"{a}.q_norm.weight", get(f"{a}.q_norm.weight")
+        yield from linear(f"{a}.wq_b")
+        yield from linear(f"{a}.wkv")
+        yield f"{a}.kv_norm.weight", get(f"{a}.kv_norm.weight")
+        # wo_a: FP8 in the checkpoint, dequantized to bf16 (reference bf16 einsum).
+        yield f"{a}.wo_a", _dequant_fp8_block(
+            get(f"{a}.wo_a.weight"), get(f"{a}.wo_a.scale")
+        )
+        yield from linear(f"{a}.wo_b")
+        yield f"{a}.attn_sink", get(f"{a}.attn_sink")
+
+        if ratio:
+            c = f"{a}.compressor"
+            yield f"{c}.ape", get(f"{c}.ape")
+            yield f"{c}.wkv.weight", get(f"{c}.wkv.weight")
+            yield f"{c}.wgate.weight", get(f"{c}.wgate.weight")
+            yield f"{c}.norm.weight", get(f"{c}.norm.weight")
+            if ratio == 4:
+                idx = f"{a}.indexer"
+                yield from linear(f"{idx}.wq_b")
+                yield f"{idx}.weights_proj.weight", get(f"{idx}.weights_proj.weight")
+                ic = f"{idx}.compressor"
+                yield f"{ic}.ape", get(f"{ic}.ape")
+                yield f"{ic}.wkv.weight", get(f"{ic}.wkv.weight")
+                yield f"{ic}.wgate.weight", get(f"{ic}.wgate.weight")
+                yield f"{ic}.norm.weight", get(f"{ic}.norm.weight")
+
+        yield f"{prefix}.attn_norm.weight", get(f"{prefix}.attn_norm.weight")
+        yield f"{prefix}.ffn_norm.weight", get(f"{prefix}.ffn_norm.weight")
+
+        g = f"{prefix}.ffn.gate"
+        yield f"{g}.weight", get(f"{g}.weight")
+        if hash_gate:
+            yield f"{g}.tid2eid", get(f"{g}.tid2eid")
+        else:
+            yield f"{g}.bias", get(f"{g}.bias")
+        for proj in ("w1", "w2", "w3"):
+            yield from linear(f"{prefix}.ffn.shared_experts.{proj}")
+
+        for nm in (
+            "hc_attn_fn", "hc_ffn_fn", "hc_attn_base",
+            "hc_ffn_base", "hc_attn_scale", "hc_ffn_scale",
+        ):
+            yield f"{prefix}.{nm}", get(f"{prefix}.{nm}")
+
     try:
         yield "embed.weight", get("embed.weight")
         yield "norm.weight", get("norm.weight")
@@ -112,53 +162,28 @@ def iter_weights(
             yield nm, get(nm)
 
         for L in range(args.n_layers):
-            a = f"layers.{L}.attn"
-            yield from linear(f"{a}.wq_a")
-            yield f"{a}.q_norm.weight", get(f"{a}.q_norm.weight")
-            yield from linear(f"{a}.wq_b")
-            yield from linear(f"{a}.wkv")
-            yield f"{a}.kv_norm.weight", get(f"{a}.kv_norm.weight")
-            # wo_a: FP8 in the checkpoint, dequantized to bf16 (reference bf16 einsum).
-            yield f"{a}.wo_a", _dequant_fp8_block(
-                get(f"{a}.wo_a.weight"), get(f"{a}.wo_a.scale")
+            yield from block(
+                f"layers.{L}", ratio=args.compress_ratios[L], hash_gate=L < args.n_hash_layers
             )
-            yield from linear(f"{a}.wo_b")
-            yield f"{a}.attn_sink", get(f"{a}.attn_sink")
 
-            ratio = args.compress_ratios[L]
-            if ratio:
-                c = f"{a}.compressor"
-                yield f"{c}.ape", get(f"{c}.ape")
-                yield f"{c}.wkv.weight", get(f"{c}.wkv.weight")
-                yield f"{c}.wgate.weight", get(f"{c}.wgate.weight")
-                yield f"{c}.norm.weight", get(f"{c}.norm.weight")
-                if ratio == 4:
-                    idx = f"{a}.indexer"
-                    yield from linear(f"{idx}.wq_b")
-                    yield f"{idx}.weights_proj.weight", get(f"{idx}.weights_proj.weight")
-                    ic = f"{idx}.compressor"
-                    yield f"{ic}.ape", get(f"{ic}.ape")
-                    yield f"{ic}.wkv.weight", get(f"{ic}.wkv.weight")
-                    yield f"{ic}.wgate.weight", get(f"{ic}.wgate.weight")
-                    yield f"{ic}.norm.weight", get(f"{ic}.norm.weight")
+        from .config import dspark_build_enabled
 
-            yield f"layers.{L}.attn_norm.weight", get(f"layers.{L}.attn_norm.weight")
-            yield f"layers.{L}.ffn_norm.weight", get(f"layers.{L}.ffn_norm.weight")
-
-            g = f"layers.{L}.ffn.gate"
-            yield f"{g}.weight", get(f"{g}.weight")
-            if L < args.n_hash_layers:
-                yield f"{g}.tid2eid", get(f"{g}.tid2eid")
-            else:
-                yield f"{g}.bias", get(f"{g}.bias")
-            for proj in ("w1", "w2", "w3"):
-                yield from linear(f"layers.{L}.ffn.shared_experts.{proj}")
-
-            for nm in (
-                "hc_attn_fn", "hc_ffn_fn", "hc_attn_base",
-                "hc_ffn_base", "hc_attn_scale", "hc_ffn_scale",
-            ):
-                yield f"layers.{L}.{nm}", get(f"layers.{L}.{nm}")
+        if dspark_build_enabled(args):
+            # DSpark drafter stages (speculative decoding): the block tensors plus stage 0's
+            # context projection and the last stage's head / Markov / confidence weights.
+            for s in range(args.n_mtp_layers):
+                p = f"mtp.{s}"
+                yield from block(p, ratio=0, hash_gate=False)
+                if s == 0:
+                    yield from linear(f"{p}.main_proj")
+                    yield f"{p}.main_norm.weight", get(f"{p}.main_norm.weight")
+                if s == args.n_mtp_layers - 1:
+                    yield f"{p}.norm.weight", get(f"{p}.norm.weight")
+                    for nm in ("hc_head_fn", "hc_head_base", "hc_head_scale"):
+                        yield f"{p}.{nm}", get(f"{p}.{nm}")
+                    for nm in ("markov_w1", "markov_w2"):
+                        yield f"{p}.markov_head.{nm}.weight", get(f"{p}.markov_head.{nm}.weight")
+                    yield from linear(f"{p}.confidence_head.proj")
     finally:
         reader.close()
 
@@ -268,12 +293,94 @@ def is_expert_tensor(name: str) -> bool:
     return _EXPERT_RE.match(name) is not None
 
 
+def _dsfp4_bank_specs(E: int, H: int, I: int) -> dict:
+    """The 4 DeepSeek-FP4 bank row shapes: packed e2m1 codes + e8m0 per-32 block scales."""
+    e8m0 = torch.float8_e8m0fnu
+    return {
+        "gate_up_packed": ((E, 2 * I, H // 2), torch.uint8),
+        "gate_up_scale": ((E, 2 * I, H // 32), e8m0),
+        "down_packed": ((E, H, I // 2), torch.uint8),
+        "down_scale": ((E, H, I // 32), e8m0),
+    }
+
+
+# DSpark drafter experts: ``mtp.{stage}.ffn.experts.{e}.w{1,2,3}.{weight,scale}`` (stage ->
+# bank layer ``n_layers + stage`` in the offload cache).
+_DSPARK_EXPERT_RE = re.compile(
+    r"^mtp\.(?P<layer>\d+)\.ffn\.experts\.(?P<expert>\d+)\."
+    r"(?P<proj>w1|w2|w3)\.(?P<kind>weight|scale)$"
+)
+
+
+def load_dspark_expert_bank_layers(
+    model_path: str | None, args: DeepseekV4Args, *, dummy: bool = False
+) -> dict[str, list[torch.Tensor]]:
+    """Pinned ds_fp4 banks for the DSpark stages' routed experts: the same 4 banks as
+    :func:`load_dsfp4_expert_sources`, one tensor per STAGE (appended to the main tower's
+    bank lists by ``append_spec_expert_bank``). ``dummy`` fabricates them (no checkpoint).
+    Always pinned: the stages run every speculative step, so they never take the CPU/locked
+    residency of the main tower's split plan (whose layer ids would not even index them)."""
+    from freetoken.moe.host_banks import (
+        HostResidency, LayerCompletionTracker, PinPipeline, alloc_layer_banks, pin_banks,
+    )
+
+    S, E = args.n_mtp_layers, args.n_routed_experts
+    H, I = args.dim, args.moe_inter_dim
+    specs = _dsfp4_bank_specs(E, H, I)
+    hb = alloc_layer_banks(specs, S)
+    banks = {name: [b.tensor for b in hb[name]] for name in specs}
+    if dummy:
+        for t in banks["gate_up_packed"]:  # packed e2m1; scales stay 0 (valid e8m0)
+            t.random_(0, 256)
+        for t in banks["down_packed"]:
+            t.random_(0, 256)
+        pin_banks(hb)
+        return banks
+
+    assert model_path, "DSpark expert banks need the checkpoint path"
+    weight_map = _weight_map(model_path)
+    shards: dict[str, list[tuple[str, re.Match]]] = collections.defaultdict(list)
+    for name, shard in weight_map.items():
+        m = _DSPARK_EXPERT_RE.match(name)
+        if m is None or int(m.group("layer")) >= S:
+            continue
+        shards[shard].append((name, m))
+
+    with PinPipeline() as pins:
+        def on_stage(stage_id: int, stage_banks: dict) -> None:
+            for bank in stage_banks.values():
+                pins.submit(bank, HostResidency.PINNED.value)
+
+        tracker = LayerCompletionTracker(E * 6, hb, on_stage)
+        placed = 0
+        for shard in tqdm(sorted(shards), desc="Loading DSpark FP4 experts"):
+            path = os.path.join(model_path, shard)
+            with safetensors.safe_open(path, framework="pt", device="cpu") as f:
+                for name, m in shards[shard]:
+                    _place_dsfp4_parsed(
+                        banks, int(m.group("layer")), int(m.group("expert")),
+                        m.group("proj"), m.group("kind"), f.get_tensor(name), I,
+                    )
+                    tracker.note(int(m.group("layer")))
+                    placed += 1
+            drop_page_cache(path)
+    expected = S * E * 6
+    assert placed == expected, f"loaded {placed} DSpark expert tensors, expected {expected}"
+    return banks
+
+
 def _place_dsfp4(banks: dict, name: str, t: torch.Tensor, I: int) -> int:
     """Copy one expert tensor into its layer/expert slot (shared by serial + parallel
     readers): w1->gate_up[:,:I], w3->gate_up[:,I:], w2->down. Returns the layer index."""
     m = _EXPERT_RE.match(name)
     layer, expert = int(m.group("layer")), int(m.group("expert"))
-    proj, kind = m.group("proj"), m.group("kind")
+    return _place_dsfp4_parsed(banks, layer, expert, m.group("proj"), m.group("kind"), t, I)
+
+
+def _place_dsfp4_parsed(
+    banks: dict, layer: int, expert: int, proj: str, kind: str, t: torch.Tensor, I: int
+) -> int:
+    """:func:`_place_dsfp4` on an already-parsed (layer, expert, proj, kind)."""
     if kind == "weight":
         t = t.view(torch.uint8)
         if proj == "w1":
@@ -342,5 +449,6 @@ __all__ = [
     "iter_weights",
     "load_dsfp4_expert_sources",
     "load_dsfp4_expert_sources_parallel",
+    "load_dspark_expert_bank_layers",
     "is_expert_tensor",
 ]

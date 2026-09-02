@@ -227,6 +227,28 @@ def test_v1_models_publishes_the_probed_efforts():
     assert card["default_reasoning_effort"] == "xhigh"
 
 
+def test_v1_models_publishes_configured_non_thinking_default():
+    state = FakeState()
+    state.config.default_reasoning_effort = "none"
+    state.frontend_tokenizer = lambda: FakeManager(
+        profile=EffortProfile(
+            supported=frozenset({"xhigh", "medium", "low"}),
+            default="xhigh",
+            consumes_effort=True,
+        )
+    )
+    card = _models_payload(state)
+    assert card["supported_reasoning_efforts"] == [
+        "xhigh", "medium", "low", "none"
+    ]
+    assert card["default_reasoning_effort"] == "none"
+
+
+def test_v1_models_advertises_streaming_usage_to_open_webui():
+    card = _models_payload(FakeState())
+    assert card["info"]["meta"]["capabilities"]["usage"] is True
+
+
 def test_v1_models_omits_efforts_without_a_frontend_tokenizer():
     card = _models_payload(FakeState())
     assert card["supported_reasoning_efforts"] is None

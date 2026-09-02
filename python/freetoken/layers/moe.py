@@ -24,6 +24,19 @@ TopK = Tuple[torch.Tensor, torch.Tensor]
 # default. Set FREETOKEN_HYBRID_OVERLAP=0 to force the serial path (CPU sync before the
 # GPU work) -- a measurement-only escape hatch to A/B the overlap benefit.
 _HYBRID_OVERLAP = os.getenv("FREETOKEN_HYBRID_OVERLAP", "1") != "0"
+# Hybrid decode (NVFP4 experts): run the demand PCIe gather on a side stream while the GEMV
+# over the already-resident routes runs, then finish the fetched routes after the join. Set
+# FREETOKEN_HYBRID_COPY_OVERLAP=0 to keep the gather serialized ahead of the GEMV (A/B knob;
+# the two orders are bit-identical).
+# Default OFF since 2026-09-02: at a ~0.07 miss rate the split's "fetched" gate_up launch is nearly
+# empty and running one gate_up after the demand-copy join measured +3-8% greedy on Qwen3.8
+# (FREETOKEN_HYBRID_COPY_OVERLAP=1 restores the hit/fetched split around the join).
+_HYBRID_COPY_OVERLAP = os.getenv("FREETOKEN_HYBRID_COPY_OVERLAP", "0") == "1"
+# Hybrid decode (NVFP4 experts, <= 4 rows): one GEMV program per DISTINCT expert instead of
+# per route (~30% fewer expert bytes at k=2) -- but the current kernel is ALU/latency-bound
+# (gate_up 92 us vs 44.5 us per-route on the RTX 5090, HBM regime), so it is OFF by default
+# until a tensor-core formulation exists. FREETOKEN_HYBRID_DEDUP=1 enables it.
+_HYBRID_DEDUP = os.getenv("FREETOKEN_HYBRID_DEDUP", "0") == "1"
 
 
 class MoELayer(BaseOP):
@@ -167,6 +180,7 @@ class MoELayer(BaseOP):
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor | None = None,
+        epilogue=None,  # MoeCombineEpilogue: not fused on the resident path (result stays None)
     ):
         if self.weight_format != "bf16":
             # Quantized resident experts: generic softmax router + format kernel.
@@ -223,12 +237,20 @@ class OffloadMoELayer(MoELayer):
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor | None = None,
+        epilogue=None,
     ):
+        """``epilogue`` (:class:`~freetoken.kernel.triton.moe_finalize.MoeCombineEpilogue`):
+        on the single-GPU NVFP4 decode path the block is finished in the sum-reduce kernel
+        (shared-expert gate + hyper-connection combine) and the NEW RESIDUAL is returned
+        with ``epilogue.result`` set; every other path ignores it and returns the routed
+        output (``result`` None), so the caller applies the separate ops."""
         ctx = get_global_ctx()
         if ctx.batch.is_prefill:
             final_hidden_states = self.prefill_forward(hidden_states, router_logits)
         else:
-            final_hidden_states = self.decode_forward(hidden_states, router_logits)
+            if self.tp_size > 1:
+                epilogue = None  # the combine must follow the all-reduce of the partials
+            final_hidden_states = self.decode_forward(hidden_states, router_logits, epilogue)
         return self._maybe_all_reduce(final_hidden_states)
 
     def routed_forward(
@@ -255,6 +277,7 @@ class OffloadMoELayer(MoELayer):
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor | None = None,
+        epilogue=None,
     ):
         topk_weights, topk_ids = fused_topk(
             hidden_states=hidden_states,
@@ -262,7 +285,7 @@ class OffloadMoELayer(MoELayer):
             topk=self.top_k,
             renormalize=self.renormalize,
         )
-        return self._decode_routed(hidden_states, topk_weights, topk_ids)
+        return self._decode_routed(hidden_states, topk_weights, topk_ids, epilogue)
 
     def prefill_forward(
         self,
@@ -290,6 +313,7 @@ class OffloadMoELayer(MoELayer):
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        epilogue=None,
     ) -> torch.Tensor:
         """On-demand load: ``ensure_experts`` rewrites ``topk_ids`` into cache slot
         ids in place (loading missing experts), then the GEMM reads the full slot
@@ -308,7 +332,7 @@ class OffloadMoELayer(MoELayer):
             assert executor is not None, "CPU MoE executor was not initialized"
             return executor.decode(self.layer_id, hidden_states, topk_weights, topk_ids)
         if cache.decode_target == "hybrid":
-            return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
+            return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids, epilogue)
         cache.ensure_experts(self.layer_id, topk_ids)
         cache.copy_missing()
         return self._expert_gemm(
@@ -320,6 +344,7 @@ class OffloadMoELayer(MoELayer):
             n=None,
             alphas=cache.alphas_for_slots(self.layer_id),
             is_prefill=False,
+            epilogue=epilogue,
         )
 
     def _decode_hybrid(
@@ -328,35 +353,96 @@ class OffloadMoELayer(MoELayer):
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        epilogue=None,
     ) -> torch.Tensor:
         """Hybrid decode: GPU computes cache hits + <=K freshly-fetched experts, the CPU
         computes the overflow misses, overlapped, then the partials merge.
 
-        The CPU pool is kicked off (``decode_submit``) before the GPU PCIe fetch + GEMM so
-        the CPU overflow GEMV runs concurrently with the GPU work. Capture-safe: the
-        routing split is device-side elementwise and the CPU submit/sync are host nodes.
-        Each route is computed exactly once -- the GPU weights are zeroed for CPU-assigned
-        routes and the CPU ids are -1 for GPU-assigned routes (the C++ kernel skips id<0).
+        Order per layer (NVFP4 experts, the shipped path): the ensure kernel rewrites
+        ``topk_ids`` to slots / -1 and emits the CPU route list plus the hit/fetched split;
+        the CPU pool is kicked off (``decode_submit``: D2H + doorbell); the PCIe gather of
+        the fetched experts runs on a side stream while the GEMV over the already-resident
+        routes runs on the compute stream; the fetched routes finish after the join; the
+        CPU partial is folded into the sum-reduce (``finalize`` = stream WAIT + H2D). Every
+        route is computed exactly once: the GEMV skips slot -1 routes, the CPU ids are -1
+        for GPU routes (the C++ kernel skips id<0). Capture-safe throughout (device-side
+        split, event edges, stream memops). Other expert formats keep the older
+        zero-weight + separate-add form since their kernels index every route.
         """
         executor = cache.cpu_executor
         assert executor is not None, "CPU MoE executor was not initialized"
-        raw = topk_ids.clone()  # raw expert ids for the CPU partial
-        cache.ensure_experts_hybrid(self.layer_id, topk_ids)  # -> slot (hit/fetched) or -1
-        if cache.collect_stats:
-            cache.record_decode_stats_hybrid(self.layer_id)
-        on_gpu = topk_ids >= 0
+        nvfp4 = cache.quant_format == "nvfp4"
+        overlap_copy = nvfp4 and _HYBRID_COPY_OVERLAP and hidden_states.is_cuda
+        dedup = nvfp4 and _HYBRID_DEDUP and hidden_states.is_cuda and hidden_states.shape[0] <= 4
+        # One launch: topk_ids -> slot (hit/fetched) or -1, cpu_ids -> raw id or -1, the
+        # residency split for the copy overlap, the expert-dedup tables, and the hybrid
+        # stats when enabled.
+        # the router weights ride along in the ensure kernel's routing pack (one D2H for
+        # ids + weights in decode_submit)
+        if overlap_copy or dedup:
+            routes = cache.ensure_experts_hybrid(
+                self.layer_id, topk_ids, split=overlap_copy, dedup=dedup, weights=topk_weights
+            )
+            cpu_ids, hit_ids, fetched_ids = routes.cpu_ids, routes.hit_ids, routes.fetched_ids
+        else:
+            routes = None
+            cpu_ids = cache.ensure_experts_hybrid(self.layer_id, topk_ids, weights=topk_weights)
+        gate_arg = None
+        if epilogue is not None and epilogue.shared is not None and epilogue.gate is None:
+            gw = epilogue.gate_weight
+            if gw is not None and executor.can_fuse_gate() and nvfp4:
+                epilogue.gate = torch.empty(hidden_states.shape[0], dtype=torch.float32, device=hidden_states.device)
+                gate_arg = (gw, epilogue.gate)
+            elif gw is not None:
+                from freetoken.kernel.triton.moe_shared_gate import shared_gate_sigmoid
 
-        cpu_ids = torch.where(on_gpu, raw.new_full((), -1), raw).contiguous()
-        pending = executor.decode_submit(self.layer_id, hidden_states, topk_weights, cpu_ids)
+                epilogue.gate = shared_gate_sigmoid(hidden_states, gw)
+        pending = executor.decode_submit(
+            self.layer_id, hidden_states, topk_weights, cpu_ids, gate=gate_arg,
+            routing_pack=getattr(cache, "routing_pack", None),
+        )
 
         # Measurement knob: FREETOKEN_HYBRID_OVERLAP=0 syncs the CPU pool *before* the
         # PCIe fetch + GPU GEMM, serializing the two so an A/B isolates the overlap win.
-        cpu_routed_early = (
-            executor.decode_sync(pending) if not _HYBRID_OVERLAP else None
-        )
+        if _HYBRID_OVERLAP:
+            finalize = lambda: executor.decode_sync(pending)  # noqa: E731
+        else:
+            cpu_routed_early = executor.decode_sync(pending)
+            finalize = lambda: cpu_routed_early  # noqa: E731
 
-        cache.copy_missing()
-        gpu_slots = topk_ids.clamp_min(0)  # -1 -> slot 0 (zero-weighted below)
+        if overlap_copy:
+            cache.copy_missing_async()
+            split = (hit_ids, fetched_ids, cache.join_demand_copy)
+        else:
+            cache.copy_missing()
+            split = None
+        dedup_tables = None
+        if dedup:
+            dedup_tables = (
+                routes.uniq_slots, routes.uniq_hit, routes.uniq_fetched, routes.pairs,
+                cache.join_demand_copy if overlap_copy else None,
+            )
+        if nvfp4:
+            # The Triton NVFP4 decode GEMV skips slot -1 routes itself and folds the CPU
+            # partial into its sum-reduce (`finalize` runs right before it).
+            return self._expert_gemm(
+                cache,
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                views=cache.bank_views(),
+                n=None,
+                alphas=cache.alphas_for_slots(self.layer_id),
+                is_prefill=False,
+                finalize=finalize,
+                split=split,
+                dedup=dedup_tables,
+                epilogue=epilogue,
+            )
+        # Other formats' kernels index every route: park the CPU routes on slot 0 with a
+        # zero weight and add the CPU partial afterwards.
+        on_gpu = topk_ids >= 0
+        gpu_slots = topk_ids.clamp_min(0)
         gpu_w = torch.where(on_gpu, topk_weights, topk_weights.new_zeros(())).contiguous()
         gpu_routed = self._expert_gemm(
             cache,
@@ -368,8 +454,7 @@ class OffloadMoELayer(MoELayer):
             alphas=cache.alphas_for_slots(self.layer_id),
             is_prefill=False,
         )
-        cpu_routed = cpu_routed_early if not _HYBRID_OVERLAP else executor.decode_sync(pending)
-        return gpu_routed + cpu_routed
+        return gpu_routed + finalize()
 
     def _prefill_routed(
         self,
@@ -439,8 +524,19 @@ class OffloadMoELayer(MoELayer):
         n: int | None,
         alphas: tuple[torch.Tensor, torch.Tensor] | None,
         is_prefill: bool,
+        finalize=None,
+        split=None,
+        dedup=None,
+        epilogue=None,
     ) -> torch.Tensor:
         fmt = cache.quant_format
+        # `finalize` (hybrid decode): a callable returning a [M, H] addend folded into the
+        # decode sum-reduce; `split` = (hit_ids, fetched_ids, join_fn) runs gemm1 over the
+        # resident routes before joining the demand copy. Only the Triton NVFP4 decode GEMV
+        # supports them (and slot -1 routes); the other formats' callers add the partial.
+        assert (finalize is None and split is None and dedup is None) or (
+            fmt == "nvfp4" and not is_prefill
+        ), fmt
         if fmt in ("nvfp4_marlin", "nvfp4_b12x"):
             # Borrowed W4A16 fused MoE -- Marlin (vLLM, sm_80-99) or b12x
             # (flashinfer, sm_120) over their pre-tiled banks; one kernel serves
@@ -502,6 +598,10 @@ class OffloadMoELayer(MoELayer):
                 self.apply_router_weight_on_input,
                 act_alpha,
                 act_limit,
+                finalize=finalize,
+                split=split,
+                dedup=dedup,
+                epilogue=epilogue,
             )
         if fmt == "fp8_block":
             # Block-fp8 experts: fused inline-dequant grouped GEMM reads the routed fp8 rows

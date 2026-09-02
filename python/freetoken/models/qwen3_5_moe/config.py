@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from freetoken.models.config import (
@@ -104,6 +105,65 @@ def _dense_mlp_quant(hf_config: Any) -> str:
     return "none"
 
 
+def extend_config_for_speculative(config: ModelConfig, num_draft_tokens: int) -> ModelConfig:
+    """Register the MTP draft layer (id ``num_layers``) for speculative decoding: it joins the
+    full-attention group so ``is_linear_layer`` and the attention backend resolve it, the KV
+    pool grows by one layer, and ``num_speculative_tokens`` sizes the verify scratch."""
+    from dataclasses import replace
+
+    from freetoken.models.config import FullAttentionGroupConfig
+
+    if num_draft_tokens < 1:
+        raise ValueError(f"num_draft_tokens must be >= 1, got {num_draft_tokens}")
+    mtp_layer_id = config.num_layers
+    groups = tuple(
+        replace(g, layer_ids=g.layer_ids + (mtp_layer_id,))
+        if isinstance(g, FullAttentionGroupConfig) and mtp_layer_id not in g.layer_ids
+        else g
+        for g in config.attention_groups
+    )
+    return replace(
+        config,
+        attention_groups=groups,
+        num_extra_kv_layers=1,
+        num_speculative_tokens=num_draft_tokens,
+    )
+
+
+def _compressed_tensors_fp8(hf_config: Any) -> tuple[bool, frozenset]:
+    """The per-channel FP8 half of a compressed-tensors MIXED export (e.g. the OrcaRouter
+    Qwen3.8-27B NVFP4+FP8 build): a ``float-quantized`` group with ``num_bits=8,
+    strategy="channel"`` weights whose explicit per-module ``targets`` cover the attention /
+    GDN projections and a few tail MLP layers, next to the NVFP4 group for the rest.
+
+    Returns ``(attn_is_fp8, fp8_mlp_layer_ids)``: whether any ``self_attn`` / ``linear_attn``
+    projection is in an FP8 group, and the decoder layer ids whose dense ``.mlp.*_proj`` are."""
+    get = _quant_accessor(hf_config)
+    if get is None or str(get("quant_method") or "").lower() != "compressed-tensors":
+        return False, frozenset()
+    groups = get("config_groups") or {}
+    attn_fp8 = False
+    mlp_layers: set[int] = set()
+    for g in (groups.values() if isinstance(groups, dict) else []):
+        w = (g or {}).get("weights") or {}
+        if int(w.get("num_bits", 0) or 0) != 8 or str(w.get("type", "")).lower() != "float":
+            continue
+        strategy = str(w.get("strategy", "")).lower()
+        if strategy not in ("channel", "tensor"):
+            raise ValueError(
+                f"unsupported compressed-tensors FP8 weight strategy {strategy!r}; FreeToken "
+                "serves per-channel / per-tensor FP8 only"
+            )
+        for target in g.get("targets") or []:
+            t = str(target)
+            if ".self_attn." in t or ".linear_attn." in t:
+                attn_fp8 = True
+            m = re.search(r"\.layers\.(\d+)\.mlp\.(gate|up|down)_proj$", t)
+            if m:
+                mlp_layers.add(int(m.group(1)))
+    return attn_fp8, frozenset(mlp_layers)
+
+
 def _attn_quant(hf_config: Any) -> str:
     """Per-tensor FP8 on the *dense* attention/GDN projections. The modelopt
     ``MIXED_PRECISION`` checkpoints tag ``self_attn.{q,k,v,o}_proj`` and
@@ -182,10 +242,16 @@ def parse_config(hf_config: Any) -> ModelConfig:
     # compressed-tensors NVFP4 (dense Qwen3.6-27B): the attention (q/k/v/o, GDN out_proj) AND
     # the dense MLP are W4A16 NVFP4; GDN in_proj_*, lm_head, norms stay bf16. Wire the shared
     # W4A16 kernels (attn_quant=="nvfp4" routes the attention/GDN linears through them too).
+    fp8_dense_layers: frozenset = frozenset()
     if _compressed_tensors_nvfp4(hf_config):
         attn_quant = "nvfp4"
         dense_quant = "nvfp4"
         lm_head_quant = "none"
+        # Mixed NVFP4+FP8 export: attention/GDN projections (and a few tail MLP layers) are
+        # per-channel FP8 -> the per-row-scale FP8 linears (W8A16); the rest stays NVFP4.
+        attn_fp8, fp8_dense_layers = _compressed_tensors_fp8(hf_config)
+        if attn_fp8:
+            attn_quant = "fp8_pertensor"
 
     # Dense variants (e.g. Qwen3.6-27B) report num_experts==0: route the decoder MLP through
     # the dense Qwen3_5DenseMLP instead of the MoE block.
@@ -257,6 +323,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         attn_quant=attn_quant,
         dense_quant=dense_quant,
         lm_head_quant=lm_head_quant,
+        fp8_dense_layers=fp8_dense_layers,
     )
 
 

@@ -221,6 +221,15 @@ class CpuMoeExecutor:
             coord_core = core_ids[-1]
             nthreads -= 1
             core_ids = core_ids[:-1]
+            # With spinning workers (FREETOKEN_CPU_MOE_SPIN, the default) every remaining
+            # physical core is busy during decode; leave one for the engine's GPU-driving
+            # thread so its kernel enqueues do not queue behind a spinner
+            # (FREETOKEN_CPU_MOE_RESERVE_MAIN=0 restores N-1 workers).
+            spin = os.getenv("FREETOKEN_CPU_MOE_SPIN", "1") != "0"
+            reserve_main = os.getenv("FREETOKEN_CPU_MOE_RESERVE_MAIN", "1") != "0"
+            if spin and reserve_main and nthreads > 3:
+                nthreads -= 1
+                core_ids = core_ids[:-1]
         self._coord_core = coord_core
         self._ext = _cpu_moe.CpuMoeExecutor(
             num_threads=nthreads,
@@ -308,6 +317,24 @@ class CpuMoeExecutor:
             logger.info_rank0(
                 "ds_fp4: input FP8 round-trip moved to the GPU "
                 "(bit-identical grid; the CPU-side scalar round-trip is skipped)"
+            )
+        # nvfp4 W4A8 (VNNI tier): the per-16-group int8 input quantization ran serially on
+        # the coordinator thread per layer per step (~30 us at bs=3). Its bit-exact GPU twin
+        # (kernel/triton/cpu_moe_prequant.py) runs before the D2H instead, and the CPU reads
+        # the int8 codes + scales directly. FREETOKEN_CPU_MOE_GPU_PREQUANT=0 restores the
+        # CPU-side prep (A/B knob; outputs are bit-identical).
+        self._gpu_prequant_i8 = (
+            fmt == "nvfp4"
+            and device.type == "cuda"
+            and "vnni" in str(self.isa).lower()
+            and os.getenv("FREETOKEN_CPU_MOE_GPU_PREQUANT", "1") != "0"
+            and hasattr(self._ext, "quant_i8_pg16_ref")
+        )
+        self._q_dev: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        if self._gpu_prequant_i8:
+            logger.info_rank0(
+                "nvfp4 W4A8: input int8 quantization moved to the GPU (bit-exact with "
+                "quant_i8_pg16; the coordinator's serial prep is skipped)"
             )
 
         logger.info_rank0(
@@ -488,12 +515,34 @@ class CpuMoeExecutor:
     def _io_for(self, bs: int) -> dict[str, torch.Tensor]:
         io = self._io.get(bs)
         if io is None:
+            # ids + weights live side by side in one pinned routing pack (rows: ids, fp32
+            # weight bits), the host mirror of OffloadMoeCache.routing_pack: the hybrid path
+            # ships both with ONE memcpy; the plain path copies into the same views.
+            from freetoken.moe.offload_cache import ROUTING_PACK_COLS
+
+            assert bs * self.top_k <= ROUTING_PACK_COLS, (bs, self.top_k)
+            if getattr(self, "_rpack", None) is None:
+                self._rpack = alloc_pinned_tensor(2, ROUTING_PACK_COLS, dtype=torch.int32)
             io = {
                 "x": alloc_pinned_tensor(bs, self.H, dtype=torch.bfloat16),
-                "ids": alloc_pinned_tensor(bs, self.top_k, dtype=torch.int32),
-                "w": alloc_pinned_tensor(bs, self.top_k, dtype=torch.float32),
+                "rpack": self._rpack,
+                "ids": self._rpack[0, : bs * self.top_k].view(bs, self.top_k),
+                "w": self._rpack[1, : bs * self.top_k].view(torch.float32).view(bs, self.top_k),
                 "y": alloc_pinned_tensor(bs, self.H, dtype=torch.bfloat16),
             }
+            if self._gpu_prequant_i8:
+                # int8 activations and their group scales share one byte buffer on both
+                # sides, so the D2H is a single memcpy node per layer (2 -> 1).
+                nq, ns = bs * self.H, bs * (self.H // 16) * 4
+                io["xpack"] = alloc_pinned_tensor(nq + ns, dtype=torch.int8)
+                io["xi8"] = io["xpack"][:nq].view(bs, self.H)
+                io["xas"] = io["xpack"][nq:].view(torch.float32).view(bs, self.H // 16)
+                pack_dev = torch.empty(nq + ns, dtype=torch.int8, device=self.device)
+                self._q_dev[bs] = (
+                    pack_dev[:nq].view(bs, self.H),
+                    pack_dev[nq:].view(torch.float32).view(bs, self.H // 16),
+                    pack_dev,
+                )
             self._io[bs] = io
         return io
 
@@ -502,6 +551,9 @@ class CpuMoeExecutor:
         task = self._tasks.get(key)
         if task is None:
             io = self._io_for(bs)
+            extra = (
+                (io["xi8"].data_ptr(), io["xas"].data_ptr()) if self._gpu_prequant_i8 else ()
+            )
             task = self._ext.create_task(
                 layer_id,
                 bs,
@@ -509,6 +561,7 @@ class CpuMoeExecutor:
                 io["ids"].data_ptr(),
                 io["w"].data_ptr(),
                 io["y"].data_ptr(),
+                *extra,
             )
             self._tasks[key] = task
             # Allocate this (layer, bs) combo a flag slot and register its task with the
@@ -535,12 +588,18 @@ class CpuMoeExecutor:
         pending = self.decode_submit(layer_id, hidden_states, topk_weights, topk_ids)
         return self.decode_sync(pending)
 
+    def can_fuse_gate(self) -> bool:
+        """True when decode_submit can produce the shared-expert gate in its pre-quant launch."""
+        return bool(self._gpu_prequant_i8)
+
     def decode_submit(
         self,
         layer_id: int,
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        gate: tuple[torch.Tensor, torch.Tensor] | None = None,
+        routing_pack: torch.Tensor | None = None,
     ) -> tuple:
         """Issue the D2H copies + the CPU-pool submit host node, then return without
         waiting. Lets a caller (the hybrid backend) enqueue GPU work between this and
@@ -562,9 +621,25 @@ class CpuMoeExecutor:
             hidden_states = act_quant_fp8_roundtrip(hidden_states, block=128)
 
         # D2H: ship this step's activations + routing to pinned host memory.
-        io["x"].copy_(hidden_states, non_blocking=True)
-        io["ids"].copy_(topk_ids.to(torch.int32), non_blocking=True)
-        io["w"].copy_(topk_weights.to(torch.float32), non_blocking=True)
+        if self._gpu_prequant_i8:
+            from freetoken.kernel.triton.cpu_moe_prequant import nvfp4_act_quant_i8_pg16
+
+            q_dev, s_dev, pack_dev = self._q_dev[bs]
+            if gate is not None:
+                # ``gate`` = (shared-gate weight [H], fp32 out [bs]): the gate sigmoid rides in
+                # the pre-quant launch (same rows), saving the caller its own kernel.
+                nvfp4_act_quant_i8_pg16(hidden_states.contiguous(), q_dev, s_dev, gate[0], gate[1])
+            else:
+                nvfp4_act_quant_i8_pg16(hidden_states.contiguous(), q_dev, s_dev)
+            io["xpack"].copy_(pack_dev, non_blocking=True)
+        else:
+            io["x"].copy_(hidden_states, non_blocking=True)
+        if routing_pack is not None and routing_pack.shape == io["rpack"].shape:
+            # the ensure kernel wrote ids (row 0) and weight bits (row 1): one D2H
+            io["rpack"].copy_(routing_pack, non_blocking=True)
+        else:
+            io["ids"].copy_(topk_ids.to(torch.int32), non_blocking=True)
+            io["w"].copy_(topk_weights.to(torch.float32), non_blocking=True)
 
         task = self._task_for(layer_id, bs)
         out = torch.empty_like(hidden_states)
@@ -639,6 +714,48 @@ class CpuMoeExecutor:
         for i in dead:
             self._done[i] = 1  # after err: unblock the stream into a checked failure
             suspects.pop(i, None)
+
+    @property
+    def timing_enabled(self) -> bool:
+        """FREETOKEN_CPU_MOE_TIMING=1 (needs an extension built with the timer)."""
+        fn = getattr(self._ext, "timing_enabled", None)
+        return bool(fn()) if fn is not None else False
+
+    def timing_report(self, reset: bool = True) -> dict[int, dict[str, float]]:
+        """Per decode batch size: mean microseconds of the flag path's host-side phases
+        over the window (``total`` = doorbell seen -> done set; ``prep`` = serial input
+        quant on the coordinator; ``wake`` = notify_all -> last worker awake; ``p1`` /
+        ``mid`` / ``p2`` = pass-1, barrier+prep rows, pass-2 incl. the coordinator's own
+        wake) plus ``max`` and the sample count ``n``. Empty when timing is off."""
+        snap_fn = getattr(self._ext, "flag_timing_snapshot", None)
+        if snap_fn is None or not self.timing_enabled:
+            return {}
+        rows = snap_fn(reset)
+        slot_bs = {slot: key[1] for key, slot in self._flag_slots.items()}
+        acc: dict[int, list[int]] = {}
+        for slot, row in enumerate(rows):
+            n = int(row[0])
+            if n == 0:
+                continue
+            bs = slot_bs.get(slot, -1)
+            a = acc.setdefault(bs, [0] * 8)
+            for i in range(7):
+                a[i] += int(row[i])
+            a[7] = max(a[7], int(row[7]))
+        out: dict[int, dict[str, float]] = {}
+        for bs, a in sorted(acc.items()):
+            n = a[0]
+            out[bs] = {
+                "n": float(n),
+                "total": a[1] / n / 1e3,
+                "prep": a[2] / n / 1e3,
+                "wake": a[3] / n / 1e3,
+                "p1": a[4] / n / 1e3,
+                "mid": a[5] / n / 1e3,
+                "p2": a[6] / n / 1e3,
+                "max": a[7] / 1e3,
+            }
+        return out
 
     def raise_if_unhealthy(self) -> None:
         """Raise if the flag watchdog fired (a doorbell stayed unanswered because the

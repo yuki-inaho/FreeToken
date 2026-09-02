@@ -56,6 +56,27 @@ class RMSNorm(nn.Module):
         return rms_norm(x, self.weight, self.eps)
 
 
+def hc_head_combine(
+    x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor,
+    *, hc_mult: int, dim: int, norm_eps: float, hc_eps: float,
+) -> torch.Tensor:
+    """Collapse the ``hc_mult`` residual streams into one hidden for a head: sigmoid-gated
+    combination (no Sinkhorn -- the head has no post/comb split). ``x`` is
+    ``[b, s, hc_mult, dim]`` -> ``[b, s, dim]``. Shared by the main tower's head and the
+    DSpark drafter's final stage (each with its own ``hc_head_*`` parameters)."""
+    from freetoken.kernel.triton.dsv4.hc import hc_pre_combine
+
+    shape, dtype = x.size(), x.dtype
+    xf = x.flatten(2).float()
+    rsqrt = torch.rsqrt(xf.square().mean(-1, keepdim=True) + norm_eps)
+    mixes = F.linear(xf, hc_fn) * rsqrt
+    pre = torch.sigmoid(mixes * hc_scale + hc_base) + hc_eps
+    M = shape[0] * shape[1]
+    return hc_pre_combine(xf.view(M, hc_mult, dim), pre.view(M, hc_mult), dtype).view(
+        *shape[:2], dim
+    )
+
+
 def get_window_topk_idxs(window_size, bsz, seqlen, start_pos):
     if start_pos >= window_size - 1:
         start_pos %= window_size

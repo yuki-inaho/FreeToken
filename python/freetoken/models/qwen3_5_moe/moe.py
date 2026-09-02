@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from typing import TYPE_CHECKING
 
 import torch
@@ -18,15 +20,35 @@ if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
 
 
+# Decode: the shared expert's down GEMV applies silu*mul on load instead of a separate act
+# kernel (FREETOKEN_SHARED_FUSED_ACT=0 restores the act launch).
+_FUSED_SHARED_ACT = os.getenv("FREETOKEN_SHARED_FUSED_ACT", "1") != "0"
+
+
 class _SharedExpert(BaseOP):
     """Always-present shared SwiGLU expert of width ``shared_expert_intermediate_size``."""
 
-    def __init__(self, config: ModelConfig, hidden_size: int, intermediate_size: int):
+    def __init__(
+        self, config: ModelConfig, hidden_size: int, intermediate_size: int,
+        *, fp8_pertensor: bool = False,
+    ):
         if getattr(config, "expert_quant", "none") == "fp8_block":
             self.gate_up_proj = Fp8BlockColMerged(
                 hidden_size, [intermediate_size, intermediate_size], has_bias=False
             )
             self.down_proj = Fp8BlockLinear(intermediate_size, hidden_size, has_bias=False)
+        elif fp8_pertensor:
+            # compressed-tensors mixed export: this layer's MLP is per-channel FP8 (fp8 weight
+            # + per-row scale, W8A16) while the others are NVFP4.
+            from freetoken.kernel.triton.fp8_pertensor_linear import (
+                Fp8PerTensorColMerged,
+                Fp8PerTensorLinear,
+            )
+
+            self.gate_up_proj = Fp8PerTensorColMerged(
+                hidden_size, [intermediate_size, intermediate_size], has_bias=False
+            )
+            self.down_proj = Fp8PerTensorLinear(intermediate_size, hidden_size, has_bias=False)
         elif getattr(config, "dense_quant", "none") == "nvfp4":
             # NVFP4 checkpoint: keep the shared expert's NVFP4 weights native (W4A16).
             from freetoken.kernel.triton.nvfp4_linear import Nvfp4DenseColMerged, Nvfp4DenseLinear
@@ -42,7 +64,15 @@ class _SharedExpert(BaseOP):
             self.down_proj = LinearRowParallel(intermediate_size, hidden_size, has_bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj.forward(silu_and_mul(self.gate_up_proj.forward(x)))
+        gate_up = self.gate_up_proj.forward(x)
+        if _FUSED_SHARED_ACT and x.dim() == 2 and x.shape[0] <= 4 and x.is_cuda:
+            # decode: the down GEMV forms silu(g)*u on load (no act kernel, no intermediate)
+            from freetoken.kernel.triton.fp8_pertensor_linear import rows_gemv_silu_mul
+
+            out = rows_gemv_silu_mul(self.down_proj, gate_up)
+            if out is not None:
+                return out
+        return self.down_proj.forward(silu_and_mul(gate_up))
 
 
 class Qwen3_5DenseMLP(_SharedExpert):
@@ -52,8 +82,13 @@ class Qwen3_5DenseMLP(_SharedExpert):
     so it reuses ``_SharedExpert`` directly and keeps the state-dict keys flat
     (``...layers.N.mlp.{gate_up_proj,down_proj}``)."""
 
-    def __init__(self, config: ModelConfig):
-        super().__init__(config, config.hidden_size, config.intermediate_size)
+    def __init__(self, config: ModelConfig, layer_id: int | None = None):
+        super().__init__(
+            config,
+            config.hidden_size,
+            config.intermediate_size,
+            fp8_pertensor=layer_id in getattr(config, "fp8_dense_layers", frozenset()),
+        )
 
 
 class Qwen3_5MoE(BaseOP):

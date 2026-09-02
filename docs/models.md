@@ -37,6 +37,13 @@ for them; other checkpoints of the same architectures work too.
 - `ft checkpoint` conversion is optional — it pre-converts a checkpoint into
   FreeToken's fast-load format, and `ft serve --model` auto-detects the result.
 - DeepSeek-V4 checkpoints must keep the `inference/config.json` subdir — the
-  authoritative model args are read from there.
+  authoritative model args are read from there. The 0731 release's DSpark
+  block drafter (`mtp.*`) is served with `--speculative-algorithm dspark`
+  (needs the raw safetensors checkpoint, not an FTW conversion); it pays only
+  when the expert cache holds most of the routed experts.
 - Qwen3.8-Flash-Next keeps a 47.7 GiB PLE n-gram table pinned in host RAM.
+- Qwen3.8-Flash-Next's NVFP4 build ships its attention/GDN/hyper-connection/shared-expert
+  projections and lm_head in bf16; `--dense-quant fp8` quantizes them to per-channel FP8 at
+  load (no checkpoint change), halving their decode weight traffic and freeing ~4 GB of VRAM
+  for expert-cache slots (see `--dense-quant` in cli.md).
 - Multimodal checkpoints are served text-only.

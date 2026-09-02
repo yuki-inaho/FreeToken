@@ -281,6 +281,25 @@ class CacheManager:
                 self.swa_pool.alloc_swa(allocated)
             _write_page_table(self.page_table, allocated, allocation_info, self.page_size)
 
+    def truncate_paged(self, req: Req, old_device_len: int) -> None:
+        """Return the whole pages a speculative over-extension allocated past the settled
+        length. The invariant to restore is the one normal decode maintains between steps:
+        page coverage == ceil(cached_len / page_size) -- allocate_paged's next first_page.
+        Keeping coverage keyed to device_len instead would, when the accepted count lands on
+        a page boundary, leave a page the next step's allocator double-allocates (its slot
+        range gets a fresh page while the old one falls out of the table: a leak)."""
+        keep_end = div_ceil(req.cached_len, self.page_size) * self.page_size
+        old_end = div_ceil(old_device_len, self.page_size) * self.page_size
+        if old_end > keep_end:
+            pages = self.page_table[req.table_idx, keep_end:old_end]
+            if self.swa_paged:
+                # allocate_paged bound a window page to each of these full pages (DSV4: the
+                # window tier is page-bound 1:1); give it back too, or the recycled full page
+                # rebinds a fresh window page and the old one is orphaned (a leak
+                # check_integrity's exact SWA conservation would flag).
+                self._free_swa(pages)
+            self._free(pages)
+
     def cache_req(self, req: Req, *, finished: bool) -> None:
         if self.is_swa:
             return self._cache_req_swa(req, finished=finished)

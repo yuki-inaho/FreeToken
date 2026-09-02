@@ -56,6 +56,9 @@ class UserReply(BaseFrontendMsg):
     finish_reason: str | None = None
     # The stop string that ended generation (Anthropic reports it as stop_reason='stop_sequence').
     matched_stop: str | None = None
+    # Per-request engine telemetry copied from the finishing DetokenizeMsg (else None);
+    # surfaced to OpenAI-protocol clients as usage["freetoken"].
+    engine_stats: dict | None = None
 
 
 @dataclass

@@ -560,3 +560,180 @@ struct MultiIndexCopyKernel {
                      device.unwrap())(kernel, params);
     }
 };
+
+
+// ---------------------------------------------------------------------------
+// Layered multi-bank fused index copy -- the expert-PREFETCH variant of the kernel
+// above. The demand kernel is per-layer (its src_ptrs are one layer's banks, the
+// layer riding in the graph node); a speculative prefetch plan spans many layers in
+// one launch, so here src_indices carry FLAT expert ids (layer * num_experts + e)
+// and each row's host source base is looked up from a [num_layers * num_banks]
+// device pointer table. The grid-stride loop keeps a uniform per-block trip count
+// (same discipline as fast_index_copy's kWaitOnFlag path) so the kWaitOnFlag
+// instantiation can poll the shared sync flag per iteration and yield to demand
+// copies that bump it (update_copy_flag / FastIndexCopyKernel::run_high).
+struct MultiLayerIndexCopyParams {
+    const int64_t* __restrict__ dst_ptrs;       // [B] base addr of each bank's slot cache
+    const int64_t* __restrict__ src_ptr_table;  // [num_layers * B] GPU-visible host bank bases
+    const int64_t* __restrict__ feat_bytes;     // [B] per-row bytes (multiple of 16)
+    const void* __restrict__ dst_indices;       // [L] slot ids
+    const void* __restrict__ src_indices;       // [L] flat expert ids
+    const int64_t* __restrict__ valid_length;   // [1] or null
+    int64_t length;                             // max L
+    int num_banks;
+    int64_t num_experts;
+};
+
+template <typename IdType, std::size_t kNumThreads, std::size_t kBlocksPerBank, bool kWaitOnFlag>
+__global__ __launch_bounds__(kNumThreads) void fast_index_copy_multi_layered(
+    const __grid_constant__ MultiLayerIndexCopyParams p,
+    int32_t* sync_flag_ptr
+) {
+    const int b = static_cast<int>(blockIdx.x / kBlocksPerBank);
+    if (b >= p.num_banks) {
+        return;
+    }
+    const int blk = static_cast<int>(blockIdx.x % kBlocksPerBank);
+    auto* dst = reinterpret_cast<uint8_t*>(p.dst_ptrs[b]);
+    const int64_t feat = p.feat_bytes[b];
+    const int64_t n = p.valid_length ? p.valid_length[0] : p.length;
+    const int64_t units = feat >> 4;  // 16-byte (uint4) units per row; feat % 16 == 0
+    const int64_t total = n * units;
+    const auto* di = static_cast<const IdType*>(p.dst_indices);
+    const auto* si = static_cast<const IdType*>(p.src_indices);
+    const int64_t stride = static_cast<int64_t>(kBlocksPerBank) * kNumThreads;
+    const int64_t start = static_cast<int64_t>(blk) * kNumThreads + threadIdx.x;
+    // Uniform per-block trip count: every thread of the block runs max_loops iterations
+    // so the flag barrier below is executed uniformly.
+    const int64_t max_loops = (total + stride - 1) / stride;
+    for (int64_t loop = 0; loop < max_loops; ++loop) {
+        if constexpr (kWaitOnFlag) {
+            if (threadIdx.x == 0) {
+                details::wait_flag_clear(sync_flag_ptr);
+            }
+            __syncthreads();
+        }
+        const int64_t u = start + loop * stride;
+        if (u >= total) {
+            continue;
+        }
+        const int64_t row = u / units;
+        const int64_t col = (u - row * units) << 4;  // byte offset within the row
+        const int64_t pd = static_cast<int64_t>(di[row]);
+        const int64_t flat = static_cast<int64_t>(si[row]);
+        const int64_t layer = flat / p.num_experts;
+        const int64_t e = flat - layer * p.num_experts;
+        const int64_t src_base = p.src_ptr_table[layer * p.num_banks + b];
+        if (src_base == 0) {
+            continue;  // unpinned (CPU-decode) layer placeholder; never admitted, belt+braces
+        }
+        const auto* src = reinterpret_cast<const uint8_t*>(src_base);
+        const uint4 v = *reinterpret_cast<const uint4*>(src + e * feat + col);
+        *reinterpret_cast<uint4*>(dst + pd * feat + col) = v;
+    }
+}
+
+template <std::size_t kNumThreads, std::size_t kBlocksPerBank>
+struct MultiLayerIndexCopyKernel {
+    enum class PriorityMode {
+        kDefault,
+        kNormal
+    };
+
+    static void run_impl(
+        tvm::ffi::TensorView dst_ptrs,
+        tvm::ffi::TensorView src_ptr_table,
+        tvm::ffi::TensorView feat_bytes,
+        tvm::ffi::TensorView dst_indices,
+        tvm::ffi::TensorView src_indices,
+        tvm::ffi::Optional<tvm::ffi::TensorView> num_indices,
+        tvm::ffi::Optional<tvm::ffi::TensorView> sync_flag,
+        int64_t num_experts,
+        PriorityMode mode
+    ) {
+        using namespace host;
+        auto device = SymbolicDevice{};
+        auto B = SymbolicSize{"num_banks"};
+        auto LB = SymbolicSize{"num_layers * num_banks"};
+        auto L = SymbolicSize{"indices length"};
+        auto ptr_dtype = SymbolicDType{};
+        auto table_dtype = SymbolicDType{};
+        auto indices_dtype = SymbolicDType{};
+        auto num_indices_dtype = SymbolicDType{};
+
+        TensorMatcher({B}).with_dtype<int64_t>(ptr_dtype).with_device<kDLCUDA>(device)
+            .verify(dst_ptrs).verify(feat_bytes);
+        TensorMatcher({LB}).with_dtype<int64_t>(table_dtype).with_device<kDLCUDA>(device)
+            .verify(src_ptr_table);
+        TensorMatcher({L}).with_dtype<int32_t, int64_t>(indices_dtype).with_device<kDLCUDA>(device)
+            .verify(dst_indices).verify(src_indices);
+
+        const int64_t* valid_length = nullptr;
+        if (num_indices.has_value()) {
+            TensorMatcher({1}).with_dtype<int64_t>(num_indices_dtype).with_device<kDLCUDA>(device)
+                .verify(num_indices.value());
+            valid_length = static_cast<const int64_t*>(num_indices.value().data_ptr());
+        }
+        const int num_banks = static_cast<int>(B.unwrap());
+        RuntimeCheck(LB.unwrap() % num_banks == 0,
+            "fast_index_copy_multi_layered: src_ptr_table length must be a multiple of num_banks");
+        RuntimeCheck(num_experts > 0, "fast_index_copy_multi_layered: num_experts must be positive");
+
+        const auto params = MultiLayerIndexCopyParams{
+            static_cast<const int64_t*>(dst_ptrs.data_ptr()),
+            static_cast<const int64_t*>(src_ptr_table.data_ptr()),
+            static_cast<const int64_t*>(feat_bytes.data_ptr()),
+            dst_indices.data_ptr(),
+            src_indices.data_ptr(),
+            valid_length,
+            static_cast<int64_t>(L.unwrap()),
+            num_banks,
+            num_experts,
+        };
+        int32_t* sync_flag_ptr = nullptr;
+        if (mode == PriorityMode::kNormal) {
+            RuntimeCheck(sync_flag.has_value(), "sync_flag is required for normal priority mode.");
+            sync_flag_ptr = get_sync_flag_ptr(sync_flag.value(), device);
+        }
+        const auto use_int32 = indices_dtype.unwrap().bits == 32;
+        const auto grid = static_cast<std::size_t>(kBlocksPerBank) * num_banks;
+        if (mode == PriorityMode::kNormal) {
+            const auto kernel = use_int32
+                ? fast_index_copy_multi_layered<int32_t, kNumThreads, kBlocksPerBank, true>
+                : fast_index_copy_multi_layered<int64_t, kNumThreads, kBlocksPerBank, true>;
+            LaunchKernel(grid, kNumThreads, device.unwrap())(kernel, params, sync_flag_ptr);
+            return;
+        }
+        const auto kernel = use_int32
+            ? fast_index_copy_multi_layered<int32_t, kNumThreads, kBlocksPerBank, false>
+            : fast_index_copy_multi_layered<int64_t, kNumThreads, kBlocksPerBank, false>;
+        LaunchKernel(grid, kNumThreads, device.unwrap())(kernel, params, static_cast<int32_t*>(nullptr));
+    }
+
+    static void run(
+        tvm::ffi::TensorView dst_ptrs,
+        tvm::ffi::TensorView src_ptr_table,
+        tvm::ffi::TensorView feat_bytes,
+        tvm::ffi::TensorView dst_indices,
+        tvm::ffi::TensorView src_indices,
+        tvm::ffi::Optional<tvm::ffi::TensorView> num_indices,
+        int64_t num_experts
+    ) {
+        run_impl(dst_ptrs, src_ptr_table, feat_bytes, dst_indices, src_indices, num_indices,
+                 tvm::ffi::Optional<tvm::ffi::TensorView>{}, num_experts, PriorityMode::kDefault);
+    }
+
+    static void run_normal(
+        tvm::ffi::TensorView dst_ptrs,
+        tvm::ffi::TensorView src_ptr_table,
+        tvm::ffi::TensorView feat_bytes,
+        tvm::ffi::TensorView dst_indices,
+        tvm::ffi::TensorView src_indices,
+        tvm::ffi::Optional<tvm::ffi::TensorView> num_indices,
+        tvm::ffi::TensorView sync_flag,
+        int64_t num_experts
+    ) {
+        run_impl(dst_ptrs, src_ptr_table, feat_bytes, dst_indices, src_indices, num_indices,
+                 sync_flag, num_experts, PriorityMode::kNormal);
+    }
+};

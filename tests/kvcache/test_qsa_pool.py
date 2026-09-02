@@ -37,7 +37,11 @@ def _tp(monkeypatch):
     )
 
 
-def _pool(num_pages=4, page_size=64, index_ratio=4, num_req_slots=4, ring_capacity=None):
+FP8 = torch.float8_e4m3fn
+
+
+def _pool(num_pages=4, page_size=64, index_ratio=4, num_req_slots=4, ring_capacity=None,
+          kv_dtype=None):
     return QSAKVCache(
         num_kv_heads=2,
         num_layers=8,
@@ -52,6 +56,7 @@ def _pool(num_pages=4, page_size=64, index_ratio=4, num_req_slots=4, ring_capaci
         num_req_slots=num_req_slots,
         ring_capacity=ring_capacity,
         layer_ids=(1, 3, 5, 7),
+        kv_dtype=kv_dtype,
     )
 
 
@@ -70,13 +75,14 @@ def _spec(*, index_ratio=4, attn_type=AttnType.QSA, num_kv_heads=2, head_dim=64,
     )
 
 
-def _config(spec, *, page_size=64, max_running_req=3):
+def _config(spec, *, page_size=64, max_running_req=3, kv_dtype=None):
     mc = SimpleNamespace(num_layers=8, has_swa_attention=False, has_linear_attention=True)
     mc.kv_cache_group_specs = lambda: (spec,)
     return SimpleNamespace(
         model_config=mc,
         page_size=page_size,
         dtype=torch.bfloat16,
+        kv_dtype=kv_dtype,
         tp_info=SimpleNamespace(size=1),
         max_running_req=max_running_req,
     )
@@ -126,12 +132,49 @@ def test_group_must_not_straddle_a_page():
 
 
 def test_index_slab_needs_a_two_byte_dtype():
+    # The COMPUTE dtype (index slab, ring, backend scratch) must be 16-bit ...
     with pytest.raises(AssertionError, match="2 bytes"):
         QSAKVCache(
             num_kv_heads=2, num_layers=8, head_dim=64, num_pages=4, page_size=64,
             dtype=torch.float32, device=DEV, index_head_dim=32, num_index_layers=4,
             index_ratio=4, num_req_slots=4, layer_ids=(1, 3, 5, 7),
         )
+    # ... while the K/V slab may be the compute dtype or e4m3 (with its scale tier), nothing else.
+    with pytest.raises(ValueError, match="storage dtype"):
+        _pool(kv_dtype=torch.float16)
+
+
+def test_fp8_pool_keeps_compute_dtype_and_adds_a_scale_tier():
+    pool = _pool(num_pages=4, kv_dtype=FP8)
+    assert pool.kv_quantized
+    assert pool.dtype == torch.bfloat16  # what the backend sizes its scratch from
+    assert pool.kv_dtype == FP8 and pool._kv_buffer.dtype == FP8
+    assert pool.k_cache(1).shape == (4, 64, 2, 64) and pool.k_cache(1).dtype == FP8
+    # one fp32 scale per (K|V, sparse layer, token slot, kv head), zero-initialized
+    assert pool._kv_scale.shape == (2, 4, 4 * 64, 2) and pool._kv_scale.dtype == torch.float32
+    assert pool._kv_scale.abs().sum().item() == 0.0
+    assert pool.k_scale(1).shape == (256, 2) and pool.v_scale(7).shape == (256, 2)
+    assert pool.k_scale(1).data_ptr() != pool.v_scale(1).data_ptr()
+    with pytest.raises(KeyError):
+        pool.k_scale(0)
+    # the index tiers are untouched (compute dtype, same geometry)
+    assert pool.cmp_k_cache(0).dtype == torch.bfloat16
+    assert pool.cmp_k_cache(0).shape == (64 + 4, 32)
+    assert pool.pending_ring(0).dtype == torch.bfloat16
+    # 16-bit pools have no scale tier and keep the historical surface
+    plain = _pool()
+    assert not plain.kv_quantized and plain._kv_scale is None
+    assert plain.k_scale(1) is None and plain.v_scale(1) is None
+
+
+def test_fp8_rebuild_resizes_the_scale_tier_too():
+    pool = _pool(num_pages=4, kv_dtype=FP8)
+    pool._kv_scale.fill_(1.0)
+    pool.rebuild(16)
+    assert pool._kv_buffer.dtype == FP8 and pool.k_cache(1).shape == (16, 64, 2, 64)
+    assert pool._kv_scale.shape == (2, 4, 16 * 64, 2)
+    assert pool._kv_scale.abs().sum().item() == 0.0  # re-zeroed, not stale
+    assert pool.cmp_k_cache(0).shape == (16 * 64 // 4 + 4, 32)
 
 
 def test_shadow_row_is_shared_by_a_whole_group():
@@ -185,15 +228,31 @@ def test_kv_cost_prices_ring_and_scratch_as_fixed():
     assert fixed == 4 * row * (QSAKVCache.ring_capacity_for(4) + 1)
 
 
-def test_unit_bytes_matches_the_cost_model():
+@pytest.mark.parametrize("kv_dtype", [None, FP8], ids=["bf16", "fp8"])
+def test_unit_bytes_matches_the_cost_model(kv_dtype):
     spec = _spec()
-    config = _config(spec)
-    pool = _pool()
+    config = _config(spec, kv_dtype=kv_dtype)
+    pool = _pool(kv_dtype=kv_dtype)
     kv_bytes, swa_bytes = pool.unit_bytes()
     assert swa_bytes == 0
     # the scratch rows and the ring must NOT inflate the per-token slider
     assert kv_bytes == spec_kv_bytes_per_token(spec, config)
     assert kv_bytes * 64 == QSAKVCache.kv_cost(config)[0]
+
+
+def test_fp8_prices_codes_plus_scales_on_the_real_geometry():
+    spec = _spec(num_kv_heads=2, head_dim=256, index_head_dim=128, num_index_layers=12,
+                 layer_ids=FULL_LAYER_IDS)
+    bf16 = spec_kv_bytes_per_token(spec, _config(spec))
+    fp8 = spec_kv_bytes_per_token(spec, _config(spec, kv_dtype=FP8))
+    assert bf16 == 24576 + 768
+    # K + V: 12 layers x 2 heads x (256 codes + 4-byte scale); the index slab stays 2-byte.
+    assert fp8 == 2 * 12 * 2 * (256 + 4) + 768 == 13248
+    # the 13-layer speculative geometry (MTP layer) lands on the documented 14,352 B/token
+    spec13 = _spec(num_kv_heads=2, head_dim=256, index_head_dim=128, num_index_layers=13,
+                   layer_ids=FULL_LAYER_IDS + (48,))
+    assert spec_kv_bytes_per_token(spec13, _config(spec13, kv_dtype=FP8)) == 14352
+    assert spec_kv_bytes_per_token(spec13, _config(spec13)) == 27456
 
 
 def test_resolve_pool_class_and_factory():

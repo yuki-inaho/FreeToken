@@ -131,3 +131,64 @@ def dequant_nvfp4(
 
 
 __all__ = ["dequant_nvfp4"]
+
+
+# ---- register-level e2m1 dequant + activation shuffles shared by the dense GEMV/GEMM and the
+# ---- MoE decode kernels (kept in this leaf module: nvfp4_linear imports freetoken.layers)
+
+@triton.jit
+def _nvfp4_pair_f32(v):
+    """Dequant two e2m1 codes held in an int32 at bits [3:0] and [19:16].
+
+    Returns ``(lo, hi)`` fp32 = ``e2m1_value * 2^-14``; the caller multiplies by
+    ``block_scale * 2^14`` (exact, power of two). Bit trick: magnitude bits go to
+    fp16 [11:9] (exponent low bits + mantissa top bit), sign to [15]; fp16's
+    subnormal encoding lines the e==0 codes up on the same 2^-14 factor.
+    """
+    r = ((v << 9) & 0x0E000E00) | ((v & 0x00080008) << 12)
+    lo = (r & 0xFFFF).to(tl.uint16).to(tl.float16, bitcast=True).to(tl.float32)
+    hi = (r >> 16).to(tl.uint16).to(tl.float16, bitcast=True).to(tl.float32)
+    return lo, hi
+
+@triton.jit
+def _split8(a_vec, BLOCK_KW: tl.constexpr):
+    """Contiguous ``[BLOCK_KW * 8]`` activations -> 8 ``[BLOCK_KW]`` vectors, a_j[w] = a[8w+j].
+
+    Register-only shuffles (reshape + split tree); avoids 8 strided gathers per word tile.
+    """
+    a3 = tl.reshape(a_vec, (BLOCK_KW, 4, 2))
+    ev, od = tl.split(a3)  # j in {0,2,4,6} / {1,3,5,7}
+    e = tl.reshape(ev, (BLOCK_KW, 2, 2))
+    o = tl.reshape(od, (BLOCK_KW, 2, 2))
+    e0, e1 = tl.split(e)  # {0,4} / {2,6}
+    o0, o1 = tl.split(o)  # {1,5} / {3,7}
+    a0, a4 = tl.split(e0)
+    a2, a6 = tl.split(e1)
+    a1, a5 = tl.split(o0)
+    a3_, a7 = tl.split(o1)
+    return a0, a1, a2, a3_, a4, a5, a6, a7
+
+@triton.jit
+def _nvfp4_pair_f16(v):
+    """Dequant two e2m1 codes at int32 bits [3:0], [19:16] -> (lo, hi) fp16 = value * 2^-14."""
+    r = ((v << 9) & 0x0E000E00) | ((v & 0x00080008) << 12)
+    lo = (r & 0xFFFF).to(tl.uint16).to(tl.float16, bitcast=True)
+    hi = (r >> 16).to(tl.uint16).to(tl.float16, bitcast=True)
+    return lo, hi
+
+@triton.jit
+def _split8_rows(a_tile, ROWS: tl.constexpr, BLOCK_KW: tl.constexpr):
+    """Contiguous ``[ROWS, BLOCK_KW * 8]`` -> 8 ``[ROWS, BLOCK_KW]`` slices, a_j[r, w] = a[r, 8w+j].
+
+    Register-only (reshape + split tree), mirrors :func:`_split8` with a leading rows dim."""
+    a4 = tl.reshape(a_tile, (ROWS, BLOCK_KW, 4, 2))
+    ev, od = tl.split(a4)  # j in {0,2,4,6} / {1,3,5,7}
+    e = tl.reshape(ev, (ROWS, BLOCK_KW, 2, 2))
+    o = tl.reshape(od, (ROWS, BLOCK_KW, 2, 2))
+    e0, e1 = tl.split(e)  # {0,4} / {2,6}
+    o0, o1 = tl.split(o)  # {1,5} / {3,7}
+    a0, a4_ = tl.split(e0)
+    a2, a6 = tl.split(e1)
+    a1, a5 = tl.split(o0)
+    a3, a7 = tl.split(o1)
+    return a0, a1, a2, a3, a4_, a5, a6, a7

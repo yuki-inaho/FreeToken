@@ -14,14 +14,24 @@ norm weights travel with the call (:class:`QSAIndexerInputs`).
 
 from __future__ import annotations
 
+import os
+
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
 import torch
 from freetoken.core import get_global_ctx
-from freetoken.layers import BaseOP, GemmaPlusOneRMSNorm, LinearColParallelMerged, LinearReplicated
+from freetoken.layers import BaseOP, GemmaPlusOneRMSNorm
+from freetoken.models.quant_linear import make_col_merged_quant, make_replicated_quant
 from freetoken.layers.rotary import get_rope
 from freetoken.utils import nvtx_annotate
+
+# Decode (rows GEMV path): q/k gemma norms + rope in one Triton launch instead of three
+# (FREETOKEN_QK_NORM_ROPE_FUSED=0 restores flashinfer's gemma_rmsnorm x2 + rope).
+_QK_NORM_ROPE_FUSED = os.getenv("FREETOKEN_QK_NORM_ROPE_FUSED", "1") != "0"
+# Decode: the QSA qkv GEMV carries the indexer's q|k projection as a second segment of the same
+# launch (fp8_pertensor_linear.rows_gemv_direct_pair). FREETOKEN_ROWS_GEMV_PAIR=0 restores the separate launches.
+_ROWS_GEMV_PAIR = os.getenv("FREETOKEN_ROWS_GEMV_PAIR", "1") != "0"
 
 if TYPE_CHECKING:
     from freetoken.core import Batch
@@ -84,12 +94,25 @@ class Qwen4ExpIndexer(BaseOP):
         self.head_dim = args.index_head_dim
         self.eps = config.rms_norm_eps
         self._split = [self.num_heads * self.head_dim, self.num_kv_heads * self.head_dim]
-        self.index_qk_proj = LinearReplicated(args.hidden_size, sum(self._split), has_bias=False)
+        # Feeds the discrete block selection; bf16 unless the "index" FP8 part is selected.
+        self.index_qk_proj = make_replicated_quant(
+            "none", args.part_quant("index", config.attn_quant),
+            args.hidden_size, sum(self._split), has_bias=False,
+        )
         self.q_layernorm = GemmaPlusOneRMSNorm(self.head_dim, eps=self.eps)
         self.k_layernorm = GemmaPlusOneRMSNorm(self.head_dim, eps=self.eps)
 
-    def forward(self, x: torch.Tensor) -> QSAIndexerInputs:
-        q, k = self.index_qk_proj.forward(x).split(self._split, dim=-1)
+    def forward(self, x: torch.Tensor, qk=None) -> QSAIndexerInputs:
+        """``qk``: the (q, k) projection halves when the caller already produced them (paired
+        with the attention qkv GEMV at decode)."""
+        if qk is None and x.dim() == 2 and x.shape[0] <= 4 and x.is_cuda:
+            # decode: the rows GEMV emits q and k contiguous (no reshape copies)
+            from freetoken.kernel.triton.fp8_pertensor_linear import rows_gemv_with_epilogue
+
+            qk = rows_gemv_with_epilogue(self.index_qk_proj, x, ("split", *self._split))
+        if qk is None:
+            qk = self.index_qk_proj.forward(x).split(self._split, dim=-1)
+        q, k = qk
         return QSAIndexerInputs(
             q=q.reshape(-1, self.num_heads, self.head_dim).contiguous(),
             k=k.reshape(-1, self.head_dim).contiguous(),
@@ -121,10 +144,15 @@ class Qwen4ExpAttention(BaseOP):
         self.qo_attn_dim = self.num_q * self.head_dim
         self.kv_attn_dim = self.num_kv * self.head_dim
         self._qkv_split = [self.qo_attn_dim * 2, self.kv_attn_dim, self.kv_attn_dim]
-        self.qkv_proj = LinearColParallelMerged(
-            config.hidden_size, self._qkv_split, has_bias=False
+        # bf16 for this checkpoint; per-channel FP8 (quantized at load) under --dense-quant
+        # fp8's "attn" part. Both factories fall back to the plain TP-aware bf16 classes.
+        aq = config.qwen4_args.part_quant("attn", config.attn_quant)
+        self.qkv_proj = make_col_merged_quant(
+            "none", aq, config.hidden_size, self._qkv_split, has_bias=False
         )
-        self.o_proj = LinearReplicated(self.qo_attn_dim, config.hidden_size, has_bias=False)
+        self.o_proj = make_replicated_quant(
+            "none", aq, self.qo_attn_dim, config.hidden_size, has_bias=False
+        )
         self.q_norm = GemmaPlusOneRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = GemmaPlusOneRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         rotary = config.rotary_config
@@ -139,18 +167,54 @@ class Qwen4ExpAttention(BaseOP):
 
     @nvtx_annotate("QSA")
     def forward(self, x: torch.Tensor, batch: Batch) -> torch.Tensor:
-        qg, k, v = self.qkv_proj.forward(x).split(self._qkv_split, dim=-1)
-        qg = qg.view(-1, self.num_q, self.head_dim * 2)
-        q = qg[..., : self.head_dim].contiguous()
-        gate = qg[..., self.head_dim :].reshape(-1, self.qo_attn_dim)
-        k = k.contiguous().view(-1, self.num_kv, self.head_dim)
-        v = v.contiguous()
-        self.q_norm.forward_inplace(q)
-        self.k_norm.forward_inplace(k)
-        q, k = self.rotary.forward(
-            batch.positions, q.view(-1, self.qo_attn_dim), k.view(-1, self.kv_attn_dim)
-        )
-        index = self.indexer.forward(x)
+        packed = None
+        index_qk = None
+        if x.dim() == 2 and x.shape[0] <= 4 and x.is_cuda:
+            # decode: the rows GEMV scatters q / gate / k / v straight into four contiguous
+            # tensors (saves the four strided copies below per layer per step); with the pair
+            # launch the indexer's q|k projection rides in the same kernel.
+            from freetoken.kernel.triton.fp8_pertensor_linear import (
+                rows_gemv_direct_pair,
+                rows_gemv_with_epilogue,
+            )
+
+            epi = ("qsa_qkv", self.num_q, self.num_kv, self.head_dim)
+            if _ROWS_GEMV_PAIR:
+                pair = rows_gemv_direct_pair(
+                    self.qkv_proj, x, epi, self.indexer.index_qk_proj, ("split", *self.indexer._split)
+                )
+                if pair is not None:
+                    packed, index_qk = pair
+            if packed is None:
+                packed = rows_gemv_with_epilogue(self.qkv_proj, x, epi)
+        if packed is not None:
+            q, gate, k, v = packed
+            q = q.view(-1, self.num_q, self.head_dim)
+            k = k.view(-1, self.num_kv, self.head_dim)
+        else:
+            qg, k, v = self.qkv_proj.forward(x).split(self._qkv_split, dim=-1)
+            qg = qg.view(-1, self.num_q, self.head_dim * 2)
+            q = qg[..., : self.head_dim].contiguous()
+            gate = qg[..., self.head_dim :].reshape(-1, self.qo_attn_dim)
+            k = k.contiguous().view(-1, self.num_kv, self.head_dim)
+            v = v.contiguous()
+        if packed is not None and _QK_NORM_ROPE_FUSED and getattr(self.rotary, "is_neox", True):
+            # decode: q/k per-head (1+w) norm + rope in one launch (3 -> 1)
+            from freetoken.kernel.triton.qsa import qsa_qk_norm_rope_fused
+
+            qsa_qk_norm_rope_fused(
+                q, k, batch.positions, self.rotary._cos_sin_cache,
+                self.q_norm.weight, self.k_norm.weight, self.q_norm.eps,
+            )
+            q = q.view(-1, self.qo_attn_dim)
+            k = k.view(-1, self.kv_attn_dim)
+        else:
+            self.q_norm.forward_inplace(q)
+            self.k_norm.forward_inplace(k)
+            q, k = self.rotary.forward(
+                batch.positions, q.view(-1, self.qo_attn_dim), k.view(-1, self.kv_attn_dim)
+            )
+        index = self.indexer.forward(x, qk=index_qk)
         o = get_global_ctx().attn_backend.qsa_forward(
             q.view(-1, self.num_q, self.head_dim), k, v, index, self.layer_id, batch
         )

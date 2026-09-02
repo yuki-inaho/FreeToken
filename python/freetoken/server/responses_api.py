@@ -155,6 +155,9 @@ async def handle_responses(
         spec = convert_responses_to_genspec(
             req, model_sampling, default_max_tokens=default_max,
             reasoning_parser=getattr(state.config, "reasoning_parser", None),
+            default_reasoning_effort=getattr(
+                state.config, "default_reasoning_effort", None
+            ),
         )
         uid = await submit_generation(spec, state)
     except ValueError as exc:
@@ -188,6 +191,7 @@ def convert_responses_to_genspec(
     model_sampling: dict[str, Any],
     default_max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
     reasoning_parser: str | None = None,
+    default_reasoning_effort: str | None = None,
 ) -> GenSpec:
     # Collect every system/developer text — the top-level `instructions` PLUS any
     # system/developer-role input items (codex sends both: a system prompt as `instructions`
@@ -235,6 +239,8 @@ def convert_responses_to_genspec(
     ctk = dict(getattr(req, "chat_template_kwargs", None) or {})
     if req.reasoning:
         ctk = effort_toggle_kwargs(req.reasoning.get("effort"), ctk)
+    elif default_reasoning_effort:
+        ctk = effort_toggle_kwargs(default_reasoning_effort, ctk)
 
     return GenSpec(
         messages=render_messages(messages),

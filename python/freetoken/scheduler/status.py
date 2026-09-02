@@ -34,6 +34,7 @@ class SchedulerStatusReporter:
         page_size: int,
         mamba_slots: tuple[int, int] | None = None,
         swa_tokens: tuple[int, int] | None = None,
+        generated_tokens: int | None = None,
     ) -> None:
         if batch.is_prefill:
             self._report_prefill(
@@ -55,6 +56,7 @@ class SchedulerStatusReporter:
                 page_size=page_size,
                 mamba_slots=mamba_slots,
                 swa_tokens=swa_tokens,
+                generated_tokens=generated_tokens,
             )
 
     def _report_prefill(
@@ -101,9 +103,13 @@ class SchedulerStatusReporter:
         page_size: int,
         mamba_slots: tuple[int, int] | None = None,
         swa_tokens: tuple[int, int] | None = None,
+        generated_tokens: int | None = None,
     ) -> None:
         self._decode_forward_count += 1
-        self._decode_generated_tokens += len(batch.reqs)
+        # A speculative verify step emits a variable run of tokens for its one request.
+        self._decode_generated_tokens += (
+            generated_tokens if generated_tokens is not None else len(batch.reqs)
+        )
         if self._decode_forward_count % self.decode_log_interval != 0:
             return
 

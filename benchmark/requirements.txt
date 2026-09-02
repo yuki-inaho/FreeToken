@@ -1,0 +1,4 @@
+# Everything runs inside the serving venv (/home/nuko/.freetoken/venv); the only additions
+# beyond FreeToken's own dependencies are:
+matplotlib>=3.8     # report plots
+# pynvml ships with the venv (NVML telemetry); transformers/tokenizers too (exact-length prompts).

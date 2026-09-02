@@ -18,6 +18,51 @@ def vision_load_enabled() -> bool:
     return os.getenv("FREETOKEN_LOAD_VISION", "0").strip().lower() in _VISION_TRUE
 
 
+def mtp_load_enabled() -> bool:
+    """The MTP (multi-token-prediction) draft head is opt-in (default OFF). For checkpoints
+    that ship one (e.g. Qwen3.8-Flash-Next: one full-attention layer plus ~4.7 GiB of resident
+    bf16 experts) it is only useful with speculative decoding, so we skip building and loading
+    it unless ``FREETOKEN_LOAD_MTP=1`` is set."""
+    return os.getenv("FREETOKEN_LOAD_MTP", "0").strip().lower() in _VISION_TRUE
+
+
+# Load-time FP8 for a checkpoint's bf16 dense linears (Qwen3.8-Flash-Next: attention, GDN,
+# hyper-connection mixes, shared expert, lm_head all sit in the modelopt ignore list). Selected
+# by --dense-quant fp8 (exported as FREETOKEN_DENSE_QUANT so it reaches parse_config and the
+# spawned engine workers); FREETOKEN_DENSE_FP8_PARTS narrows the part set for A/B bisection.
+# "mtp" (the MTP head's own dense linears) is speed-neutral and frees ~155 MB (~56 expert slots).
+DENSE_FP8_DEFAULT_PARTS = frozenset({"gdn", "attn", "hc", "shared", "lm_head", "mtp"})
+DENSE_FP8_ALL_PARTS = DENSE_FP8_DEFAULT_PARTS | {"index", "ple", "mtp", "draft_nvfp4"}
+
+
+def dense_quant_override() -> str:
+    """``FREETOKEN_DENSE_QUANT``: ``auto`` (default, keep the checkpoint's dtypes) | ``bf16``
+    (same) | ``fp8`` (quantize the selected dense parts to per-channel FP8 at load)."""
+    raw = os.getenv("FREETOKEN_DENSE_QUANT", "auto").strip().lower() or "auto"
+    if raw not in ("auto", "bf16", "fp8"):
+        raise ValueError(f"FREETOKEN_DENSE_QUANT={raw!r}: expected auto, bf16 or fp8")
+    return raw
+
+
+def dense_fp8_parts() -> frozenset[str]:
+    """The dense parts quantized to FP8 at load: empty unless ``FREETOKEN_DENSE_QUANT=fp8``;
+    then ``FREETOKEN_DENSE_FP8_PARTS`` (comma list over ``DENSE_FP8_ALL_PARTS``) or the
+    default set. Both the model config and the weight loader call this, so they agree."""
+    if dense_quant_override() != "fp8":
+        return frozenset()
+    raw = os.getenv("FREETOKEN_DENSE_FP8_PARTS")
+    if raw is None or not raw.strip():
+        return DENSE_FP8_DEFAULT_PARTS
+    parts = frozenset(p.strip().lower() for p in raw.split(",") if p.strip())
+    unknown = parts - DENSE_FP8_ALL_PARTS
+    if unknown:
+        raise ValueError(
+            f"FREETOKEN_DENSE_FP8_PARTS: unknown part(s) {sorted(unknown)}; "
+            f"choose from {sorted(DENSE_FP8_ALL_PARTS)}"
+        )
+    return parts
+
+
 def detect_expert_quant(hf_config: Any) -> str:
     """Routed-expert quantization from a checkpoint's ``quantization_config``: ``"nvfp4"`` for
     a ModelOpt FP4 build, else the lowercased algo string (``"none"`` when unquantized). Models
@@ -32,6 +77,14 @@ def detect_expert_quant(hf_config: Any) -> str:
     if algo is None:
         return "none"
     return "nvfp4" if "fp4" in str(algo).lower() else str(algo).lower()
+
+
+def draft_lm_head_enabled() -> bool:
+    """Whether a model with a bf16 lm_head builds an NVFP4 copy for the speculative DRAFT
+    passes only (``draft_lm_head``): the draft and chained-draft logits read ~4x fewer bytes
+    while the target logits keep the bf16 head, so the emitted distribution is untouched.
+    On by default under speculative decoding; ``FREETOKEN_DRAFT_LM_HEAD=0`` disables."""
+    return mtp_load_enabled() and os.getenv("FREETOKEN_DRAFT_LM_HEAD", "1") != "0"
 
 
 def detect_compressed_tensors_nvfp4(hf_config: Any) -> bool:
@@ -262,6 +315,10 @@ class ModelConfig:
     # routed experts and lm_head: e.g. pure-NVFP4 Qwen3.5 has bf16 attn + bf16 lm_head but FP4
     # shared experts, so this is "nvfp4" while attn_quant / lm_head_quant are "none".
     dense_quant: str = "none"
+    # Dense (non-MoE) MLP layers that deviate from ``dense_quant`` and are stored as per-channel
+    # FP8 instead (compressed-tensors mixed-precision exports keep a few tail layers at 8 bits).
+    # They are served through the per-row-scale FP8 linears (W8A16).
+    fp8_dense_layers: frozenset = frozenset()
     # Weight quantization of the lm_head. "nvfp4" keeps the (untied) FP4 head native (W4A16) --
     # the bf16 dequant of this ~1 GB matrix was the single largest decode kernel; "none" leaves
     # it bf16. Separate from dense_quant because only some NVFP4 checkpoints quantize lm_head
@@ -294,6 +351,16 @@ class ModelConfig:
     vision_config: Any | None = None
     image_token_id: int | None = None
     attention_groups: Tuple[AttentionGroupConfig, ...] = ()
+    # ----- Speculative decoding (set by the model's extend_config_for_speculative hook) -----
+    # Extra KV-bearing layer ids past num_layers (e.g. an MTP draft layer registered in an
+    # attention group). num_layers itself stays the main tower's count -- it drives model
+    # construction and the MoE-offload layer count -- while the KV pools accept layer ids in
+    # [0, num_layers + num_extra_kv_layers).
+    num_extra_kv_layers: int = 0
+    # Draft tokens per speculative verify step (0 = speculation off). Sizes the QSA pending
+    # ring and any other per-step speculative buffers, and keeps the KV cost model in
+    # lockstep with the pool factory.
+    num_speculative_tokens: int = 0
     has_attn_bias: bool = False
     has_router_bias: bool = False
     moe_weight_format: str | None = None
@@ -335,6 +402,12 @@ class ModelConfig:
         only store experts for the trailing layers; everything else has all layers MoE.
         """
         return self.num_layers - self.first_k_dense_replace
+
+    @property
+    def kv_layer_id_bound(self) -> int:
+        """Exclusive upper bound of the KV-pool layer-id namespace: the main tower's layers
+        plus any speculative extra KV layers (e.g. an MTP draft layer)."""
+        return self.num_layers + self.num_extra_kv_layers
 
     @property
     def is_multimodal(self) -> bool:

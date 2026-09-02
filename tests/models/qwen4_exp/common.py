@@ -154,6 +154,7 @@ class Fixture:
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
         page_size: int = 64,
+        kv_dtype: torch.dtype | None = None,
     ) -> None:
         from freetoken.attention.qsa_sparse import QSASparseAttnBackend
         from freetoken.kvcache import create_kvcache_pool
@@ -161,6 +162,7 @@ class Fixture:
         self.config = config
         self.device = torch.device(device)
         self.dtype = dtype
+        self.kv_dtype = dtype if kv_dtype is None else kv_dtype
         self.page_size = page_size
         self.num_req_slots = max_running_req + 1
         self.pool = create_kvcache_pool(
@@ -170,6 +172,7 @@ class Fixture:
             dtype=dtype,
             device=self.device,
             num_req_slots=self.num_req_slots,
+            kv_dtype=kv_dtype,  # None -> the compute dtype; torch.float8_e4m3fn -> the fp8 pool
         )
         self.page_table = torch.zeros(
             (self.num_req_slots, num_pages * page_size), dtype=torch.int32, device=self.device
@@ -248,8 +251,8 @@ def selection_spy(monkeypatch, backend) -> dict:
     seen: dict[str, torch.Tensor] = {}
     original = QSASparseAttnBackend._select
 
-    def spy(self, index, md, slot):
-        indices = original(self, index, md, slot)
+    def spy(self, index, md, slot, *extra, **kwargs):
+        indices = original(self, index, md, slot, *extra, **kwargs)
         seen["indices"] = indices.clone()
         return indices
 

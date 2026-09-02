@@ -901,6 +901,25 @@ def test_convert_reasoning_effort_none_disables_thinking():
     }
 
 
+def test_default_reasoning_effort_only_applies_when_request_omits_one():
+    plain = ResponsesRequest.model_validate({"model": "m", "input": "hi"})
+    spec = RP.convert_responses_to_genspec(
+        plain, {}, default_reasoning_effort="none"
+    )
+    assert spec.chat_template_kwargs == {
+        "enable_thinking": False, "thinking_mode": "disabled"
+    }
+
+    explicit = ResponsesRequest.model_validate(
+        {"model": "m", "input": "hi", "reasoning": {"effort": "high"}}
+    )
+    spec = RP.convert_responses_to_genspec(
+        explicit, {}, default_reasoning_effort="none"
+    )
+    assert spec.chat_template_kwargs["reasoning_effort"] == "high"
+    assert spec.chat_template_kwargs["enable_thinking"] is True
+
+
 def test_convert_reasoning_toggle_broadcasts_every_spelling():
     """The toggle is broadcast in every spelling templates read; a template
     picks the knob it knows (M3: thinking_mode) and ignores the rest, so the

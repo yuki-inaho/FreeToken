@@ -389,6 +389,51 @@ def test_triton_decode_marlin_matches_dequant_reference_after_prefill_stomp():
 
 
 @cuda
+def test_triton_decode_marlin_skips_cpu_routes_and_folds_addend():
+    """Hybrid-backend contract of the Triton decode GEMV: routes whose slot is -1 (assigned
+    to the CPU executor) are skipped -- they contribute exactly zero, whatever their
+    weight -- and ``finalize`` returns a partial folded into the sum-reduce, so
+    ``gpu_routes(out) == ref(gpu routes only) + partial``."""
+    from freetoken.moe.fused_nvfp4 import fused_experts_decode_nvfp4_marlin
+
+    device = torch.device("cuda")
+    cache, ref_sources = _triton_cache(device)
+    torch.manual_seed(5)
+    M = 3
+    hidden = torch.randn(M, H, dtype=torch.bfloat16, device=device) / 4
+    topk_weights = torch.rand(M, TOPK, dtype=torch.float32, device=device)
+    raw = torch.tensor([[1, 6], [2, 6], [3, 0]], dtype=torch.int32, device=device)
+    ids = raw.clone()
+    cache.ensure_experts(0, ids)  # -> slots, all resident
+    cache.copy_missing()
+    banks = cache.bank_views()
+    # Reference over the GPU-kept routes only (row 0 keeps both, row 1 keeps route 1,
+    # row 2 keeps nothing).
+    keep = torch.tensor([[True, True], [False, True], [False, False]], device=device)
+    ids_gpu = torch.where(keep, ids, torch.full_like(ids, -1))
+    w_ref = torch.where(keep, topk_weights, torch.zeros_like(topk_weights))
+    ref = _ref_moe(ref_sources, 0, hidden, w_ref, raw)
+    partial = torch.randn(M, H, dtype=torch.bfloat16, device=device)
+    calls = []
+
+    def finalize():
+        calls.append(1)
+        return partial
+
+    out = fused_experts_decode_nvfp4_marlin(
+        hidden, *banks, topk_weights, ids_gpu, "silu", False, finalize=finalize
+    )
+    assert calls == [1]
+    _assert_close(out.float() - partial.float(), ref)
+    # row 2 (all routes on the CPU) is exactly the addend: the skipped routes wrote zeros
+    torch.testing.assert_close(out[2].float(), partial[2].float())
+    # without finalize the skipped rows are exactly zero
+    out2 = fused_experts_decode_nvfp4_marlin(hidden, *banks, topk_weights, ids_gpu, "silu", False)
+    assert torch.equal(out2[2], torch.zeros_like(out2[2]))
+    _assert_close(out2, ref)
+
+
+@cuda
 def test_triton_decode_marlin_matches_baseline_kernel():
     """The production marlin-style decode GEMV must match the original LUT-gather decode
     within tolerance (it only reorders the dequant math: int32 wide load + deferred reduce)."""

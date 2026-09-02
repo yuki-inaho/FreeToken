@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
 import torch
@@ -42,6 +43,13 @@ logger = init_logger(__name__)
 
 Indice2D: TypeAlias = Tuple[torch.Tensor, torch.Tensor]
 
+# Decode MoE cache stats cadence (steps per [moe-stats] line, 0 = off). Read once at
+# import like the other FREETOKEN_* diagnostics; also force-enables cache.collect_stats
+# at engine init (see _init_offload_moe_cache).
+from freetoken.moe.offload_cache import moe_stats_log_interval
+
+_MOE_STATS_LOG = moe_stats_log_interval()
+
 
 def _gib(n_bytes: int) -> str:
     return f"{n_bytes / (1 << 30):.2f} GiB"
@@ -56,6 +64,26 @@ class ForwardInput(NamedTuple):
 
 
 ForwardData: TypeAlias = "Tuple[ForwardInput, ForwardOutput]"
+
+
+def _engine_stats(req: "Req", now: float) -> dict:
+    """Per-request engine telemetry for the finishing reply (usage["freetoken"]).
+
+    ``prefill_s`` is the in-engine prefill wall time (first chunk scheduled -> first token
+    drained), excluding HTTP/tokenizer time; ``decode_s`` spans first -> last emitted token;
+    a verify step counts as one decode step. getattr defaults keep stub requests in unit
+    tests working. Costs a few ints and two clock stamps per request lifetime.
+    """
+    first = getattr(req, "stat_first_token_t", None)
+    prefill_s = getattr(req, "stat_prefill_s", None)
+    return {
+        "prefill_s": None if prefill_s is None else round(prefill_s, 4),
+        "decode_s": None if first is None else round(now - first, 4),
+        "decode_steps": getattr(req, "stat_decode_steps", 0),
+        "spec_steps": getattr(req, "stat_spec_steps", 0),
+        "draft_tokens": getattr(req, "stat_draft_tokens", 0),
+        "accepted_tokens": getattr(req, "stat_accepted_tokens", 0),
+    }
 
 
 class Scheduler(SchedulerIOMixin):
@@ -112,6 +140,14 @@ class Scheduler(SchedulerIOMixin):
         # A received-but-not-yet-executed runtime cache rebuild (CacheRebuildBackendMsg),
         # run at the next idle safe point in overlap_loop. None when no rebuild is pending.
         self._pending_rebuild: CacheRebuildBackendMsg | None = None
+        # Elastic KV pool (see scheduler/elastic_kv.py): the startup geometry is the base;
+        # requests that triggered a grow/shrink wait here until the rebuild has landed.
+        self._elastic_base_pages: int = self.engine.num_pages
+        self._elastic_last_activity: float = time.monotonic()
+        self._elastic_seq: int = 0
+        self._elastic_attempted: set[int] = set()
+        self._elastic_backoff_until: float = 0.0
+        self._parked_msgs: list = []
         self.tokenizer = load_tokenizer(config.model_path)
         self.eos_token_ids = load_eos_token_ids(config.model_path, self.tokenizer)
         self.toolcall_anchor_id = None
@@ -125,6 +161,15 @@ class Scheduler(SchedulerIOMixin):
                 toolcall_opener_for(getattr(config, "tool_call_parser", "")),
             )
         self.token_pool = self.table_manager.token_pool
+        # Speculative decoding (MTP): the engine owns the executor; the scheduler owns the
+        # session state machine (Req.spec_state), engages verify batches only while exactly
+        # one greedy request is decoding, and wires the token pool the executor scatters into.
+        self.spec_k = config.num_spec_tokens if self.engine.spec_executor is not None else 0
+        # First-prefill-chunk schedule time per uid; consumed at first-token drain to report
+        # the request's in-engine prefill wall time (usage["freetoken"].prefill_s).
+        self._prefill_t0: dict[int, float] = {}
+        if self.engine.spec_executor is not None:
+            self.engine.spec_executor.token_pool = self.token_pool
         # Floor the prefill chunk by the cache manager's cap (DSV4: ~half the window pool) so a
         # sliding-window cache chunks long prompts and frees out-of-window pages between chunks
         # instead of OOMing _alloc_window on a prompt longer than the window pool.
@@ -182,6 +227,8 @@ class Scheduler(SchedulerIOMixin):
                 # needlessly reallocates + zeros the whole GPU token_pool every mamba resize).
                 self.table_manager.rebuild(self.engine.page_table)
                 self.token_pool = self.table_manager.token_pool
+                if getattr(self.engine, "spec_executor", None) is not None:
+                    self.engine.spec_executor.token_pool = self.token_pool
             self.cache_manager.check_integrity()
         # The prefill chunk cap tracks the CURRENT window-pool size (DSV4); a rebuild that
         # shrank the pool must shrink the cap too, or the next long prompt is chunked against
@@ -238,7 +285,9 @@ class Scheduler(SchedulerIOMixin):
                 # cross-stream wait and before the forward reads the live slot (program order
                 # vs the prior batch's snapshot writes). Doing this on self.stream would race.
                 self._restore_linear_states(forward_input.batch)
-                ongoing_data = (forward_input, self._forward(forward_input))
+                fwd_out = self._forward(forward_input)
+                # None: a prefill hit CUDA OOM; its requests were aborted (client told), nothing to drain
+                ongoing_data = None if fwd_out is None else (forward_input, fwd_out)
 
         # The drain issues GPU-visible writes to state the batch just launched still reads: the
         # page-table re-point and, for the paged-SWA pools, the full->swa (DSV4: full->window)
@@ -247,6 +296,15 @@ class Scheduler(SchedulerIOMixin):
         # in-flight forward. copy_done only covers batch N; order against N+1 explicitly.
         self.stream.wait_stream(self.engine.stream)
         self._process_last_data(last_data)
+        if ongoing_data is not None and (
+            ongoing_data[0].batch.spec is not None
+            or getattr(ongoing_data[0].batch, "spec_warmup", None) is not None
+        ):
+            # Speculative steps drain immediately (non-overlap): a verify's next scheduling
+            # needs the host-side accepted count, and a warmup's session-state flip must land
+            # before the next decode step is staged (else it would warm up twice).
+            self._process_last_data(ongoing_data)
+            ongoing_data = None
         self._flush_abort_acks()
         return ongoing_data
 
@@ -272,7 +330,9 @@ class Scheduler(SchedulerIOMixin):
         if forward_input is not None:
             # already inside engine_stream_ctx (run_forever); restore on the engine stream
             self._restore_linear_states(forward_input.batch)
-            ongoing_data = (forward_input, self._forward(forward_input))
+            fwd_out = self._forward(forward_input)
+            # None: a prefill hit CUDA OOM; its requests were aborted (client told), nothing to drain
+            ongoing_data = None if fwd_out is None else (forward_input, fwd_out)
 
         self._process_last_data(ongoing_data)
         self._flush_abort_acks()
@@ -302,9 +362,21 @@ class Scheduler(SchedulerIOMixin):
     def _process_last_data(self, last_data: ForwardData | None) -> None:
         if last_data is None:
             return
+        self._elastic_last_activity = time.monotonic()
+
+        if _MOE_STATS_LOG and last_data[0].batch.is_decode:
+            self._moe_stats_steps = getattr(self, "_moe_stats_steps", 0) + 1
+            if self._moe_stats_steps >= _MOE_STATS_LOG:
+                self._moe_stats_steps = 0
+                self._log_moe_decode_stats()
+
+        if getattr(last_data[0].batch, "spec", None) is not None:
+            self._process_spec_last_data(last_data[0].batch, last_data[1])
+            return
 
         batch, (_, next_tokens_cpu, copy_done) = last_data[0].batch, last_data[1]
         copy_done.synchronize()
+        now = time.monotonic()
         reply: List[DetokenizeMsg] = []
         new_finished_reqs: Set[Req] = set()
         with self.cache_manager.lazy_free_region():
@@ -337,6 +409,13 @@ class Scheduler(SchedulerIOMixin):
                 next_token = next_tokens_cpu[i]
                 req.append_host(next_token.unsqueeze(0))
                 next_token = int(next_token.item())
+                if batch.is_prefill:
+                    _t0 = self.__dict__.setdefault("_prefill_t0", {}).pop(req.uid, None)
+                    if _t0 is not None:
+                        req.stat_prefill_s = now - _t0
+                    req.stat_first_token_t = now
+                else:
+                    req.stat_decode_steps = getattr(req, "stat_decode_steps", 0) + 1
                 # EOS / stop-string -> "stop", output budget exhausted -> "length";
                 # EOS and stop strings win over length.
                 hit_length = not req.can_decode
@@ -360,6 +439,10 @@ class Scheduler(SchedulerIOMixin):
                     and not finished
                 ):
                     req.toolcall_anchor_len = req.input_ids.numel()
+                if getattr(batch, "spec_warmup", None) is req and not finished:
+                    # The warmup step ran and its draft is staged; decode continues as
+                    # verify steps.
+                    req.spec_state = "ready"
                 reply.append(
                     DetokenizeMsg(
                         uid=req.uid,
@@ -368,6 +451,7 @@ class Scheduler(SchedulerIOMixin):
                         finish_reason=finish_reason,
                         matched_stop=matched_stop,
                         stop_strs=req.sampling_params.stop_strs or None,
+                        engine_stats=_engine_stats(req, now) if finished else None,
                     )
                 )
 
@@ -416,6 +500,152 @@ class Scheduler(SchedulerIOMixin):
             swa_tokens=swa_tokens,
         )
         self.send_result(reply)
+
+    def _process_spec_last_data(self, batch: Batch, output) -> None:
+        """Drain one speculative verify step: settle Req bookkeeping to the emitted run,
+        truncating at the first terminal condition (EOS / stop string / length). The device
+        side already committed states and scattered tokens for the full accepted count; a
+        truncation re-commits at the kept count (the scratch still holds the step's
+        intermediates), so the state, ``cached_len`` and ``input_ids`` stay aligned and the
+        finish-time prefix donation remains valid."""
+        executor = self.engine.spec_executor
+        req = batch.reqs[0]
+        from freetoken.engine.spec import _SPEC_HOST_TIME
+
+        if _SPEC_HOST_TIME:
+            import time as _time
+
+            _t0 = _time.perf_counter()
+            output.copy_done.synchronize()
+            _t1 = _time.perf_counter()
+            executor._ht_sync.append(_t1 - _t0)
+        else:
+            output.copy_done.synchronize()
+        n = int(output.num_emitted_cpu.item())
+        cands = output.candidates_cpu
+        if batch.spec is not None:
+            from freetoken.engine.spec import update_accept_ema
+
+            update_accept_ema(req, batch.spec.num_input_tokens - 1, n - 1)
+            req.stat_decode_steps = getattr(req, "stat_decode_steps", 0) + 1
+            req.stat_spec_steps = getattr(req, "stat_spec_steps", 0) + 1
+            req.stat_draft_tokens = getattr(req, "stat_draft_tokens", 0) + (
+                batch.spec.num_input_tokens - 1
+            )
+            req.stat_accepted_tokens = getattr(req, "stat_accepted_tokens", 0) + max(n - 1, 0)
+
+        if req in self.finished_reqs:
+            # Overlap edge: the previous drain finished this request after this verify was
+            # already launched. Everything the step wrote lands in freed slots that any
+            # later owner re-initializes; nothing to settle.
+            return
+        if req.aborted:
+            # Keep the invariant state == cached_len == len(input_ids) with the minimum
+            # emitted token, then free through the normal abort path (no reply).
+            executor.recommit(req, 1)
+            req.append_host(cands[:1])
+            old_device_len = req.device_len
+            req.commit_verify(1)
+            self.cache_manager.truncate_paged(req, old_device_len)
+            req.spec_state = "off"
+            executor.drop(req.uid)
+            self.decode_manager.remove_req(req)
+            with self.cache_manager.lazy_free_region():
+                self._free_req_resources(req)
+            self.finished_reqs = self.finished_reqs | {req}
+            return
+
+        kept = 0
+        finished = False
+        finish_reason = None
+        matched_stop = None
+        tokens: List[int] = []
+        for j in range(n):
+            token_t = cands[j : j + 1]
+            req.append_host(token_t)
+            kept += 1
+            token = int(token_t.item())
+            tokens.append(token)
+            hit_length = req.input_ids.numel() >= req.max_device_len
+            hit_eos = not req.sampling_params.ignore_eos and token in self.eos_token_ids
+            matched_stop = (
+                self._match_stop_str(req)
+                if not hit_eos and req.sampling_params.stop_strs
+                else None
+            )
+            finished = hit_length or hit_eos or matched_stop is not None
+            finish_reason = (
+                ("stop" if (hit_eos or matched_stop is not None) else "length")
+                if finished
+                else None
+            )
+            if finished:
+                break
+        # One message for the whole run: the detokenizer's batch decode requires at most one
+        # DetokenizeMsg per uid per batch, and next_token must stay the run's LAST token so
+        # the finished/eos handling keyed on it applies to the token that triggered it.
+        reply: List[DetokenizeMsg] = [
+            DetokenizeMsg(
+                uid=req.uid,
+                next_token=tokens[-1],
+                extra_tokens=tokens[:-1] or None,
+                finished=finished,
+                finish_reason=finish_reason,
+                matched_stop=matched_stop,
+                stop_strs=req.sampling_params.stop_strs or None,
+                engine_stats=_engine_stats(req, time.monotonic()) if finished else None,
+            )
+        ]
+
+        if kept < n:
+            executor.recommit(req, kept)  # before commit_verify: reads the pre-commit cached_len
+        old_device_len = req.device_len
+        req.commit_verify(kept)
+        # Give back the whole pages the optimistic bump allocated past the settled length.
+        with self.cache_manager.lazy_free_region():
+            self.cache_manager.truncate_paged(req, old_device_len)
+
+        if finished:
+            req.spec_state = "off"
+            executor.drop(req.uid)
+            self.decode_manager.remove_req(req)
+            with self.cache_manager.lazy_free_region():
+                self._free_req_resources(req)
+            self.finished_reqs = self.finished_reqs | {req}
+        elif req not in self.decode_manager.running_reqs:
+            # The launch-time filter saw the optimistic (over-bumped) device_len; the
+            # settled books may still have budget.
+            self.decode_manager.filter_reqs([req])
+
+        used, total = self._kv_usage_pages()
+        mamba_slots = self._mamba_slot_usage()
+        swa_tokens = self._swa_token_usage()
+        if reply:
+            mem = self._gpu_mem_bytes()
+            mamba_used, mamba_total = mamba_slots or (0, 0)
+            swa_used, swa_total = swa_tokens or (0, 0)
+            for m in reply:
+                m.kv_used_pages = used
+                m.kv_total_pages = total
+                m.mamba_used_slots = mamba_used
+                m.mamba_total_slots = mamba_total
+                m.swa_used_tokens = swa_used
+                m.swa_total_tokens = swa_total
+                m.gpu_mem_bytes = mem
+        self.status_reporter.report_batch(
+            batch,
+            running_reqs=len(self.decode_manager.running_reqs),
+            queue_reqs=len(self.prefill_manager.pending_list),
+            kv_used_pages=used,
+            kv_total_pages=total,
+            page_size=self.config.page_size,
+            mamba_slots=mamba_slots,
+            swa_tokens=swa_tokens,
+            generated_tokens=kept,
+        )
+        self.send_result(reply)
+        if _SPEC_HOST_TIME:
+            executor._ht_drain.append(_time.perf_counter() - _t1)
 
     def _match_stop_str(self, req: Req) -> str | None:
         """First stop string present in this request's generated tail, else None. Decodes
@@ -491,6 +721,10 @@ class Scheduler(SchedulerIOMixin):
                 return
             input_len, max_seq_len = len(msg.input_ids), self.engine.max_seq_len
             max_output_len = max_seq_len - input_len
+            if self._elastic_kv_maybe_resize(msg, input_len):
+                return  # parked: re-processed once the queued rebuild has landed
+            self.__dict__.setdefault("_elastic_attempted", set()).discard(msg.uid)
+            self._elastic_last_activity = time.monotonic()
             if max_output_len <= 0:
                 logger.warning_rank0(
                     f"Input sequence length {input_len} exceeds {max_seq_len}, "
@@ -595,12 +829,15 @@ class Scheduler(SchedulerIOMixin):
                 req.mamba_restore_src = None  # consumed: restore exactly once
 
     def _free_req_resources(self, req: Req) -> None:
+        self.__dict__.setdefault("_prefill_t0", {}).pop(req.uid, None)
         # Idempotent: an EOS-finished request can stay in running_reqs (output budget left), so an
         # abort in the same overlap iteration races _process_last_data and would free it twice --
         # double-freeing its table_idx and (hybrid) GDN slots onto the free-list, handing the same
         # slots to two later requests. table_idx == -1 marks an already-freed request.
         if req.table_idx == -1:
             return
+        if getattr(self, "spec_k", 0):
+            self.engine.spec_executor.drop(req.uid)
         # Polymorphic free: the DSV4 manager returns the request's window pages + cmp/idx blocks
         # to their tier free-lists; the generic manager frees its KV pages (it reads
         # page_table[req.table_idx], so free the table entry after).
@@ -609,6 +846,10 @@ class Scheduler(SchedulerIOMixin):
         req.table_idx = -1
 
     def _reply_rebuild(self, request_id: str, status: str, error: str | None = None) -> None:
+        if request_id.startswith("auto:") and status != "ok":
+            # elastic KV: do not hammer a resize that just failed (e.g. transient OOM)
+            self._elastic_backoff_until = time.monotonic() + 600.0
+            logger.warning_rank0(f"[elastic-kv] automatic resize {status}: {error}; backing off 10 min")
         # Single source of truth with the rollback snapshot (_current_cache_geometry): mamba is
         # usable slots (padding sink excluded, matching the status-bar gauge), and num_swa_pages
         # reports 0 unless the model actually has a window pool.
@@ -627,7 +868,87 @@ class Scheduler(SchedulerIOMixin):
             ]
         )
 
+    def _elastic_kv_enabled(self) -> bool:
+        cfg = getattr(self, "config", None)
+        if cfg is None:
+            return False  # stub schedulers in unit tests carry no config
+        return (
+            cfg.kv_elastic_max_tokens > 0
+            and cfg.tp_info.size == 1
+            and self.engine.moe_offload_cache is not None
+            and self.engine.num_pages > 0
+        )
+
+    def _elastic_kv_maybe_resize(self, msg, input_len: int) -> bool:
+        """Elastic KV policy at admission. Returns True when ``msg`` was parked behind a queued
+        grow (the pool is too small for it) or shrink (it fits the base and the pool has been
+        idle long enough); the message is re-processed after the rebuild. A request that
+        already triggered one attempt is never parked twice (a rejected grow falls through to
+        the normal too-long error)."""
+        if not self._elastic_kv_enabled() or msg.uid in self._elastic_attempted:
+            return False
+        if time.monotonic() < self._elastic_backoff_until:
+            return False  # a recent automatic resize was rejected/failed: leave the pool alone
+        if self._pending_rebuild is not None:
+            # a resize is already queued (maybe by an earlier request): ride along
+            self._parked_msgs.append(msg)
+            self._elastic_attempted.add(msg.uid)
+            return True
+        from freetoken.kvcache.cache_status import compute_cache_unit_bytes
+        from freetoken.scheduler.elastic_kv import needed_tokens, plan_moe_for_pages, plan_target_tokens
+
+        cfg = self.config
+        page = cfg.page_size
+        cap = cfg.kv_elastic_max_tokens
+        base_pages = self._elastic_base_pages
+        cur_pages = self.engine.num_pages
+        base_tokens, cur_tokens = base_pages * page, cur_pages * page
+        needed = needed_tokens(input_len, int(getattr(msg.sampling_params, "max_tokens", 1024) or 1024), cap)
+        target_pages = None
+        if needed > cur_tokens and input_len < cap:
+            target_pages = (plan_target_tokens(needed, base_tokens, cap) + page - 1) // page
+            if target_pages <= cur_pages:
+                target_pages = None
+            reason = "grow"
+        elif (
+            cur_pages > base_pages
+            and needed <= base_tokens
+            and time.monotonic() - self._elastic_last_activity >= cfg.kv_elastic_idle_s
+        ):
+            target_pages = base_pages
+            reason = "shrink"
+        if target_pages is None:
+            return False
+        unit = compute_cache_unit_bytes(self.engine)
+        kv_per_page = unit["kv_bytes_per_token"] * page
+        slot_bytes = unit["moe_bytes_per_expert"]
+        cur_moe = self.engine.moe_offload_cache.cache_size
+        moe_target = plan_moe_for_pages(cur_pages, cur_moe, target_pages, kv_per_page, slot_bytes)
+        if moe_target <= 0 or kv_per_page <= 0:
+            return False
+        self._elastic_seq += 1
+        logger.info_rank0(
+            f"[elastic-kv] {reason}: request {msg.uid} (prompt {input_len} tok, needs ~{needed}) "
+            f"-> KV {cur_tokens} -> {target_pages * page} tokens, expert slots {cur_moe} -> {moe_target}"
+        )
+        self._pending_rebuild = CacheRebuildBackendMsg(
+            request_id=f"auto:{self._elastic_seq}", moe_cache_size=moe_target, num_pages=target_pages,
+        )
+        self._parked_msgs.append(msg)
+        self._elastic_attempted.add(msg.uid)
+        return True
+
     def _execute_pending_rebuild(self) -> None:
+        # Requests parked behind an elastic resize are re-processed against the new geometry
+        # whatever the outcome (a rejected grow surfaces as the normal too-long error).
+        parked, self._parked_msgs = self._parked_msgs, []
+        try:
+            self._execute_pending_rebuild_inner()
+        finally:
+            for m in parked:
+                self._process_one_msg(m)
+
+    def _execute_pending_rebuild_inner(self) -> None:
         from freetoken.engine.engine import CacheRebuildRejected
 
         msg = self._pending_rebuild
@@ -698,6 +1019,66 @@ class Scheduler(SchedulerIOMixin):
         # mistaken for a rebuild failure and roll back the geometry the engine now serves.
         self._log_cache_geometry("Cache rebuilt")
         self._reply_rebuild(msg.request_id, "ok")
+
+    def _log_moe_decode_stats(self) -> None:
+        """Periodic decode MoE cache readout: one line per FREETOKEN_MOE_STATS_LOG drained
+        decode steps, each line covering exactly that window (stats reset after logging).
+        The .item() reads sync on the engine stream's already-enqueued accumulations --
+        negligible at the default cadence, and this only runs when the env asks for it."""
+        cache = self.engine.moe_offload_cache
+        if cache is None:
+            return
+        self._log_cpu_moe_timing(cache)
+        if not cache.collect_stats:
+            return
+        try:
+            s = cache.decode_miss_stats()
+            per_step = s["missing_per_layer"] * cache.num_layers
+            try:
+                from freetoken.kvcache.cache_status import compute_cache_unit_bytes
+
+                fetch_mb = (
+                    s["fetched_per_layer"] * cache.num_layers
+                    * compute_cache_unit_bytes(self.engine)["moe_bytes_per_expert"] / (1 << 20)
+                )
+            except Exception:  # noqa: BLE001 -- byte figure is best-effort decoration
+                fetch_mb = 0.0
+            extras = "".join(
+                f" {k}={v:.3f}" if isinstance(v, float) else f" {k}={v}"
+                for k, v in s.items()
+                if k.startswith("prefetch_") or k.startswith("pf_")
+            )
+            logger.info_rank0(
+                f"[moe-stats] miss_rate={s['miss_rate']:.3f}"
+                f" active/layer={s['active_per_layer']:.1f}"
+                f" missing/layer={s['missing_per_layer']:.1f}"
+                f" fetched/layer={s['fetched_per_layer']:.1f}"
+                f" cpu/layer={s['cpu_per_layer']:.1f}"
+                f" missing/step={per_step:.0f}"
+                f" fetch_MB/step={fetch_mb:.0f}"
+                f" layer_calls={s['layer_calls']}" + extras
+            )
+            cache.reset_stats()
+        except Exception as e:  # noqa: BLE001 -- diagnostics must never take down the loop
+            logger.warning(f"could not log MoE decode stats: {e!r}")
+
+    def _log_cpu_moe_timing(self, cache) -> None:
+        """FREETOKEN_CPU_MOE_TIMING=1: the hybrid/cpu backend's host-side per-layer
+        latency breakdown (microseconds, means over the window) at the moe-stats cadence."""
+        executor = getattr(cache, "cpu_executor", None)
+        if executor is None or not getattr(executor, "timing_enabled", False):
+            return
+        try:
+            report = executor.timing_report(reset=True)
+        except Exception as e:  # noqa: BLE001 -- diagnostics must never take down the loop
+            logger.warning(f"could not read CPU MoE timing: {e!r}")
+            return
+        for bs, r in report.items():
+            logger.info_rank0(
+                f"[cpu-moe-timing] bs={bs} n={int(r['n'])} total={r['total']:.1f}us"
+                f" prep={r['prep']:.1f} wake={r['wake']:.1f} p1={r['p1']:.1f}"
+                f" mid={r['mid']:.1f} p2={r['p2']:.1f} max={r['max']:.1f}"
+            )
 
     def _current_cache_geometry(self) -> dict:
         """The pools' current (serving) sizes as rebuild_cache kwargs — the rollback snapshot and
@@ -778,6 +1159,14 @@ class Scheduler(SchedulerIOMixin):
         # Polymorphic page allocation: DSV4 allocates window pages + cmp/idx blocks into its
         # slot maps; the generic manager allocates KV pages into the page table.
         self.cache_manager.allocate_paged(batch.reqs)
+        if (
+            batch.spec is not None
+            and self.engine.spec_executor.has_graph(batch.spec.num_input_tokens)
+        ):
+            # Graph-mode verify step: the executor stages inputs/positions/out_loc as
+            # contiguous token-pool/page-table slices and the graphs carry their own
+            # metadata, so the per-step building below would be dead work.
+            return ForwardInput(batch=batch, sample_args=None, input_tuple=None, write_tuple=None)
         if batch.is_prefill:
             self._gather_multimodal(batch)
         batch.positions = _make_positions(batch, self.device)
@@ -836,9 +1225,68 @@ class Scheduler(SchedulerIOMixin):
         )
         if batch is None:
             return None
+        if batch.is_prefill:
+            # Stamp each request's first prefill schedule (getattr: unit tests drive this
+            # method on stub schedulers/batches that predate the telemetry fields).
+            _now = time.monotonic()
+            _t0map = self.__dict__.setdefault("_prefill_t0", {})
+            for _req in getattr(batch, "reqs", ()):
+                _t0map.setdefault(_req.uid, _now)
+        if getattr(self, "spec_k", 0):
+            if batch.is_decode:
+                self._stage_spec(batch)
+            else:
+                self._stage_spec_prefill(batch)
         forward_input = self._prepare_batch(batch)
         self._report_prompt_admissions(batch)
         return forward_input
+
+    def _stage_spec_prefill(self, batch: Batch) -> None:
+        """Arm the speculative session when a prompt's FINAL prefill chunk is scheduled.
+
+        Marked at schedule time (not at drain): under overlap scheduling the first decode
+        step is staged before the prefill batch drains, and the warmup draft must ride that
+        first step -- a later warmup would leave a gap in the MTP layer's KV."""
+        for req in batch.reqs:
+            if isinstance(req, ChunkedReq):
+                continue  # intermediate chunk; the final chunk carries the original req
+            req.spec_state = "warmup"
+
+    def _stage_spec(self, batch: Batch) -> None:
+        """Turn an eligible one-request decode batch into a verify (or warmup) step.
+
+        Speculation engages only for a single greedy request. Any decode step outside that
+        shape ends the request's session for good (session-terminating fallback): its MTP
+        KV would go stale for normally-decoded tokens, so it only re-arms with a new prefill.
+        """
+        from freetoken.engine.spec import SpecBatchInfo
+
+        if len(batch.reqs) != 1:
+            for req in batch.reqs:
+                if req.spec_state != "off":
+                    req.spec_state = "off"
+                    self.engine.spec_executor.drop(req.uid)
+            return
+        req = batch.reqs[0]
+        if req.spec_state == "off":
+            return
+        if req.spec_state == "warmup":
+            batch.spec_warmup = req
+            return
+        # ready: stage a verify of up to spec_k drafts, clipped by the output budget. With
+        # no room for even one draft this is the request's last token -- plain decode, and
+        # the session ends (the plain step's position gets no MTP KV).
+        # the executor staged req.spec_k_staged drafts for this step (adaptive k); the
+        # budget may still clip the verify (a smaller captured set or eager serves it)
+        k_eff = min(req.spec_k_staged or self.spec_k, self.spec_k, req.max_device_len - req.device_len)
+        if k_eff >= 1:
+            req.begin_verify(k_eff)
+            batch.spec = SpecBatchInfo(
+                scratch=self.engine.spec_executor.scratch, num_input_tokens=k_eff + 1
+            )
+        else:
+            req.spec_state = "off"
+            self.engine.spec_executor.drop(req.uid)
 
     def _report_prompt_admissions(self, batch: Batch) -> None:
         """Publish first-prefill accounting only after batch preparation succeeded.
@@ -863,13 +1311,58 @@ class Scheduler(SchedulerIOMixin):
         pending.clear()
         self.send_result([ErrorReplyMsg(uid=uid, error="request aborted") for uid in uids])
 
-    def _forward(self, forward_input: ForwardInput) -> ForwardOutput:
+    def _abort_prefill_oom(self, batch: Batch, err: BaseException) -> None:
+        torch.cuda.synchronize(self.device)
+        torch.cuda.empty_cache()
+        try:
+            free_b, total_b = torch.cuda.mem_get_info(self.device)
+            mem = f"{free_b / 2**30:.2f} GiB free of {total_b / 2**30:.2f} GiB after the failure"
+        except Exception:  # noqa: BLE001
+            mem = "memory state unavailable"
+        logger.error(
+            f"prefill batch of {len(batch.reqs)} request(s) hit CUDA OOM ({mem}); aborting "
+            f"the request(s) and continuing: {str(err).splitlines()[0][:200]}"
+        )
+        replies = []
+        for req in list(batch.reqs):
+            freed = self.prefill_manager.abort_req(req.uid) or self.decode_manager.abort_req(req.uid)
+            target = freed or req
+            with self.cache_manager.lazy_free_region():
+                self._free_req_resources(target)
+            replies.append(
+                ErrorReplyMsg(
+                    uid=req.uid,
+                    error=(
+                        "GPU out of memory while prefilling this prompt (another process may be "
+                        "holding VRAM, or the prompt is too long for the remaining headroom); the "
+                        "request was aborted"
+                    ),
+                    code="server_error",
+                )
+            )
+        if replies:
+            self.send_result(replies)
+
+    def _forward(self, forward_input: ForwardInput) -> ForwardOutput | None:
         batch, sample_args, input_mapping, output_mapping = forward_input
-        batch.input_ids = self.token_pool[input_mapping]
+        if input_mapping is not None:
+            batch.input_ids = self.token_pool[input_mapping]
         if self.toolcall_anchor_id is not None and not batch.is_prefill:
             self.cache_manager.snapshot_toolcall_anchor(batch.reqs)
-        forward_output = self.engine.forward_batch(batch, sample_args)
-        self.token_pool[output_mapping] = forward_output.next_tokens_gpu
+        try:
+            forward_output = self.engine.forward_batch(batch, sample_args)
+        except torch.OutOfMemoryError as e:
+            if not batch.is_prefill:
+                raise
+            # A prefill chunk's transient did not fit (typically another process grabbed VRAM
+            # after boot): abort the batch's requests with an error instead of taking the
+            # scheduler down. Nothing of this chunk was committed (cached_len is the last
+            # finished chunk), so the abort path frees a consistent request.
+            self._abort_prefill_oom(batch, e)
+            return None
+        if batch.spec is None:
+            self.token_pool[output_mapping] = forward_output.next_tokens_gpu
+        # else: the spec executor already scattered the emitted run and the next draft
         self.decode_manager.filter_reqs(forward_input.batch.reqs)
         return forward_output
 

@@ -1,4 +1,4 @@
-from .config import parse_config
+from .config import extend_config_for_speculative, parse_config
 from .model import Qwen3_5MoEForCausalLM
 from .weight import (
     iter_weights,
@@ -10,6 +10,7 @@ from .weight import (
 
 __all__ = [
     "Qwen3_5MoEForCausalLM",
+    "extend_config_for_speculative",
     "parse_config",
     "iter_weights",
     "iter_weights_parallel",

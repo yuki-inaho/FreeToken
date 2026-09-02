@@ -111,6 +111,7 @@ class GenDone:
     completion_tokens: int
     matched_stop: str | None = None
     cached_tokens: int = 0
+    engine_stats: dict | None = None
 
 
 GenEvent = ReasoningDelta | ContentDelta | ToolCallStart | ToolCallArgsDelta | ToolCallsDelta | GenDone
@@ -126,6 +127,7 @@ class GenResult:
     completion_tokens: int
     matched_stop: str | None = None
     cached_tokens: int = 0
+    engine_stats: dict | None = None
 
 
 @dataclass
@@ -647,6 +649,7 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
 
     engine_finish_reason: str | None = None
     engine_matched_stop: str | None = None
+    engine_stats: dict | None = None
     async for ack in state.wait_for_ack(uid):
         if getattr(ack, "error", None):
             raise GenerationError(ack.error, getattr(ack, "error_code", None))
@@ -671,6 +674,7 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
         if ack.finished:
             engine_finish_reason = getattr(ack, "finish_reason", None)
             engine_matched_stop = getattr(ack, "matched_stop", None)
+            engine_stats = getattr(ack, "engine_stats", None)
             break
 
     # Drain residue held in the reasoning parser (a deferred tool block, or a
@@ -735,6 +739,7 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
     yield GenDone(
         finish_reason, prompt_tokens, completion_tokens,
         matched_stop=engine_matched_stop, cached_tokens=cached_tokens,
+        engine_stats=engine_stats,
     )
 
 
@@ -747,6 +752,7 @@ async def _generate_full_impl(uid: int, spec: GenSpec, state: Any) -> GenResult:
     cached_tokens = 0
     engine_finish_reason: str | None = None
     engine_matched_stop: str | None = None
+    engine_stats: dict | None = None
     async for ack in state.wait_for_ack(uid):
         if getattr(ack, "error", None):
             raise GenerationError(ack.error, getattr(ack, "error_code", None))
@@ -757,6 +763,7 @@ async def _generate_full_impl(uid: int, spec: GenSpec, state: Any) -> GenResult:
         if ack.finished:
             engine_finish_reason = getattr(ack, "finish_reason", None)
             engine_matched_stop = getattr(ack, "matched_stop", None)
+            engine_stats = getattr(ack, "engine_stats", None)
             break
 
     reasoning_text, content_text = _split_reasoning(full_content, spec, state)
@@ -779,4 +786,5 @@ async def _generate_full_impl(uid: int, spec: GenSpec, state: Any) -> GenResult:
         completion_tokens=completion_tokens,
         matched_stop=engine_matched_stop,
         cached_tokens=cached_tokens,
+        engine_stats=engine_stats,
     )

@@ -1,0 +1,3 @@
+# Server stdout captured during a run: megabytes of progress-bar carriage returns.
+# The measurement data (runs.jsonl, telemetry/, meta-*.json) is kept.
+results/*/server-logs/

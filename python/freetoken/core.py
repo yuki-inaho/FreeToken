@@ -30,6 +30,15 @@ class SamplingParams:
     def is_greedy(self) -> bool:
         return (self.temperature <= 0.0 or self.top_k == 1) and self.top_p == 1.0
 
+    @property
+    def is_argmax(self) -> bool:
+        """The sampled token is the argmax regardless of top-k/top-p filtering (both keep
+        the highest-probability token). Weaker than ``is_greedy``, which additionally
+        requires the *distribution* to be untouched -- argmax-invariance is what greedy-match
+        speculative verification needs, and server-filled defaults (top_p 0.95) would
+        otherwise disqualify every temperature-0 request."""
+        return self.temperature <= 0.0 or self.top_k == 1
+
 
 @dataclass(eq=False)
 class Req:
@@ -64,6 +73,25 @@ class Req:
     # handler must not free resources under an in-flight forward; it sets this flag and
     # _process_last_data frees the request when the batch drains (after copy_done.synchronize).
     aborted: bool = False
+    # Speculative-decoding (MTP) session state, scheduler-owned. "off" = never engage (also
+    # the terminal fallback state -- once a session ends it only restarts with a new prefill);
+    # "warmup" = prompt prefilled with draft KV, the first decode step still owes the first
+    # draft; "ready" = a draft is staged in the token pool, decode steps run as verify steps.
+    spec_state: str = "off"
+    # Adaptive draft count (engine/spec.py): how many drafts the executor staged for this
+    # request's NEXT verify (0 = the executor's base k), and the running fraction of drafts
+    # accepted (EMA over verify steps; None until the first drain).
+    spec_k_staged: int = 0
+    spec_ema: float | None = None
+    # Per-request engine telemetry, reported on the finishing reply (usage["freetoken"]).
+    # decode_steps counts decode forwards that emitted tokens (a verify step is one step);
+    # draft/accepted count speculative drafts attempted / accepted by verification.
+    stat_decode_steps: int = 0
+    stat_spec_steps: int = 0
+    stat_draft_tokens: int = 0
+    stat_accepted_tokens: int = 0
+    stat_prefill_s: float | None = None
+    stat_first_token_t: float | None = None
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu
@@ -88,6 +116,25 @@ class Req:
     def complete_one(self) -> None:
         self.cached_len = self.device_len
         self.device_len += 1
+
+    def begin_verify(self, num_draft_tokens: int) -> None:
+        """Extend this decode step to a speculative verify of ``num_draft_tokens + 1`` tokens.
+
+        The drafts are already staged in the token pool at positions ``device_len ..``; the
+        bump makes ``extend_len == num_draft_tokens + 1`` so the ragged scheduler paths
+        (positions, page allocation, input gather) cover them. ``commit_verify`` settles the
+        books once the accepted count is known.
+        """
+        assert self.extend_len == 1, "begin_verify extends a plain decode step"
+        assert self.device_len + num_draft_tokens <= self.max_device_len
+        self.device_len += num_draft_tokens
+
+    def commit_verify(self, num_emitted: int) -> None:
+        """Settle a verify step: ``num_emitted`` inputs were valid (states cover them), the
+        same count of tokens was emitted, and the next step's input is the newest one."""
+        assert num_emitted >= 1
+        self.cached_len = self.cached_len + num_emitted
+        self.device_len = self.cached_len + 1
 
     def append_host(self, next_token: torch.Tensor) -> None:
         n = self.input_ids.numel()
@@ -146,6 +193,11 @@ class Batch:
     # _prepare_batch succeeds. Continuation chunks leave this empty, so accounting is
     # exactly-once.
     prompt_admissions: List[Tuple[int, int, int]] = field(default_factory=list, init=False)
+    # Speculative verify step (phase stays "decode"): carries the per-step scratch
+    # (engine/spec.py SpecBatchInfo). The one-token decode fast paths (QSA staging, FLA/PLE
+    # metadata, the GDN single-step branch, graph dispatch) all gate on ``spec is None`` and
+    # take their ragged multi-token forms instead when it is set.
+    spec: "object | None" = field(default=None, init=False)
 
     @property
     def is_prefill(self) -> bool:
@@ -154,6 +206,10 @@ class Batch:
     @property
     def is_decode(self) -> bool:
         return self.phase == "decode"
+
+    @property
+    def is_spec_verify(self) -> bool:
+        return self.spec is not None
 
     @property
     def size(self) -> int:

@@ -50,6 +50,10 @@ _CPU_PINNED = {"device": "cpu", "dtype": torch.int32, "pin_memory": True}
 # Block-score transient budget (vLLM's number): the fp32 [rows, n_blocks] logits tile is
 # 256 KB per row at a 1M-token context, so a long prefill must be scored in row chunks.
 _LOGITS_WORKSPACE_BYTES = 128 << 20
+# Decode (<= 4 rows, fp8 KV): the five index-write launches per QSA layer run as one kernel;
+# FREETOKEN_QSA_DECODE_FUSED=0 restores the separate kernels (bit-identical stores, fp32
+# reduction-order noise on the normed rows).
+_QSA_DECODE_FUSED = os.getenv("FREETOKEN_QSA_DECODE_FUSED", "1") != "0"
 
 
 TORCH_TOPK_ENV = "FREETOKEN_QSA_TORCH_TOPK"
@@ -180,7 +184,11 @@ class QSASparseAttnBackend(BaseAttnBackend):
         reqs = batch.padded_reqs if hasattr(batch, "padded_reqs") else batch.reqs
         seqlens_q = [r.extend_len for r in reqs]
         seqlens_k = [r.device_len for r in reqs]
-        is_decode = getattr(batch, "phase", None) == "decode"
+        # A speculative verify batch keeps phase "decode" but is ragged (k+1 tokens per
+        # sequence), so it takes the generic staging below, not the one-token decode path.
+        is_decode = (
+            getattr(batch, "phase", None) == "decode" and getattr(batch, "spec", None) is None
+        )
         qo_indptr = torch.tensor([0] + seqlens_q, **_CPU_PINNED).cumsum_(0).to(torch.int32)
         kv_len = torch.tensor(seqlens_k, **_CPU_PINNED)
         last = (qo_indptr[1:].to(torch.int32) - 1).to(self.device, non_blocking=True)
@@ -271,7 +279,16 @@ class QSASparseAttnBackend(BaseAttnBackend):
         md = batch.attn_metadata
         assert isinstance(md, QSASparseMetadata)
         slot = self._idx_slot[layer_id]
-        self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
+        T = k.shape[0]
+        fused = (
+            _QSA_DECODE_FUSED
+            and T <= 4
+            and self.kvcache.kv_quantized
+            and md.block_table is not None
+            and T + self.ratio - 1 <= self.ring_capacity
+        )
+        if not fused:
+            self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
         if md.block_table is None:
             self._snapshot_decode(md, batch)
         if slot == 0 or md.cmp_rows is None:
@@ -280,8 +297,33 @@ class QSASparseAttnBackend(BaseAttnBackend):
             # cached plan would bake the warmup's addresses into the graph.
             self._plan_index_writes(md, batch)
 
-        self._update_index_cache(index, md, slot)
-        indices = self._select(index, md, slot)
+        q_index = None
+        if fused:
+            # Decode (<= 4 rows): K/V fp8 store + group compress + compressed-key norm/rope +
+            # ring store + query-side norm/rope in ONE launch (kernel/triton/qsa/fused_decode.py).
+            from freetoken.kernel.triton.qsa import qsa_index_write_fused
+
+            rows = index.q.shape[0]
+            q_index = self._scratch(
+                "q_index", rows, self.index_heads, self.index_head_dim, dtype=self.dtype
+            )
+            kc = self.kvcache
+            dense = kc._dense(layer_id)
+            qsa_index_write_fused(
+                k=k, v=v, out_loc=batch.out_loc,
+                k_cache=kc._k_buffer[dense].view(kc._storage_shape),
+                v_cache=kc._v_buffer[dense].view(kc._storage_shape),
+                k_scale=kc._kv_scale[0, dense], v_scale=kc._kv_scale[1, dense],
+                raw_k=index.k, idx_q=index.q.view(rows, -1), q_out=q_index,
+                ring=kc.pending_ring(slot), ring_slots=md.ring_slots,
+                token_to_req=md.token_to_req, cu_seqlens=md.cu_seqlens, positions=md.positions,
+                cmp_cache=kc.cmp_k_cache(slot), cmp_rows=md.cmp_rows, ring_rows=md.ring_rows,
+                cos_sin=self._index_rope_cache(), k_norm_weight=index.k_norm_weight,
+                q_norm_weight=index.q_norm_weight, eps=index.eps, ratio=self.ratio,
+            )
+        else:
+            self._update_index_cache(index, md, slot)
+        indices = self._select(index, md, slot, q_index)
         return qsa_sparse_paged_attention(
             q,
             self.kvcache.k_cache(layer_id),
@@ -290,12 +332,26 @@ class QSASparseAttnBackend(BaseAttnBackend):
             md.block_table,
             md.token_to_req,
             torch.empty_like(q),
+            # fp8 pools (--kv-cache-dtype fp8): per-(token, kv head) scales the kernel folds
+            # in; None (16-bit slabs) keeps the historical path.
+            k_scale=self.kvcache.k_scale(layer_id),
+            v_scale=self.kvcache.v_scale(layer_id),
         )
 
     def _plan_index_writes(self, md: QSASparseMetadata, batch: Batch) -> None:
         """Per-token slab row and ring row for this forward; the other QSA layers reuse it
         (it is layer-invariant). Pure device arithmetic: no host sync, graph-capturable."""
         md.positions = batch.positions
+        if _QSA_DECODE_FUSED and batch.out_loc.numel() <= 64:
+            # one launch instead of ~20 elementwise ops (same arithmetic as below)
+            from freetoken.kernel.triton.qsa import qsa_plan_index_writes
+
+            md.cmp_rows, md.ring_rows = qsa_plan_index_writes(
+                batch.out_loc, batch.positions, md.token_to_req, md.ring_slots, md.cu_seqlens,
+                ratio=self.ratio, ring_capacity=self.ring_capacity,
+                scratch_base=self.kvcache.cmp_scratch_base,
+            )
+            return
         out_loc = batch.out_loc.to(torch.int64)
         positions = batch.positions.to(torch.int64)
         rows = torch.arange(out_loc.numel(), device=self.device)
@@ -351,8 +407,9 @@ class QSASparseAttnBackend(BaseAttnBackend):
         # ones a straddling group just consumed.
         qsa_store_rows(ring, md.ring_rows, index.k)
 
-    def _select(self, index, md: QSASparseMetadata, slot: int) -> torch.Tensor:
-        """Score complete visible blocks, take the top-k, expand them to token indices."""
+    def _select(self, index, md: QSASparseMetadata, slot: int, q_index=None) -> torch.Tensor:
+        """Score complete visible blocks, take the top-k, expand them to token indices.
+        ``q_index``: the query-side normed/roped rows when a fused prologue already made them."""
         from freetoken.kernel.triton.qsa import (
             expand_qsa_block_indices,
             qsa_index_norm_rope,
@@ -361,18 +418,19 @@ class QSASparseAttnBackend(BaseAttnBackend):
 
         rows = index.q.shape[0]
         positions = md.positions
-        q_index = self._scratch(
-            "q_index", rows, self.index_heads, self.index_head_dim, dtype=self.dtype
-        )
-        qsa_index_norm_rope(
-            index.q.view(-1, self.index_head_dim),
-            positions,
-            self._index_rope_cache(),
-            index.q_norm_weight,
-            index.eps,
-            q_index.view(-1, self.index_head_dim),
-            heads=self.index_heads,
-        )
+        if q_index is None:
+            q_index = self._scratch(
+                "q_index", rows, self.index_heads, self.index_head_dim, dtype=self.dtype
+            )
+            qsa_index_norm_rope(
+                index.q.view(-1, self.index_head_dim),
+                positions,
+                self._index_rope_cache(),
+                index.q_norm_weight,
+                index.eps,
+                q_index.view(-1, self.index_head_dim),
+                heads=self.index_heads,
+            )
         cmp_pages = self._cmp_pages(slot)
         columns = md.block_table.shape[1] * self.cmp_page_size
         indices = self._scratch("indices", rows, self.select_width, dtype=torch.int32)

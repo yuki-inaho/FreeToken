@@ -119,14 +119,42 @@ def _raw_checkpoint() -> dict[str, torch.Tensor]:
         f"{attn}.indexer.q_layernorm.weight": _bf16(IHD),
         f"{attn}.indexer.k_layernorm.weight": _bf16(IHD),
     })
+    raw.update(_mtp_raw())
     raw.update({
-        "mtp.hyper_connection_mixer.hc_norm.weight": _bf16(HCH),
-        "mtp.layers.0.self_attn.q_proj.weight": _bf16(2 * QH * AHD, H),
-        "mtp.layers.0.mlp.experts.gate_up_proj": _bf16(E, 2 * I, H),
-        "mtp.layers.0.mlp.experts.down_proj": _bf16(E, H, I),
         "model.visual.blocks.0.attn.qkv.weight": _bf16(3 * H, H),
         "model.visual.merger.norm.weight": _bf16(H),
     })
+    return raw
+
+
+def _mtp_raw() -> dict[str, torch.Tensor]:
+    """The complete MTP head at test geometry (fusion-consistent, all bf16, no scales)."""
+    mtp = "mtp.layers.0"
+    raw = {
+        "mtp.pre_fc_norm_hidden.weight": _bf16(HCH),
+        "mtp.pre_fc_norm_embedding.weight": _bf16(H),
+        "mtp.fc_hidden.weight": _bf16(H, H),
+        "mtp.fc_embedding.weight": _bf16(H, H),
+        f"{mtp}.self_attn.q_proj.weight": _bf16(2 * QH * AHD, H),
+        f"{mtp}.self_attn.k_proj.weight": _bf16(KVH * AHD, H),
+        f"{mtp}.self_attn.v_proj.weight": _bf16(KVH * AHD, H),
+        f"{mtp}.self_attn.o_proj.weight": _bf16(H, QH * AHD),
+        f"{mtp}.self_attn.q_norm.weight": _bf16(AHD),
+        f"{mtp}.self_attn.k_norm.weight": _bf16(AHD),
+        f"{mtp}.self_attn.indexer.index_qk_proj.weight": _bf16(5 * IHD, H),
+        f"{mtp}.self_attn.indexer.q_layernorm.weight": _bf16(IHD),
+        f"{mtp}.self_attn.indexer.k_layernorm.weight": _bf16(IHD),
+        f"{mtp}.mlp.gate.weight": _bf16(E, H),
+        f"{mtp}.mlp.shared_expert.gate_proj.weight": _bf16(I, H),
+        f"{mtp}.mlp.shared_expert.up_proj.weight": _bf16(I, H),
+        f"{mtp}.mlp.shared_expert.down_proj.weight": _bf16(H, I),
+        f"{mtp}.mlp.shared_expert_gate.weight": _bf16(1, H),
+        f"{mtp}.mlp.experts.gate_up_proj": _bf16(E, 2 * I, H),
+        f"{mtp}.mlp.experts.down_proj": _bf16(E, H, I),
+    }
+    raw.update(_hc_weights("mtp.hyper_connection_mixer", inject=False))
+    raw.update(_hc_weights(f"{mtp}.attn_hyper_connection", inject=True))
+    raw.update(_hc_weights(f"{mtp}.mlp_hyper_connection", inject=True))
     return raw
 
 
@@ -201,12 +229,56 @@ def test_key_map_is_exactly_the_model_state_dict(loaded):
     assert set(loaded) == _expected_names()
 
 
-def test_mtp_visual_experts_and_table_never_loaded(loaded):
+def test_mtp_visual_experts_and_table_not_loaded_by_default(loaded):
     for name in loaded:
         assert not name.startswith(("mtp.", "model.visual."))
         assert ".mlp.experts." not in name
         assert "ngram_embedding" not in name
         assert not name.endswith((".weight_scale", ".weight_scale_2", ".input_scale"))
+
+
+def _expected_mtp_names() -> set[str]:
+    layer = "mtp.layers.0"
+    names = {
+        "mtp.pre_fc_norm_hidden.weight", "mtp.pre_fc_norm_embedding.weight",
+        "mtp.fc_hidden.weight", "mtp.fc_embedding.weight",
+    }
+    names |= {f"mtp.hyper_connection_mixer.{leaf}" for leaf in (
+        "hc_norm.weight", "input_mix_weight_down.weight", "input_mix_weight_up.weight")}
+    for hc in ("attn_hyper_connection", "mlp_hyper_connection"):
+        names |= {f"{layer}.{hc}.{leaf}" for leaf in (
+            "hc_norm.weight", "input_mix_weight_down_block_inject.weight",
+            "input_mix_weight_up.weight")}
+    names |= {f"{layer}.self_attn.{leaf}" for leaf in (
+        "qkv_proj.weight", "o_proj.weight", "q_norm.weight", "k_norm.weight",
+        "indexer.index_qk_proj.weight", "indexer.q_layernorm.weight",
+        "indexer.k_layernorm.weight")}
+    names |= {f"{layer}.mlp.{leaf}" for leaf in (
+        "gate.weight", "shared_expert.gate_up_proj.weight", "shared_expert.down_proj.weight",
+        "shared_expert_gate.weight", "experts.gate_up_proj", "experts.down_proj")}
+    return names
+
+
+def test_mtp_loads_when_enabled(checkpoint, monkeypatch):
+    # the loader also emits the NVFP4 draft head under speculative decoding; this test pins
+    # the bf16 MTP subtree only
+    monkeypatch.setenv("FREETOKEN_DRAFT_LM_HEAD", "0")
+    monkeypatch.setenv("FREETOKEN_LOAD_MTP", "1")
+    monkeypatch.setenv("FREETOKEN_MTP_EXPERTS", "bf16")  # toy dims are not 128-divisible
+    folder, raw = checkpoint
+    loaded = dict(
+        iter_weights(folder, torch.device("cpu"), include_moe_experts=True, include_non_moe=True)
+    )
+    assert {n for n in loaded if n.startswith("mtp.")} == _expected_mtp_names()
+    assert set(loaded) == _expected_names() | _expected_mtp_names()
+    # the stacked resident experts pass through verbatim; qkv fuses like the main tower
+    assert torch.equal(
+        loaded["mtp.layers.0.mlp.experts.gate_up_proj"],
+        raw["mtp.layers.0.mlp.experts.gate_up_proj"],
+    )
+    qkv = loaded["mtp.layers.0.self_attn.qkv_proj.weight"]
+    assert qkv.shape[0] == 2 * QH * AHD + 2 * KVH * AHD
+    assert torch.equal(qkv[: 2 * QH * AHD], raw["mtp.layers.0.self_attn.q_proj.weight"])
 
 
 def test_hc_merge_is_down_then_inject_then_zero_pad(loaded, checkpoint):
@@ -408,3 +480,87 @@ def test_fusion_pad_rides_the_tensor_device():
     key, fused = _try_fuse("model.layers.0.attn_hyper_connection.block_inject_weight.weight", inject, buf)
     assert fused.device.type == "cuda" and fused.shape[0] == 336
     assert torch.equal(fused[324:], torch.zeros(12, 64, device="cuda", dtype=torch.bfloat16))
+
+
+def test_mtp_fp8_quantizer_roundtrip():
+    from freetoken.models.qwen4_exp.weight import _quantize_fp8_block
+
+    torch.manual_seed(3)
+    w = torch.randn(4, 256, 384, dtype=torch.bfloat16) * 2.0
+    q, scale = _quantize_fp8_block(w, block=128, chunk=2)
+    assert q.shape == w.shape and scale.shape == (4, 2, 3)
+    deq = q.float().view(4, 2, 128, 3, 128) * scale.float()[:, :, None, :, None]
+    deq = deq.view(4, 256, 384)
+    rel = (deq - w.float()).abs().max() / w.float().abs().max()
+    assert rel < 0.06, f"fp8 block roundtrip error {rel:.4f}"
+
+
+def _dequant_nvfp4_reference(packed, scale, glob):
+    """Torch mirror of the triton decode kernels' dequant conventions
+    (kernel/triton/nvfp4_fused_moe.py): lut[code] * block_scale * per-row global,
+    low nibble = even input, sign in bit 3."""
+    from freetoken.kernel.triton.nvfp4_fused_moe import _E2M1_VALUES
+
+    lut = torch.tensor(_E2M1_VALUES, dtype=torch.float32)
+    e, r, half_c = packed.shape
+    codes = torch.stack([packed & 0xF, packed >> 4], dim=-1).view(e, r, 2 * half_c)
+    vals = lut[codes.long()].view(e, r, -1, 16)
+    return (vals * scale.float().unsqueeze(-1)).view(e, r, 2 * half_c) * glob.float()[..., None]
+
+
+def test_mtp_nvfp4_quantizer_roundtrip():
+    from freetoken.models.qwen4_exp.weight import _quantize_nvfp4_stacked
+
+    torch.manual_seed(5)
+    w = torch.randn(4, 96, 128, dtype=torch.bfloat16) * 0.05
+    w[0, 0] = 0.0  # all-zero row: global underflows, codes must still be 0
+    w[1, 3, :16] = 0.0  # all-zero block under a live row
+    packed, scale, glob = _quantize_nvfp4_stacked(w, chunk=2)
+    assert packed.shape == (4, 96, 64) and packed.dtype is torch.uint8
+    assert scale.shape == (4, 96, 8) and scale.dtype is torch.float8_e4m3fn
+    assert glob.shape == (4, 96) and glob.dtype is torch.float16
+    deq = _dequant_nvfp4_reference(packed, scale, glob)
+    assert (deq[0, 0] == 0).all()
+    assert (deq[1, 3, :16] == 0).all()
+    # e2m1's grid is coarse (max step 1/6 of the block amax after scaling), so bound the
+    # error per element against its own 16-block amax rather than globally.
+    block_amax = w.float().view(4, 96, 8, 16).abs().amax(dim=-1, keepdim=True).clamp_min(1e-12)
+    rel = ((deq - w.float()).abs().view(4, 96, 8, 16) / block_amax).max()
+    # worst representable-grid gap is (6-4)/2 of the scaled amax (~amax/6), plus fp8
+    # scale rounding (~6%): ~0.18 block-relative worst case
+    assert rel < 0.22, f"nvfp4 roundtrip block-relative error {rel:.4f}"
+    # values already on the representable grid survive exactly: every 16-block carries a
+    # +-6 so its fp8 scale lands on exactly 448, and the row amax makes the fp16 global
+    # exactly 2^-12 (amax/(6*448) = 2^-12) -- the whole dequant chain is then lossless
+    exact = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -6.0, -3.0, 2.0, -1.5,
+                          0.5, -0.5, 1.0, -1.0]).repeat(8) * (448 * 2**-12)
+    we = exact.view(1, 1, 128).expand(1, 16, 128).to(torch.bfloat16).contiguous()
+    packed_e, scale_e, glob_e = _quantize_nvfp4_stacked(we)
+    deq_e = _dequant_nvfp4_reference(packed_e, scale_e, glob_e)
+    torch.testing.assert_close(deq_e, we.float(), rtol=0, atol=0)
+
+
+def test_draft_lm_head_emitted_when_enabled(checkpoint, monkeypatch):
+    """Under speculative decoding the loader also yields the NVFP4 copy of lm_head for the
+    draft passes (model.draft_lm_head): packed e2m1 codes, per-16 fp8 block scales, per-row
+    fp16 globals -- alongside the (untouched) target head."""
+    import pytest
+
+    monkeypatch.setenv("FREETOKEN_LOAD_MTP", "1")
+    monkeypatch.setenv("FREETOKEN_MTP_EXPERTS", "bf16")
+    monkeypatch.setenv("FREETOKEN_DRAFT_LM_HEAD", "1")
+    monkeypatch.delenv("FREETOKEN_DENSE_QUANT", raising=False)
+    folder, raw = checkpoint
+    loaded = dict(
+        iter_weights(folder, torch.device("cpu"), include_moe_experts=True, include_non_moe=True)
+    )
+    head = loaded["lm_head.weight"]
+    V, H = head.shape
+    if H % 16:
+        pytest.skip("toy hidden size is not NVFP4-blockable")
+    assert loaded["draft_lm_head.weight"].shape == (V, H // 2)
+    assert loaded["draft_lm_head.weight"].dtype == torch.uint8
+    assert loaded["draft_lm_head.weight_scale"].shape == (V, H // 16)
+    assert loaded["draft_lm_head.weight_global"].shape == (V,)
+    assert loaded["draft_lm_head.weight_global"].dtype == torch.float16
+    assert torch.equal(head, raw["lm_head.weight"])  # target head untouched

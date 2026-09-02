@@ -29,6 +29,16 @@ class _LinearTPImpl(BaseOP):
         self.bias = torch.empty(local_osize) if has_bias else None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.is_cuda and x.dim() == 2 and x.shape[0] <= 4:
+            # Decode batch sizes: a memory-bound rows GEMV beats cuBLAS's small-M kernels
+            # on deep-K shapes (see fp8_pertensor_linear.bf16_rows_gemv_applicable).
+            from freetoken.kernel.triton.fp8_pertensor_linear import (
+                bf16_rows_gemv,
+                bf16_rows_gemv_applicable,
+            )
+
+            if bf16_rows_gemv_applicable(x, self.weight, self.bias):
+                return bf16_rows_gemv(x, self.weight)
         return F.linear(x, self.weight, self.bias)
 
 

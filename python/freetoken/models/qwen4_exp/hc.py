@@ -10,6 +10,8 @@ back at the store, so they agree to fp32 rounding.
 
 from __future__ import annotations
 
+import os
+
 from typing import TYPE_CHECKING, Tuple
 
 import torch
@@ -20,7 +22,12 @@ from freetoken.kernel.triton.hc import (
     hc_gate_mix,
     hc_silu,
 )
-from freetoken.layers import BaseOP, LinearReplicated
+from freetoken.layers import BaseOP
+from freetoken.models.quant_linear import make_replicated_quant
+
+# Decode-time fused epilogues for the hyper-connection mix (rows GEMV reduce passes carry
+# the silu / gate-mix); FREETOKEN_HC_FUSED_EPILOGUE=0 restores the separate kernels.
+_HC_FUSED_EPILOGUE = os.getenv("FREETOKEN_HC_FUSED_EPILOGUE", "1") != "0"
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
@@ -93,16 +100,23 @@ class GatedResidual(BaseOP):
         self.use_combine = use_combine
         width = args.ple_state_width
         self.hc_norm = GroupedPlusOneRMSNorm(width, config.rms_norm_eps, self.hc_count)
+        # bf16 for this checkpoint; per-channel FP8 (quantized at load) under --dense-quant
+        # fp8's "hc" part (make_replicated_quant falls back to LinearReplicated).
+        hq = args.part_quant("hc", getattr(config, "dense_quant", "none"))
         if use_combine:
             # 16-row alignment for the merged skinny GEMM (vLLM hyperconnection.py:98)
             self.pad_size = (-(self.lowrank + self.hc_count)) % 16
-            self.input_mix_weight_down_block_inject = LinearReplicated(
-                width, self.lowrank + self.hc_count + self.pad_size, has_bias=False
+            self.input_mix_weight_down_block_inject = make_replicated_quant(
+                "none", hq, width, self.lowrank + self.hc_count + self.pad_size, has_bias=False
             )
         else:
             self.pad_size = 0
-            self.input_mix_weight_down = LinearReplicated(width, self.lowrank, has_bias=False)
-        self.input_mix_weight_up = LinearReplicated(self.lowrank, width, has_bias=False)
+            self.input_mix_weight_down = make_replicated_quant(
+                "none", hq, width, self.lowrank, has_bias=False
+            )
+        self.input_mix_weight_up = make_replicated_quant(
+            "none", hq, self.lowrank, width, has_bias=False
+        )
 
     def _down(self, rn: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor | None]:
         """Run the down GEMM and split off the raw inject logits; the pad columns are dropped."""
@@ -114,6 +128,30 @@ class GatedResidual(BaseOP):
 
     def _mix_kernel(self, R: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor | None]:
         rn = grouped_gemma_rmsnorm(R, self.hc_norm.weight, self.hc_norm.eps, self.hc_count)
+        if _HC_FUSED_EPILOGUE and R.shape[0] <= 4 and R.is_cuda:
+            # Decode: the two skinny GEMMs run as rows GEMVs whose split-K reduce passes
+            # carry the epilogues (silu(x/hc) + inject split; sigmoid-gate mix), saving the
+            # hc_silu / hc_gate_mix launches per block.
+            from freetoken.kernel.triton.fp8_pertensor_linear import rows_gemv_with_epilogue
+
+            down_layer = (
+                self.input_mix_weight_down_block_inject if self.use_combine
+                else self.input_mix_weight_down
+            )
+            res = rows_gemv_with_epilogue(
+                down_layer, rn,
+                ("hc_down", self.lowrank, self.hc_count if self.use_combine else 0, self.hc_count),
+            )
+            if res is not None:
+                lora, s = res
+                mixed = rows_gemv_with_epilogue(
+                    self.input_mix_weight_up, lora,
+                    ("hc_gate_mix", rn, self.hc_count, self.hidden_size),
+                )
+                if mixed is not None:
+                    return mixed, s
+                gate = self.input_mix_weight_up.forward(lora)
+                return hc_gate_mix(rn, gate, self.hc_count), s
         lora, s = self._down(rn)
         gate = self.input_mix_weight_up.forward(hc_silu(lora, self.hc_count))
         return hc_gate_mix(rn, gate, self.hc_count), s

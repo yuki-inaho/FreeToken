@@ -284,8 +284,12 @@ def _linear_pool_num_slots(config) -> int:
     mr = config.max_running_req
     if config.cache_type != "hybrid_radix":
         return mr + 1  # live + dummy/padding
-    ratio = config.linear_state_cache_ratio
-    n_cache = max(4, int(ratio * mr))
+    explicit = int(getattr(config, "linear_state_cache", -1))
+    if explicit >= 0:
+        n_cache = explicit  # operator-chosen cross-request snapshot cache (0 = none)
+    else:
+        ratio = config.linear_state_cache_ratio
+        n_cache = max(4, int(ratio * mr))
     return 4 * mr + n_cache + 1  # live + 2 ping-pong + locked committed snapshot + cache + padding
 
 

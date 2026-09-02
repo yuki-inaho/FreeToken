@@ -74,12 +74,18 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
     """Build the engine's KV pool for ``num_pages`` USABLE pages (the dummy page and every
     secondary tier -- window pool, index slab, state rings -- are derived here or inside
     the pool). Single factory entry for all pool families, DSV4 included."""
-    from .dsv4_cost_model import _dsv4_pool_sizes
+    from .dsv4_cost_model import _dsv4_pool_sizes, dsv4_n_scratch
     from .hybrid_swa_pool import _naive_swa_num_tokens, _swa_paged_num_tokens
     from .dsv4_paged_pool import DSV4PagedKVCache
 
     model_config = config.model_config
+    # --kv-cache-dtype (resolved by the engine into config.kv_dtype): the K/V slab's storage
+    # dtype. Only the QSA pool implements a quantized slab; everyone else must get the
+    # compute dtype (the engine rejects the flag for them at config time).
+    kv_dtype = getattr(config, "kv_dtype", None)
     if resolve_pool_class(model_config) is DSV4PagedKVCache:
+        if kv_dtype is not None and kv_dtype != dtype:
+            raise ValueError(f"DSV4 KV pools store the compute dtype, not {kv_dtype}")
         # DSV4 is driven by the generic CacheManager over the shared page table; the pool is
         # the only DSV4-specific piece (the swa_pool plug-in: window tier + cmp/idx/state
         # shadows). Sizing reads dsv4_args, never the group spec.
@@ -89,7 +95,7 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
             device=device,
             dtype=dtype,
             P=model_config.dsv4_args.window_size,
-            n_scratch=config.max_running_req + 1,
+            n_scratch=dsv4_n_scratch(config),
         )
         pool._init_paged_state(config.max_running_req, config.cache_type != "naive")
         return pool
@@ -111,6 +117,7 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
         device=device,
         dtype=dtype,
         num_req_slots=config.max_running_req + 1,  # + 1 for the dummy request row
+        kv_dtype=kv_dtype,
     )
 
 
@@ -122,7 +129,19 @@ def create_kvcache_pool(
     device: torch.device,
     num_swa_tokens: int | None = None,
     num_req_slots: int | None = None,
+    kv_dtype: torch.dtype | None = None,
 ) -> BaseKVCachePool:
+    # ``kv_dtype``: the K/V slab storage dtype (--kv-cache-dtype). Only the QSA pool serves a
+    # quantized slab; every other family stores the compute dtype.
+    kv_specs_probe = model_config.kv_cache_group_specs()
+    from freetoken.attention import AttnType as _AttnTypeProbe
+
+    is_qsa = len(kv_specs_probe) == 1 and kv_specs_probe[0].attn_type == _AttnTypeProbe.QSA
+    if kv_dtype is not None and kv_dtype != dtype and not is_qsa:
+        raise ValueError(
+            f"--kv-cache-dtype {kv_dtype}: a quantized K/V slab is implemented for the QSA "
+            "pool (Qwen3.8-Flash-Next) only; this model's KV pool stores the compute dtype"
+        )
     if model_config.has_swa_attention:
         from .hybrid_swa_pool import HybridSWAKVCache
 
@@ -192,7 +211,10 @@ def create_kvcache_pool(
             raise ValueError("QSA pools need num_req_slots (max_running_req + 1)")
         return QSAKVCache(
             num_kv_heads=spec.num_kv_heads,
-            num_layers=model_config.num_layers,
+            # Speculative decoding registers extra KV layers (the MTP draft layer) past
+            # num_layers; the bound widens the id namespace, layer_ids picks the slabs.
+            # getattr: tests hand in duck-typed configs without the speculative fields.
+            num_layers=getattr(model_config, "kv_layer_id_bound", model_config.num_layers),
             head_dim=spec.head_dim,
             num_pages=num_pages,
             page_size=page_size,
@@ -202,7 +224,11 @@ def create_kvcache_pool(
             num_index_layers=spec.num_index_layers,
             index_ratio=spec.index_ratio,
             num_req_slots=num_req_slots,
+            ring_capacity=QSAKVCache.ring_capacity_for(
+                spec.index_ratio, getattr(model_config, "num_speculative_tokens", 0)
+            ),
             layer_ids=spec.layer_ids,
+            kv_dtype=kv_dtype,
         )
 
     if len(kv_specs) == 1 and kv_specs[0].mla:
@@ -233,7 +259,9 @@ def create_kvcache_pool(
         num_kv_heads=num_kv_heads,
         num_pages=num_pages,
         page_size=page_size,
-        num_layers=model_config.num_layers,
+        # The id namespace bound (storage is len(layer_ids) slabs): a speculative MTP layer
+        # sits at id num_layers, so widen by num_extra_kv_layers when set.
+        num_layers=getattr(model_config, "kv_layer_id_bound", model_config.num_layers),
         head_dim=head_dim,
         device=device,
         dtype=dtype,

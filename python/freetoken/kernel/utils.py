@@ -16,7 +16,41 @@ DISABLE_KERNEL_CACHE_ENV = "FREETOKEN_DISABLE_KERNEL_CACHE"
 DISABLE_KERNEL_CACHE_VERSION_CHECK_ENV = "FREETOKEN_DISABLE_KERNEL_CACHE_VERSION_CHECK"
 DISABLE_JIT_ENV = "FREETOKEN_DISABLE_JIT"
 _TRUE_VALUES = {"1", "true", "yes", "on"}
-DEFAULT_INCLUDE = [str(KERNEL_PATH / "include")]
+
+
+def _space_free_include_dir(path: pathlib.Path) -> str:
+    """tvm-ffi hands include dirs to nvcc/ninja unquoted, so a checkout under a path with
+    whitespace breaks every JIT build ("A single input file is required ..."). Mirror the
+    header tree into a whitespace-free cache directory (refreshed whenever a header is
+    newer than the mirror) and point ``-I`` there; paths without whitespace are returned
+    untouched."""
+    # tvm-ffi resolves symlinks before building the flag, so judge the REAL path.
+    raw = str(path.resolve())
+    if not any(ch.isspace() for ch in raw):
+        return raw
+    import hashlib
+    import shutil
+
+    root = os.getenv(KERNEL_CACHE_DIR_ENV) or str(pathlib.Path.home() / ".cache" / "freetoken")
+    if any(ch.isspace() for ch in root):
+        root = str(pathlib.Path.home() / ".cache" / "freetoken")
+    dst = pathlib.Path(root) / "include-mirror" / hashlib.sha1(raw.encode()).hexdigest()[:12]
+    if any(ch.isspace() for ch in str(dst)):
+        return raw  # nothing whitespace-free to offer; let the build report the problem
+    try:
+        newest = max((p.stat().st_mtime for p in path.rglob("*") if p.is_file()), default=0.0)
+        stamp = dst / ".mirror-stamp"
+        if not stamp.exists() or float(stamp.read_text() or "0") < newest:
+            if dst.exists():
+                shutil.rmtree(dst)
+            shutil.copytree(path, dst)
+            stamp.write_text(repr(newest))
+    except OSError:
+        return raw
+    return str(dst)
+
+
+DEFAULT_INCLUDE = [_space_free_include_dir(KERNEL_PATH / "include")]
 DEFAULT_CFLAGS = ["-std=c++20", "-O3"]
 DEFAULT_CUDA_CFLAGS = ["-std=c++20", "-O3", "--expt-relaxed-constexpr"]
 DEFAULT_LDFLAGS = []

@@ -40,8 +40,19 @@ def ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
     )
 
 
+# Dedup GEMV tables hold up to this many routes per distinct expert (one per token: a
+# speculative verify is k+1 <= 4 rows). Larger decode batches keep the per-route GEMV.
+DEDUP_MAX_TOKENS = 4
+
+
 def ensure_experts_hybrid(
-    cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, fetch_fraction: float = 0.0
+    cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, fetch_fraction: float = 0.0,
+    cpu_ids: torch.Tensor | None = None,
+    hit_ids: torch.Tensor | None = None,
+    fetched_ids: torch.Tensor | None = None,
+    dedup: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    weights: torch.Tensor | None = None,
+    cpu_w: torch.Tensor | None = None,
 ) -> None:
     """Capped-fetch variant of ``ensure_experts`` (hybrid backend).
 
@@ -52,12 +63,36 @@ def ensure_experts_hybrid(
     split (fraction = pcie_bw / cpu_bw): fetch ~fraction of the step's misses, rounded to
     the integer that makes the PCIe fetch and the CPU overflow compute finish closest to
     together. ``num_indices`` = capped fetch count (copy_missing); ``num_missing_full`` =
-    pre-cap miss count (stats)."""
+    pre-cap miss count (stats).
+
+    ``cpu_ids`` (optional, same shape as ``expert_ids``) receives the CPU side of the
+    split in the same launch: the raw expert id where ``expert_ids`` became ``-1``, else
+    ``-1`` -- the hybrid layer's routing split used to be five elementwise kernels per
+    layer per step. With ``cache.collect_stats`` the launch also accumulates the hybrid
+    miss statistics in-kernel (``record_decode_stats_hybrid`` was eleven more).
+
+    ``hit_ids`` / ``fetched_ids`` (both or neither): the GPU routes split by residency --
+    ``hit_ids`` = slot for a route whose expert was already resident, ``fetched_ids`` = slot
+    for one assigned a slot THIS step (its bytes land with ``copy_missing``), -1 elsewhere --
+    so the layer can run the hit GEMV while the PCIe gather is still in flight.
+
+    ``dedup`` = ``(uniq_slots, uniq_hit, uniq_fetched, pairs)``: the GPU routes grouped by
+    expert for the dedup GEMV -- ``uniq_*[u]`` the u-th distinct expert's slot (all / hit
+    only / fetched only, -1 elsewhere) and ``pairs[u, m]`` the route indices
+    (``token * top_k + k``) sharing it, -1 padded (at most one per token)."""
+    assert (hit_ids is None) == (fetched_ids is None)
     # Q16 fixed point so the GPU kernel and the CPU reference cap identically (no float).
     frac_q16 = min(1 << 16, max(0, round(fetch_fraction * (1 << 16))))
     if not expert_ids.is_cuda:
-        return _ensure_experts_hybrid_cpu(cache, layer_id, expert_ids, max_fetch, frac_q16)
-    _ensure_experts_hybrid_gpu(cache, layer_id, expert_ids, max_fetch, frac_q16)
+        assert dedup is None, "the CPU mirror does not build the dedup tables"
+        return _ensure_experts_hybrid_cpu(
+            cache, layer_id, expert_ids, max_fetch, frac_q16, cpu_ids=cpu_ids,
+            hit_ids=hit_ids, fetched_ids=fetched_ids, weights=weights, cpu_w=cpu_w,
+        )
+    _ensure_experts_hybrid_gpu(
+        cache, layer_id, expert_ids, max_fetch, frac_q16, cpu_ids=cpu_ids,
+        hit_ids=hit_ids, fetched_ids=fetched_ids, weights=weights, cpu_w=cpu_w, dedup=dedup,
+    )
 
 
 def prefill_hit_compact(cache, layer_id: int, buffer_id: int) -> None:
@@ -82,6 +117,135 @@ def prefill_hit_compact(cache, layer_id: int, buffer_id: int) -> None:
     )
 
 
+def prefetch_admit(cache, cand: torch.Tensor, budget: int, plan: int = 0) -> None:
+    """Admit up to ``budget`` predicted experts into the cache and stage ring plan ``plan``.
+
+    ``cand`` is a score-DESCENDING [C] int32 tensor of flat expert ids
+    (``layer * num_experts + expert``, -1 padded), typically a predictor's top
+    candidates. For each candidate, in order: already-resident (which covers experts an
+    earlier candidate just admitted -- the map is the dedup) -> skip; else claim the
+    global argmin(usage) victim slot at or above ``prefetch_reserve_lo`` (the prefill
+    double buffer's slots are never victims), update both maps, stamp ``usage`` with the
+    CURRENT step (as recent as the last demand call, so demand eviction cannot reach it
+    for ~cache_size/active-per-call calls), and append (slot, flat id) to plan ``plan``'s
+    slices of ``evict_slots2``/``src_indices2``/``num_indices2``. The step clock is
+    READ, not advanced; no routing tensor is touched -- the authoritative router path is
+    byte-identical with prefetch on. Single fixed-shape launch, device-side counts,
+    static slices per plan: CUDA-graph capturable (the in-graph lookahead captures one
+    call per hooked layer with plan = target_layer % ring).
+    """
+    assert cache.num_indices2 is not None, "init_prefetch_plan must run first"
+    b = cache.max_prefetch
+    evict2 = cache.evict_slots2[plan * b : (plan + 1) * b]
+    src2 = cache.src_indices2[plan * b : (plan + 1) * b]
+    num2 = cache.num_indices2[plan : plan + 1]
+    stamp = cache.pf_stamp[plan : plan + 1]
+    if not cand.is_cuda:
+        return _prefetch_admit_cpu(cache, cand, budget, evict2, src2, num2, stamp)
+    block_c = triton.next_power_of_2(cache.cache_size)
+    _prefetch_admit_kernel[(1,)](
+        cand,
+        cache.slot_for_id,
+        cache.id_of_slot,
+        cache.usage,
+        cache.step,
+        evict2,
+        src2,
+        num2,
+        stamp,
+        cache.pf_issued,
+        cand.numel(),
+        int(budget),
+        int(cache.prefetch_reserve_lo),
+        cache.cache_size,
+        BLOCK_C=block_c,
+        num_warps=8 if block_c >= 2048 else 4,
+    )
+
+
+def _prefetch_admit_cpu(cache, cand, budget, evict2, src2, num2, stamp) -> None:
+    """CPU reference mirror of ``_prefetch_admit_kernel`` (decisions bit-identical)."""
+    step = int(cache.step.item())
+    stamp.fill_(step)
+    reserve_lo = int(cache.prefetch_reserve_lo)
+    usage = cache.usage.tolist()
+    admitted = 0
+    flat_map = cache.slot_for_id.view(-1)
+    for flat in cand.view(-1).tolist():
+        if admitted >= budget or flat < 0:
+            continue
+        if int(flat_map[flat].item()) >= 0:
+            continue
+        victim = min(
+            range(reserve_lo, cache.cache_size), key=lambda s: (usage[s], s)
+        )
+        old_id = int(cache.id_of_slot[victim].item())
+        if old_id >= 0:
+            flat_map[old_id] = -1
+        cache.id_of_slot[victim] = flat
+        flat_map[flat] = victim
+        cache.usage[victim] = step
+        usage[victim] = 1 << 62  # claimed: out of the victim scan
+        evict2[admitted] = victim
+        src2[admitted] = flat
+        admitted += 1
+    num2.fill_(admitted)
+    cache.pf_issued += admitted
+
+
+@triton.jit(do_not_specialize=["num_cand", "budget", "reserve_lo"])
+def _prefetch_admit_kernel(
+    cand_ptr,          # [C] int32 flat expert ids, score-descending, -1 padded. READ-ONLY.
+    slot_for_id_ptr,   # [L*E] int32 flat view (shared LRU maps)
+    id_of_slot_ptr,    # [S] int32
+    usage_ptr,         # [S] int64
+    step_ptr,          # [] int64 -- READ only; admission does not advance the clock
+    evict2_ptr,        # [budget] int32 out: victim slots (plan-2 dst)
+    src2_ptr,          # [budget] int32 out: FLAT expert ids (plan-2 src)
+    num2_ptr,          # [1] int64 out: admitted count
+    pf_stamp_ptr,      # [1] int64 out: usage-clock snapshot (used-check baseline)
+    pf_issued_ptr,     # [1] int64: cumulative admitted counter
+    num_cand,
+    budget,
+    reserve_lo,        # 2 * num_experts under prefill_overlap else 0
+    cache_size: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+):
+    step = tl.load(step_ptr)
+    tl.store(pf_stamp_ptr, step)
+
+    off_c = tl.arange(0, BLOCK_C)
+    c_mask = (off_c < cache_size) & (off_c >= reserve_lo)
+    # Usage stamps are step counts (< 2^31), so the victim scan runs on int32: half the
+    # reduction traffic of the int64 argmin. Reserved / out-of-range slots pin to INF.
+    INF32: tl.constexpr = 2147483647
+    u64 = tl.load(usage_ptr + off_c, mask=c_mask, other=9223372036854775807).to(tl.int64)
+    u = tl.minimum(tl.maximum(u64, 0), INF32 - 1).to(tl.int32)
+    u = tl.where(~c_mask, INF32, u)
+
+    admitted = tl.zeros((), dtype=tl.int64)
+    for i in tl.range(num_cand):
+        flat = tl.load(cand_ptr + i)
+        slot = tl.load(slot_for_id_ptr + tl.maximum(flat, 0))
+        do = (flat >= 0) & (slot < 0) & (admitted < budget)
+        victim = tl.argmin(u, axis=0).to(tl.int32)
+        # A slot claimed earlier in this launch sits at INF and is never re-selected, so the
+        # victim's owner is still the pre-launch map value: one scalar load, no BLOCK_C-wide
+        # gather-reduce per candidate.
+        old_id = tl.load(id_of_slot_ptr + victim)
+        tl.store(slot_for_id_ptr + tl.maximum(old_id, 0), -1, mask=do & (old_id >= 0))
+        tl.store(id_of_slot_ptr + victim, flat, mask=do)
+        tl.store(slot_for_id_ptr + tl.maximum(flat, 0), victim, mask=do)
+        tl.store(usage_ptr + victim, step, mask=do)
+        tl.store(evict2_ptr + admitted, victim, mask=do)
+        tl.store(src2_ptr + admitted, flat, mask=do)
+        # Claimed slots leave the victim scan; the map update above is the in-flight dedup.
+        u = tl.where(do & (off_c == victim), INF32, u)
+        admitted += do.to(tl.int64)
+    tl.store(num2_ptr, admitted)
+    tl.store(pf_issued_ptr, tl.load(pf_issued_ptr) + admitted)
+
+
 def materialize_layer(cache, layer_id: int) -> None:
     _materialize_layer_gpu(cache, layer_id)
 
@@ -95,13 +259,35 @@ def reset_cache(cache) -> None:
 
 
 def _ensure_experts_hybrid_gpu(
-    cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, frac_q16: int
+    cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, frac_q16: int,
+    cpu_ids: torch.Tensor | None = None,
+    hit_ids: torch.Tensor | None = None,
+    fetched_ids: torch.Tensor | None = None,
+    dedup: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    weights: torch.Tensor | None = None,
+    cpu_w: torch.Tensor | None = None,
 ) -> None:
     block_e = triton.next_power_of_2(cache.num_experts)
     block_c = triton.next_power_of_2(cache.cache_size)
+    block_a = max(16, triton.next_power_of_2(expert_ids.numel()))
     num_warps = 8 if block_c >= 2048 else 4
+    collect = bool(getattr(cache, "collect_stats", False))
+    if dedup is None:
+        uniq_slots = uniq_hit = uniq_fetched = pairs = expert_ids
+    else:
+        uniq_slots, uniq_hit, uniq_fetched, pairs = dedup
+        assert pairs.numel() >= block_a * DEDUP_MAX_TOKENS and uniq_slots.numel() >= block_a
     _ensure_experts_hybrid_kernel[(1,)](
         expert_ids,
+        expert_ids if cpu_ids is None else cpu_ids,
+        expert_ids if hit_ids is None else hit_ids,
+        expert_ids if fetched_ids is None else fetched_ids,
+        expert_ids if weights is None else weights,
+        expert_ids if cpu_w is None else cpu_w,
+        uniq_slots,
+        uniq_hit,
+        uniq_fetched,
+        pairs,
         cache.slot_for_id,
         cache.id_of_slot,
         cache.usage,
@@ -112,6 +298,14 @@ def _ensure_experts_hybrid_gpu(
         cache.num_indices,
         cache.num_missing_full,
         cache.expert_recency,
+        cache.stat_missing,
+        cache.stat_fetched,
+        cache.stat_active,
+        cache.stat_calls,
+        cache.stat_missing_layer,
+        cache.stat_fetched_layer,
+        cache.stat_active_layer,
+        cache.stat_steps_layer,
         layer_id,
         expert_ids.numel(),
         int(max_fetch),
@@ -120,13 +314,25 @@ def _ensure_experts_hybrid_gpu(
         cache.cache_size,
         BLOCK_E=block_e,
         BLOCK_C=block_c,
+        BLOCK_A=block_a,
         BY_RECENCY=_HYBRID_FETCH_BY_RECENCY,
+        EMIT_CPU_IDS=cpu_ids is not None,
+        EMIT_CPU_W=cpu_w is not None and weights is not None,
+        EMIT_SPLIT=hit_ids is not None,
+        EMIT_DEDUP=dedup is not None,
+        MAXB=DEDUP_MAX_TOKENS,
+        COLLECT_STATS=collect,
         num_warps=num_warps,
     )
 
 
 def _ensure_experts_hybrid_cpu(
-    cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, frac_q16: int
+    cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, frac_q16: int,
+    cpu_ids: torch.Tensor | None = None,
+    hit_ids: torch.Tensor | None = None,
+    fetched_ids: torch.Tensor | None = None,
+    weights: torch.Tensor | None = None,
+    cpu_w: torch.Tensor | None = None,
 ) -> None:
     """CPU reference mirror of the hybrid kernel (eviction/fetch decisions bit-identical to
     the GPU path; see tests/test_offload_lru_kernels.py). Fetches at most ``max_fetch`` (or
@@ -165,8 +371,10 @@ def _ensure_experts_hybrid_cpu(
     cache.num_indices.fill_(num_fetch)
 
     usage = cache.usage.tolist()
+    fetched_set = set()
     for idx in range(num_fetch):
         expert = missing[idx]
+        fetched_set.add(expert)
         victim = min(range(cache.cache_size), key=lambda s: (usage[s], s))
         old_id = int(cache.id_of_slot[victim].item())
         if old_id >= 0:
@@ -182,10 +390,35 @@ def _ensure_experts_hybrid_cpu(
         for expert in seen:
             cache.expert_recency[layer_id, expert] = step
 
+    if getattr(cache, "collect_stats", False):
+        num_active = len(seen)
+        cache.stat_missing += len(missing)
+        cache.stat_fetched += num_fetch
+        cache.stat_active += num_active
+        cache.stat_calls += 1
+        cache.stat_missing_layer[layer_id] += len(missing)
+        cache.stat_fetched_layer[layer_id] += num_fetch
+        cache.stat_active_layer[layer_id] += num_active
+        cache.stat_steps_layer[layer_id] += 1
+
     # Overflow misses keep slot_for_id == -1, so the rewrite below yields -1 for them.
     flat = expert_ids.view(-1)
+    cflat = None if cpu_ids is None else cpu_ids.view(-1)
+    if cpu_w is not None and weights is not None:
+        n_r = expert_ids.numel()
+        cpu_w.view(-1)[:n_r].copy_(weights.reshape(-1)[:n_r].to(torch.float32).view(torch.int32))
+    hflat = None if hit_ids is None else hit_ids.view(-1)
+    fflat = None if fetched_ids is None else fetched_ids.view(-1)
     for i in range(flat.numel()):
-        flat[i] = int(cache.slot_for_id[layer_id, int(flat[i].item())].item())
+        raw = int(flat[i].item())
+        slot = int(cache.slot_for_id[layer_id, raw].item())
+        flat[i] = slot
+        if cflat is not None:
+            cflat[i] = -1 if slot >= 0 else raw
+        if hflat is not None:
+            fetched = raw in fetched_set
+            hflat[i] = -1 if (slot < 0 or fetched) else slot
+            fflat[i] = slot if (slot >= 0 and fetched) else -1
 
 
 def _materialize_layer_gpu(cache, layer_id: int) -> None:
@@ -290,6 +523,15 @@ def _materialize_layer_kernel(
 @triton.jit(do_not_specialize=["layer_id", "num_active", "max_fetch", "fetch_frac_q16"])
 def _ensure_experts_hybrid_kernel(
     expert_ids_ptr,
+    cpu_ids_ptr,
+    hit_ids_ptr,
+    fetched_ids_ptr,
+    w_ptr,            # [A] fp32 router weights (EMIT_CPU_W)
+    cpu_w_ptr,        # [A] int32 out: the weights' bits next to cpu_ids (one D2H for both)
+    uniq_slots_ptr,
+    uniq_hit_ptr,
+    uniq_fetched_ptr,
+    pairs_ptr,
     slot_for_id_ptr,
     id_of_slot_ptr,
     usage_ptr,
@@ -300,6 +542,14 @@ def _ensure_experts_hybrid_kernel(
     num_indices_ptr,
     num_missing_full_ptr,
     expert_recency_ptr,
+    stat_missing_ptr,
+    stat_fetched_ptr,
+    stat_active_ptr,
+    stat_calls_ptr,
+    stat_missing_layer_ptr,
+    stat_fetched_layer_ptr,
+    stat_active_layer_ptr,
+    stat_steps_layer_ptr,
     layer_id,
     num_active,
     max_fetch,
@@ -308,7 +558,14 @@ def _ensure_experts_hybrid_kernel(
     cache_size: tl.constexpr,
     BLOCK_E: tl.constexpr,
     BLOCK_C: tl.constexpr,
+    BLOCK_A: tl.constexpr,
     BY_RECENCY: tl.constexpr,
+    EMIT_CPU_IDS: tl.constexpr,
+    EMIT_CPU_W: tl.constexpr,
+    EMIT_SPLIT: tl.constexpr,
+    EMIT_DEDUP: tl.constexpr,
+    MAXB: tl.constexpr,
+    COLLECT_STATS: tl.constexpr,
 ):
     """Capped-fetch timestamp-LRU (hybrid backend).
 
@@ -325,7 +582,15 @@ def _ensure_experts_hybrid_kernel(
     most-recently active before this step (LRU on the expert, via ``expert_recency``),
     breaking ties toward the lower expert id -- this prioritizes *recurring* misses for
     caching, lowering the steady miss rate. Otherwise the lowest expert ids are fetched
-    (``missing_rank``), the original routing-blind heuristic."""
+    (``missing_rank``), the original routing-blind heuristic.
+
+    ``EMIT_CPU_IDS``: Phase 3 also writes ``cpu_ids`` = raw expert id for the overflow
+    (-1) positions and -1 elsewhere, i.e. the CPU executor's route list, so the layer
+    needs no elementwise split kernels. ``EMIT_SPLIT``: also ``hit_ids`` (slot for routes
+    already resident before this step, else -1) and ``fetched_ids`` (slot for routes given
+    a slot this step, else -1), the residency split behind the demand-copy overlap.
+    ``COLLECT_STATS``: the hybrid miss/fetch/active counters (scalar + per-layer) are
+    accumulated in this launch."""
     step = tl.load(step_ptr) + 1
     tl.store(step_ptr, step)
     base = layer_id * num_experts
@@ -333,10 +598,13 @@ def _ensure_experts_hybrid_kernel(
     # ---- Phase 1: active + missing over experts ----
     off_e = tl.arange(0, BLOCK_E)
     e_mask = off_e < num_experts
-    is_active = tl.zeros((BLOCK_E,), dtype=tl.int1)
-    for i in tl.range(num_active):
-        e = tl.load(expert_ids_ptr + i)
-        is_active = is_active | (off_e == e)
+    # All routes as one vector (BLOCK_A lanes, -1 past num_active): the active mask is a
+    # [BLOCK_E, BLOCK_A] compare reduced over routes -- one vector op instead of
+    # num_active dependent scalar loads.
+    off_a = tl.arange(0, BLOCK_A)
+    a_mask = off_a < num_active
+    ids_vec = tl.load(expert_ids_ptr + off_a, mask=a_mask, other=-1)
+    is_active = tl.sum((off_e[:, None] == ids_vec[None, :]).to(tl.int32), axis=1) > 0
     tl.store(active_mask_ptr + off_e, is_active.to(tl.int32), mask=e_mask)
     slot = tl.load(slot_for_id_ptr + base + off_e, mask=e_mask, other=-1)
     is_missing = is_active & (slot == -1) & e_mask
@@ -370,19 +638,28 @@ def _ensure_experts_hybrid_kernel(
         missing_rank = tl.cumsum(is_missing.to(tl.int32)) - 1
 
     # ---- Phase 2: evict victims by argmin(usage), only for the capped fetches ----
+    fetched_e = tl.zeros((BLOCK_E,), dtype=tl.int1)
     if num_fetch > 0:
         off_c = tl.arange(0, BLOCK_C)
         c_mask = off_c < cache_size
         oid = tl.load(id_of_slot_ptr + off_c, mask=c_mask, other=-1)
-        u = tl.load(usage_ptr + off_c, mask=c_mask, other=9223372036854775807).to(tl.int64)
-        owner_active = c_mask & False
-        for i in tl.range(num_active):
-            ei = tl.load(expert_ids_ptr + i)
-            owner_active = owner_active | (oid == base + ei)
-        u = tl.where(owner_active | (~c_mask), 9223372036854775807, u)
+        # Usage stamps are step counts (< 2^31): int32 victim scan (see _prefetch_admit_kernel).
+        INF32: tl.constexpr = 2147483647
+        u64 = tl.load(usage_ptr + off_c, mask=c_mask, other=9223372036854775807).to(tl.int64)
+        u = tl.minimum(tl.maximum(u64, 0), INF32 - 1).to(tl.int32)
+        # A slot whose owner is one of THIS layer's active experts can never be a victim:
+        # gather the active mask stored above (same program; barrier orders store -> load).
+        tl.debug_barrier()
+        in_layer = c_mask & (oid >= base) & (oid < base + num_experts)
+        owner_active = tl.load(
+            active_mask_ptr + (oid - base), mask=in_layer, other=0
+        ) > 0
+        u = tl.where(owner_active | (~c_mask), INF32, u)
         for i in tl.range(num_fetch):
             victim = tl.argmin(u, axis=0).to(tl.int32)
-            old_id = tl.sum(tl.where(off_c == victim, oid, 0))
+            # Claimed slots sit at INF and are never re-selected, so the victim's owner is
+            # still the pre-launch map value: a scalar load replaces the BLOCK_C-wide gather.
+            old_id = tl.load(id_of_slot_ptr + victim)
             if old_id >= 0:
                 tl.store(slot_for_id_ptr + old_id, -1)
             if BY_RECENCY:
@@ -395,13 +672,63 @@ def _ensure_experts_hybrid_kernel(
             tl.store(usage_ptr + victim, step)
             tl.store(evict_slots_ptr + i, victim)
             tl.store(src_indices_ptr + i, e)  # layer-local row
-            u = tl.where(off_c == victim, 9223372036854775807, u)
+            u = tl.where(off_c == victim, INF32, u)
+            fetched_e = fetched_e | (off_e == e)
 
     # ---- Phase 3: rewrite expert_ids -> slot id (hit/fetched) or -1 (overflow -> CPU) ----
-    for i in tl.range(num_active):
-        e = tl.load(expert_ids_ptr + i)
-        s = tl.load(slot_for_id_ptr + base + e)
-        tl.store(expert_ids_ptr + i, s)
+    # Phase 2's slot_for_id stores are ordered before this gather by the barrier.
+    tl.debug_barrier()
+    s_vec = tl.load(slot_for_id_ptr + base + ids_vec, mask=a_mask, other=-1)
+    tl.store(expert_ids_ptr + off_a, s_vec, mask=a_mask)
+    if EMIT_CPU_IDS:
+        tl.store(cpu_ids_ptr + off_a, tl.where(s_vec >= 0, -1, ids_vec), mask=a_mask)
+    if EMIT_CPU_W:
+        wv = tl.load(w_ptr + off_a, mask=a_mask, other=0.0).to(tl.float32)
+        tl.store(cpu_w_ptr + off_a, wv.to(tl.int32, bitcast=True), mask=a_mask)
+    if EMIT_SPLIT or EMIT_DEDUP:
+        # fetched-this-step flag per route: [BLOCK_E, BLOCK_A] compare against fetched_e
+        f_vec = tl.sum(
+            tl.where(off_e[:, None] == ids_vec[None, :], fetched_e.to(tl.int32)[:, None], 0),
+            axis=0,
+        ) > 0
+    if EMIT_SPLIT:
+        tl.store(hit_ids_ptr + off_a, tl.where((s_vec >= 0) & (~f_vec), s_vec, -1), mask=a_mask)
+        tl.store(fetched_ids_ptr + off_a, tl.where((s_vec >= 0) & f_vec, s_vec, -1), mask=a_mask)
+    if EMIT_DEDUP:
+        # Group the GPU routes by expert: leader = lowest route lane with the same expert;
+        # leaders get compact indices, every route its leader's index and its rank among
+        # the routes sharing the expert (< MAXB: at most one route per token).
+        gpu_route = a_mask & (s_vec >= 0)
+        same = (ids_vec[:, None] == ids_vec[None, :]) & gpu_route[:, None] & gpu_route[None, :]
+        leader = tl.min(tl.where(same, off_a[None, :], BLOCK_A), axis=1)
+        is_leader = gpu_route & (leader == off_a)
+        uniq_idx = tl.cumsum(is_leader.to(tl.int32), axis=0) - 1
+        u_of_route = tl.sum(tl.where(same & is_leader[None, :], uniq_idx[None, :], 0), axis=1)
+        rank_m = tl.sum((same & (off_a[None, :] < off_a[:, None])).to(tl.int32), axis=1)
+        neg_a = tl.zeros((BLOCK_A,), dtype=tl.int32) - 1
+        tl.store(uniq_slots_ptr + off_a, neg_a)
+        tl.store(uniq_hit_ptr + off_a, neg_a)
+        tl.store(uniq_fetched_ptr + off_a, neg_a)
+        offs_p = tl.arange(0, BLOCK_A * MAXB)
+        tl.store(pairs_ptr + offs_p, tl.zeros((BLOCK_A * MAXB,), dtype=tl.int32) - 1)
+        tl.debug_barrier()
+        tl.store(uniq_slots_ptr + uniq_idx, s_vec, mask=is_leader)
+        tl.store(uniq_hit_ptr + uniq_idx, tl.where(f_vec, -1, s_vec), mask=is_leader)
+        tl.store(uniq_fetched_ptr + uniq_idx, tl.where(f_vec, s_vec, -1), mask=is_leader)
+        tl.store(pairs_ptr + u_of_route * MAXB + rank_m, off_a.to(tl.int32), mask=gpu_route)
+
+    if COLLECT_STATS:
+        num_act = tl.sum((is_active & e_mask).to(tl.int64))
+        nm = num_missing.to(tl.int64)
+        nf = num_fetch.to(tl.int64)
+        tl.store(stat_missing_ptr, tl.load(stat_missing_ptr) + nm)
+        tl.store(stat_fetched_ptr, tl.load(stat_fetched_ptr) + nf)
+        tl.store(stat_active_ptr, tl.load(stat_active_ptr) + num_act)
+        tl.store(stat_calls_ptr, tl.load(stat_calls_ptr) + 1)
+        tl.store(stat_missing_layer_ptr + layer_id, tl.load(stat_missing_layer_ptr + layer_id) + nm)
+        tl.store(stat_fetched_layer_ptr + layer_id, tl.load(stat_fetched_layer_ptr + layer_id) + nf)
+        tl.store(stat_active_layer_ptr + layer_id, tl.load(stat_active_layer_ptr + layer_id) + num_act)
+        tl.store(stat_steps_layer_ptr + layer_id, tl.load(stat_steps_layer_ptr + layer_id) + 1)
 
     # Bump every active expert's recency to this step (LRU on the expert): an overflow miss
     # computed on the CPU now ranks high if it recurs, so it gets fetched next time.

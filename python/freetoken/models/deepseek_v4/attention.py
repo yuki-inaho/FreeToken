@@ -248,7 +248,7 @@ class Attention(nn.Module):
 
     def decode_step(
         self, x: torch.Tensor, pos: torch.Tensor, rows: torch.Tensor, cmp_stage_cap: int,
-        wctx=None,
+        wctx=None, spec=None,
     ) -> torch.Tensor:
         """Batched single-token attention (EAGER/graph). Per row, builds the per-query top-k as
         GLOBAL pool slots -- the live 128-window ring slots (window-first) then the first
@@ -262,7 +262,13 @@ class Attention(nn.Module):
         the layer's fixed compressed top-k width is ``(cmp_stage_cap+1)//ratio`` (= max valid count
         over rows in eager; a static capture width = ``(max_seq-1+1)//ratio`` under graph). Picks
         past each row's valid count are masked to -1 (the kernel ignores -1), so co-tenant rows
-        stay isolated."""
+        stay isolated.
+
+        ``spec`` (a speculative verify, ``Batch.spec``): the B rows are CONSECUTIVE tokens of ONE
+        request. Every per-row piece above is already correct for that (window slots per
+        position, causal ``j <= pos`` masking, per-row ``valid`` bounds, per-row scratch rows);
+        the compressors' carry is the one read-modify-write that must be chained instead of
+        batched, so they take their ``verify_rows`` form with the step's carry intermediates."""
         B = x.size(0)
         win, ratio, rd = self.window_size, self.compress_ratio, self.rope_head_dim
         device = x.device
@@ -292,13 +298,26 @@ class Attention(nn.Module):
         n_window = win
         cmp_counts = None
         if self.compress_ratio:
-            self.compressor.decode_step(x, pos, prev_window_slots, window_slots, rows)
+            L = self.layer_id
+            if spec is None:
+                self.compressor.decode_step(x, pos, prev_window_slots, window_slots, rows)
+            else:
+                self.compressor.verify_rows(
+                    x.view(B, -1), pos, prev_window_slots[:1], window_slots, rows,
+                    spec.scratch.carry[(L, "attn")], boundary_row=spec.scratch.boundary_row,
+                )
             valid = (pos + 1) // ratio  # [B] per-row compressed block count
             if self.indexer is not None:
                 # Indexer returns the selected BLOCK indices (offset 0) into [0, n_cmp_stage) or -1.
-                blocks = self.indexer.decode_step(
-                    x, qr, pos, 0, prev_window_slots, window_slots, rows, n_cmp_stage
-                )  # [B, 1, k] block index or -1
+                if spec is None:
+                    blocks = self.indexer.decode_step(
+                        x, qr, pos, 0, prev_window_slots, window_slots, rows, n_cmp_stage
+                    )  # [B, 1, k] block index or -1
+                else:
+                    blocks = self.indexer.verify_rows(
+                        x, qr, pos, 0, prev_window_slots[:1], window_slots, rows, n_cmp_stage,
+                        spec.scratch.carry[(L, "idx")], boundary_row=spec.scratch.boundary_row,
+                    )
             else:
                 # Each valid block b is its own pick (column order = block order); invalid -> -1.
                 blk = torch.arange(n_cmp_stage, device=device)

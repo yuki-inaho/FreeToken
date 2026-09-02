@@ -207,10 +207,12 @@ class DSV4PagedKVCache(BaseKVCachePool):
         if not hasattr(self, "full_loc_map"):
             self.full_loc_map: torch.Tensor | None = None
 
-        # Window KV: every layer.
+        # Window KV: every layer, plus the DSpark draft-KV layers (ids n_layers.., window
+        # tier only -- ratio 0, so none of the compressed/indexer/ring lists below grow).
+        n_window_layers = self._n_layers + int(getattr(self.args, "n_extra_window_layers", 0) or 0)
         self.window_pool: list[torch.Tensor] = [
             torch.zeros(sizes.n_win_slots, self.head_dim, device=device, dtype=dtype)
-            for _ in range(self._n_layers)
+            for _ in range(n_window_layers)
         ]
 
         # Compressed KV / Indexer KV / compress-state ring: per ratio-class.
@@ -318,11 +320,13 @@ class DSV4PagedKVCache(BaseKVCachePool):
         from .dsv4_cost_model import _dsv4_swa_ratio, _dsv4_window_floor_pages
         from .dsv4_cost_model import dsv4_auto_cost_model
 
+        from .dsv4_cost_model import dsv4_n_scratch
+
         dsv4_args = config.model_config.dsv4_args
         P = dsv4_args.window_size
         floor = _dsv4_window_floor_pages(config, P)
         per_page, fixed, min_reserve_tokens = dsv4_auto_cost_model(
-            dsv4_args, _dsv4_swa_ratio(config), floor, P=P, n_scratch=config.max_running_req + 1
+            dsv4_args, _dsv4_swa_ratio(config), floor, P=P, n_scratch=dsv4_n_scratch(config)
         )
         return per_page, fixed, config.page_size, min_reserve_tokens
 
@@ -336,7 +340,7 @@ class DSV4PagedKVCache(BaseKVCachePool):
         from freetoken.utils import mem_GB
 
         from .dsv4_cost_model import _dsv4_pool_sizes, _dsv4_swa_ratio, _dsv4_window_floor_pages
-        from .dsv4_cost_model import dsv4_pool_bytes, dsv4_solve_num_pages
+        from .dsv4_cost_model import dsv4_n_scratch, dsv4_pool_bytes, dsv4_solve_num_pages
 
         dsv4_args = config.model_config.dsv4_args
         P = dsv4_args.window_size
@@ -345,7 +349,7 @@ class DSV4PagedKVCache(BaseKVCachePool):
             sizes = dsv4_solve_num_pages(
                 available_memory, dsv4_args, _dsv4_swa_ratio(config),
                 floor_win_pages=_dsv4_window_floor_pages(config, P), P=P,
-                n_scratch=config.max_running_req + 1,
+                n_scratch=dsv4_n_scratch(config),
             )
             # The solver fits PHYSICAL pages to memory; one is the dummy page, so the
             # usable (advertised) count is one less.
@@ -362,7 +366,7 @@ class DSV4PagedKVCache(BaseKVCachePool):
                 )
             sizes = _dsv4_pool_sizes(config, num_pages + 1)  # +1 for dummy page
         assert num_pages > 1, "Not enough memory for KV cache, try reducing --num-pages"
-        real = dsv4_pool_bytes(sizes, dsv4_args, config.max_running_req + 1)
+        real = dsv4_pool_bytes(sizes, dsv4_args, dsv4_n_scratch(config))
         logger.info(
             f"Allocating {num_pages * P} tokens for DSV4 KV cache "
             f"({sizes.n_win_pages} window pages), total = {mem_GB(real)}"
@@ -389,7 +393,7 @@ class DSV4PagedKVCache(BaseKVCachePool):
 
         from .base import CacheRebuildRejected
         from .dsv4_cost_model import _dsv4_pool_sizes, _dsv4_window_floor_pages
-        from .dsv4_cost_model import dsv4_pool_bytes
+        from .dsv4_cost_model import dsv4_n_scratch, dsv4_pool_bytes
 
         dsv4_args = config.model_config.dsv4_args
         if num_pages is not None:
@@ -414,7 +418,7 @@ class DSV4PagedKVCache(BaseKVCachePool):
         # cache term); an unfit request must still reject BEFORE the teardown.
         budget = net_cache_budget_bytes(config.memory_ratio, baseline_free, weights_bytes, 0)
         need = target_moe * per_expert_bytes + dsv4_pool_bytes(
-            kv_sizes, dsv4_args, config.max_running_req + 1
+            kv_sizes, dsv4_args, dsv4_n_scratch(config)
         )
         if need > budget:
             kv_part = f"kv={num_pages} P-pages" if num_pages is not None else "kv=current pool"

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import NamedTuple
+
 import math
 import os
 from dataclasses import dataclass
@@ -24,6 +26,17 @@ _FUSED_COPY = os.getenv("FREETOKEN_FUSED_COPY", "1").strip().lower() not in {"0"
 # whole layer is tiny) and are excluded from the hit gather, so every per-run
 # entry the batch sees is >= this size.
 _SMALL_BANK_FEAT_BYTES = 256 * 1024
+
+
+def moe_stats_log_interval() -> int:
+    """FREETOKEN_MOE_STATS_LOG=N: log ``decode_miss_stats`` every N drained decode steps
+    (0 = off). Setting it also force-enables ``collect_stats`` at engine init, so the env
+    alone yields a live readout without --moe-collect-stats."""
+    try:
+        return max(0, int(os.getenv("FREETOKEN_MOE_STATS_LOG", "0") or "0"))
+    except ValueError:
+        return 0
+
 
 from freetoken.utils import init_logger
 
@@ -101,6 +114,24 @@ _BANK_BYTES_PER_EXPERT = {
 # vLLM's marlin grouped-GEMM hands the full [cache_size] slot cache as its expert
 # dimension; moe_align_block_size requires round_up(experts, 32) < 1024, i.e. <= 992.
 MARLIN_MAX_CACHE_SIZE = 992
+
+
+
+# decode routes per step (bs * top_k) are far below this; the ensure kernel's BLOCK_A must fit
+ROUTING_PACK_COLS = 256
+
+
+class HybridRoutes(NamedTuple):
+    """The hybrid ensure kernel's route classes for one layer step (see
+    ``OffloadMoeCache.ensure_experts_hybrid``)."""
+
+    cpu_ids: torch.Tensor
+    hit_ids: torch.Tensor | None
+    fetched_ids: torch.Tensor | None
+    uniq_slots: torch.Tensor | None
+    uniq_hit: torch.Tensor | None
+    uniq_fetched: torch.Tensor | None
+    pairs: torch.Tensor | None
 
 
 @dataclass
@@ -187,6 +218,26 @@ class OffloadMoeCache:
         plan_slots = max(self.num_experts, self.cache_size)
         self.evict_slots = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
         self.src_indices = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
+        # hybrid only: the CPU executor's route list, written by the ensure kernel in the
+        # same launch that rewrites expert_ids (raw expert id where the slot is -1, else
+        # -1); sliced to the step's [bs * top_k] and viewed like expert_ids.
+        # hybrid only: the CPU route list + the routes' router weights (fp32 bits) side by
+        # side, so the executor ships both to the pool in ONE D2H memcpy (rows: ids, weights).
+        self.routing_pack = torch.empty((2, ROUTING_PACK_COLS), dtype=torch.int32, device=self.device)
+        self.cpu_ids = self.routing_pack[0]
+        self.cpu_w = self.routing_pack[1]
+        # hybrid only: the GPU routes split by residency (hit = resident before this step,
+        # fetched = given a slot this step), for the demand-copy overlap.
+        self.hit_ids = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
+        self.fetched_ids = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
+        # hybrid only: the GPU routes grouped by expert for the dedup GEMV (see
+        # offload_kernels.ensure_experts_hybrid): u-th distinct expert's slot (all / hit /
+        # fetched) and its route indices, one row of DEDUP_MAX_TOKENS per expert.
+        dedup_cap = max(16, 1 << (plan_slots - 1).bit_length())  # >= the kernel's BLOCK_A
+        self.uniq_slots = torch.empty((dedup_cap,), dtype=torch.int32, device=self.device)
+        self.uniq_hit = torch.empty((dedup_cap,), dtype=torch.int32, device=self.device)
+        self.uniq_fetched = torch.empty((dedup_cap,), dtype=torch.int32, device=self.device)
+        self.uniq_pairs = torch.empty((dedup_cap * 4,), dtype=torch.int32, device=self.device)
         self.num_indices = torch.zeros((1,), dtype=torch.int64, device=self.device)
         # hybrid only: full missing count BEFORE the per-step fetch cap (num_indices holds
         # the capped count that copy_missing actually fetches). The difference is what the
@@ -262,6 +313,20 @@ class OffloadMoeCache:
         # _pending_whole_layer records WHICH staged it: the pageable branch is only sound after materialize_layer
         self._pending_src_layer: int | None = None
         self._pending_whole_layer = False
+        # Speculative-prefetch copy plan ("plan-2"): its own dst/src/count so a prefetch
+        # can be in flight on a side stream while the demand plan above is rewritten by
+        # graph replays. src_indices2 carries FLAT ids (layer * num_experts + expert) --
+        # the layer rides in the id, so there is no _pending_src_layer analogue. Allocated
+        # by init_prefetch_plan (engine init, prefetch enabled only); None means disabled.
+        self.max_prefetch = 0
+        self.evict_slots2: torch.Tensor | None = None
+        self.src_indices2: torch.Tensor | None = None
+        self.num_indices2: torch.Tensor | None = None
+        self.pf_stamp: torch.Tensor | None = None
+        self.pf_issued: torch.Tensor | None = None
+        self.pf_used: torch.Tensor | None = None
+        self.pf_evicted_unused: torch.Tensor | None = None
+        self.pf_steps: torch.Tensor | None = None
         # Per-bank [2, num_experts, ...] double-buffer views over the slot cache's
         # first 2 * num_experts slots (set up when prefill_overlap is enabled).
         self.prefill_bank_buffers: list[torch.Tensor] = []
@@ -361,6 +426,7 @@ class OffloadMoeCache:
         self._copy_dst_ptrs = None
         self._copy_src_ptrs = None
         self._copy_feat_bytes = None
+        self._src_ptr_table = None
         self._copy_dst_ptrs_host: list[int] = []
         self._copy_src_ptrs_host: list[list[int]] = []
         self._copy_feat_bytes_host: list[int] = []
@@ -398,6 +464,11 @@ class OffloadMoeCache:
             for ptrs in layer_src_ptrs
         ]
         self._copy_feat_bytes = torch.tensor(feats, dtype=torch.int64, device=self.device)
+        # Prefetch ("plan-2") source table: [num_layers * num_banks] flattened, indexed by
+        # layer * num_banks + bank inside fast_index_copy_multi_layered. Rebuilt here with
+        # the rest of the descriptor, so rebuild() keeps it fresh for free. Unpinned
+        # layers keep their 0 placeholders (never admitted; the kernel skips 0 bases).
+        self._src_ptr_table = torch.stack(self._copy_src_ptrs).reshape(-1).contiguous()
         self._copy_dst_ptrs_host = dst_ptrs
         self._copy_src_ptrs_host = layer_src_ptrs
         self._copy_feat_bytes_host = feats
@@ -471,6 +542,26 @@ class OffloadMoeCache:
         plan_slots = max(self.num_experts, cache_size)
         self.evict_slots = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
         self.src_indices = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
+        # hybrid only: the CPU executor's route list, written by the ensure kernel in the
+        # same launch that rewrites expert_ids (raw expert id where the slot is -1, else
+        # -1); sliced to the step's [bs * top_k] and viewed like expert_ids.
+        # hybrid only: the CPU route list + the routes' router weights (fp32 bits) side by
+        # side, so the executor ships both to the pool in ONE D2H memcpy (rows: ids, weights).
+        self.routing_pack = torch.empty((2, ROUTING_PACK_COLS), dtype=torch.int32, device=self.device)
+        self.cpu_ids = self.routing_pack[0]
+        self.cpu_w = self.routing_pack[1]
+        # hybrid only: the GPU routes split by residency (hit = resident before this step,
+        # fetched = given a slot this step), for the demand-copy overlap.
+        self.hit_ids = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
+        self.fetched_ids = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
+        # hybrid only: the GPU routes grouped by expert for the dedup GEMV (see
+        # offload_kernels.ensure_experts_hybrid): u-th distinct expert's slot (all / hit /
+        # fetched) and its route indices, one row of DEDUP_MAX_TOKENS per expert.
+        dedup_cap = max(16, 1 << (plan_slots - 1).bit_length())  # >= the kernel's BLOCK_A
+        self.uniq_slots = torch.empty((dedup_cap,), dtype=torch.int32, device=self.device)
+        self.uniq_hit = torch.empty((dedup_cap,), dtype=torch.int32, device=self.device)
+        self.uniq_fetched = torch.empty((dedup_cap,), dtype=torch.int32, device=self.device)
+        self.uniq_pairs = torch.empty((dedup_cap * 4,), dtype=torch.int32, device=self.device)
         self.step.zero_()
         self.active_mask.zero_()
         self.num_indices.zero_()
@@ -489,6 +580,14 @@ class OffloadMoeCache:
         self.decode_freq.zero_()
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
+        # Plan-2 buffers are budget-shaped (not cache_size-shaped): keep, zero the state.
+        if self.num_indices2 is not None:
+            self.num_indices2.zero_()
+            self.pf_stamp.zero_()
+            self.pf_issued.zero_()
+            self.pf_used.zero_()
+            self.pf_evicted_unused.zero_()
+            self.pf_steps.zero_()
         self._hit_d2d_fallback_logged = False  # geometry changed; re-log if still unusable
         # 5. Re-evaluate prefill overlap against the new size.
         if self.prefill_overlap and cache_size < 2 * self.num_experts:
@@ -819,7 +918,10 @@ class OffloadMoeCache:
         self._pending_whole_layer = False
         ensure_experts(self, layer_id, expert_ids)
 
-    def ensure_experts_hybrid(self, layer_id: int, expert_ids: torch.Tensor) -> None:
+    def ensure_experts_hybrid(
+        self, layer_id: int, expert_ids: torch.Tensor, split: bool = False, dedup: bool = False,
+        weights: torch.Tensor | None = None,
+    ):
         """Capped-fetch LRU for the hybrid backend.
 
         Like :meth:`ensure_experts` but assigns slots to (and schedules copies for) at
@@ -828,7 +930,16 @@ class OffloadMoeCache:
         left non-resident and ``expert_ids`` is rewritten to their cache slot (hit or
         freshly fetched) or ``-1`` (overflow -> compute on the CPU). ``num_indices`` holds
         the capped fetch count (for ``copy_missing``); ``num_missing_full`` the pre-cap
-        miss count (for stats). All device-side / fixed-shape, so it is CUDA-graph safe."""
+        miss count (for stats). All device-side / fixed-shape, so it is CUDA-graph safe.
+
+        Returns the CPU route list (same shape as ``expert_ids``: the raw expert id
+        where ``expert_ids`` is now ``-1``, else ``-1``), produced by the same launch; the
+        hybrid miss statistics are accumulated in-kernel when ``collect_stats`` is set.
+        With ``split`` and/or ``dedup`` a :class:`HybridRoutes` instead: the GPU routes by
+        residency (``hit_ids`` = slot if resident before this step, ``fetched_ids`` = slot if
+        assigned this step and written by the pending ``copy_missing``, -1 elsewhere) and
+        the expert-dedup tables (``uniq_slots`` / ``uniq_hit`` / ``uniq_fetched`` [BLOCK_A],
+        ``pairs`` [BLOCK_A, 4] route indices per distinct expert, -1 padded)."""
         from freetoken.moe.offload_kernels import ensure_experts_hybrid
 
         if self.collect_decode_freq:
@@ -836,9 +947,63 @@ class OffloadMoeCache:
             self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
+        n = expert_ids.numel()
+        assert n <= ROUTING_PACK_COLS, (n, ROUTING_PACK_COLS)
+        cpu_ids = self.cpu_ids[:n].view(expert_ids.shape)
+        cpu_w = self.cpu_w[:n].view(expert_ids.shape) if weights is not None else None
+        hit_ids = self.hit_ids[:n].view(expert_ids.shape) if split else None
+        fetched_ids = self.fetched_ids[:n].view(expert_ids.shape) if split else None
+        tables = None
+        if dedup:
+            import triton
+
+            from freetoken.moe.offload_kernels import DEDUP_MAX_TOKENS
+
+            block_a = max(16, triton.next_power_of_2(n))
+            tables = (
+                self.uniq_slots[:block_a],
+                self.uniq_hit[:block_a],
+                self.uniq_fetched[:block_a],
+                self.uniq_pairs[: block_a * DEDUP_MAX_TOKENS].view(block_a, DEDUP_MAX_TOKENS),
+            )
         ensure_experts_hybrid(
-            self, layer_id, expert_ids, self.hybrid_max_fetch, self.hybrid_fetch_fraction
+            self, layer_id, expert_ids, self.hybrid_max_fetch, self.hybrid_fetch_fraction,
+            cpu_ids=cpu_ids, hit_ids=hit_ids, fetched_ids=fetched_ids, dedup=tables,
+            weights=weights, cpu_w=cpu_w,
         )
+        if split or dedup:
+            return HybridRoutes(
+                cpu_ids, hit_ids, fetched_ids,
+                *(tables if tables is not None else (None, None, None, None)),
+            )
+        return cpu_ids
+
+    # ----- demand copy on a side stream (hybrid decode overlap) -----------------------
+
+    def _demand_side_stream(self):
+        """High-priority side stream + fork/join events for the demand gather, created once
+        (eager warmup precedes graph capture; creating them under capture is not allowed)."""
+        s = getattr(self, "_demand_stream", None)
+        if s is None:
+            self._demand_stream = s = torch.cuda.Stream(self.device, priority=-1)
+            self._demand_ev_fork = torch.cuda.Event()
+            self._demand_ev_copy = torch.cuda.Event()
+        return s
+
+    def copy_missing_async(self) -> None:
+        """``copy_missing`` on the demand side stream, forked from the current stream after
+        the ensure kernel wrote the plan; ``join_demand_copy`` waits for it. Captured into
+        the decode graph as ordinary event edges (the layer-lookahead pattern)."""
+        side = self._demand_side_stream()
+        cur = torch.cuda.current_stream(self.device)
+        self._demand_ev_fork.record(cur)
+        side.wait_event(self._demand_ev_fork)
+        with torch.cuda.stream(side):
+            self.copy_missing()
+        self._demand_ev_copy.record(side)
+
+    def join_demand_copy(self) -> None:
+        torch.cuda.current_stream(self.device).wait_event(self._demand_ev_copy)
 
     def materialize_layer(self, layer_id: int) -> None:
         from freetoken.moe.offload_kernels import materialize_layer
@@ -854,6 +1019,8 @@ class OffloadMoeCache:
         # Per-expert recency is not cache_size-shaped, so reset_cache leaves it alone; wipe
         # it here so a new sequence starts with cold hybrid fetch priorities.
         self.expert_recency.fill_(-1)
+        if self.num_indices2 is not None:
+            self.num_indices2.zero_()
 
     def reset_stats(self) -> None:
         self.prefill_hit_rows = 0
@@ -868,6 +1035,90 @@ class OffloadMoeCache:
         self.stat_fetched_layer.zero_()
         self.stat_steps_layer.zero_()
 
+    @property
+    def prefetch_reserve_lo(self) -> int:
+        """Lowest slot a prefetch admission may claim: the prefill double buffer owns
+        slots [0, 2E) when prefill_overlap is on (their usage is deliberately zeroed by
+        _invalidate_prefill_buffer, which would otherwise make them argmin favorites)."""
+        return 2 * self.num_experts if self.prefill_overlap else 0
+
+    def init_prefetch_plan(self, max_prefetch: int, ring: int = 1) -> None:
+        """Allocate the speculative-prefetch copy plans ("plan-2") and counters.
+
+        Called once at engine init when --moe-prefetch is enabled, after
+        ``set_bank_sources`` (the layered copy needs the fused descriptor's source
+        pointers). ``ring`` > 1 gives the in-graph lookahead one independent
+        (dst/src/count) plan per in-flight layer; the eager variant uses ring 1.
+        Buffers are budget-shaped (not cache_size-shaped), so ``rebuild`` keeps them
+        and only zeroes the counts."""
+        assert self.bank_sources, "set_bank_sources must run before init_prefetch_plan"
+        if self.device.type == "cuda":  # CPU-device tests exercise the admission logic only
+            assert self._copy_fused_ok and self._src_ptr_table is not None, (
+                "expert prefetch requires the fused copy plan (16B-aligned banks, "
+                "FREETOKEN_FUSED_COPY on)"
+            )
+        assert max_prefetch > 0 and ring > 0
+        self.max_prefetch = int(max_prefetch)
+        self.prefetch_ring = int(ring)
+        n = max_prefetch * ring
+        self.evict_slots2 = torch.zeros((n,), dtype=torch.int32, device=self.device)
+        self.src_indices2 = torch.full((n,), -1, dtype=torch.int32, device=self.device)
+        self.num_indices2 = torch.zeros((ring,), dtype=torch.int64, device=self.device)
+        self.pf_stamp = torch.zeros((ring,), dtype=torch.int64, device=self.device)
+        self.pf_issued = torch.zeros((1,), dtype=torch.int64, device=self.device)
+        self.pf_used = torch.zeros((1,), dtype=torch.int64, device=self.device)
+        self.pf_evicted_unused = torch.zeros((1,), dtype=torch.int64, device=self.device)
+        self.pf_steps = torch.zeros((1,), dtype=torch.int64, device=self.device)
+
+    def prefetch_admit(self, cand: torch.Tensor, budget: int, plan: int = 0) -> None:
+        """Admit up to ``budget`` predicted experts into ring slot ``plan`` (see
+        offload_kernels.prefetch_admit)."""
+        from freetoken.moe.offload_kernels import prefetch_admit
+
+        prefetch_admit(self, cand, min(int(budget), self.max_prefetch), plan)
+
+    def prefetch_copy(self, plan: int = 0) -> None:
+        """Launch ring slot ``plan``'s H2D gather on the CURRENT stream (the caller
+        picks the prefetch side stream and fences with events). One multi-bank launch
+        over flat expert ids; device-side count, so an empty plan costs one no-op
+        launch. Fixed tensor slices per ``plan`` -> CUDA-graph capturable."""
+        from freetoken.kernel.fast_index_copy import fast_index_copy_multi_layered_jit
+
+        assert self.num_indices2 is not None, "init_prefetch_plan must run first"
+        b = self.max_prefetch
+        fast_index_copy_multi_layered_jit(
+            self._copy_dst_ptrs,
+            self._src_ptr_table,
+            self._copy_feat_bytes,
+            self.evict_slots2[plan * b : (plan + 1) * b],
+            self.src_indices2[plan * b : (plan + 1) * b],
+            self.num_indices2[plan : plan + 1],
+            num_experts=self.num_experts,
+        )
+
+    def prefetch_used_check(self) -> None:
+        """Score the previous step's prefetch plan (ring slot 0; the eager variant's),
+        device-side, no host sync.
+
+        A plan row was USED if its slot still maps to the prefetched expert and a later
+        demand call bumped the slot's usage past the admission stamp; EVICTED-UNUSED if
+        the slot was re-assigned before any use. Rows neither used nor evicted yet (a
+        prediction one step early) count in neither -- pf_used is a lower bound. Must run
+        before the next admission rewrites the plan."""
+        assert self.num_indices2 is not None
+        b = self.max_prefetch
+        n = self.num_indices2[0:1]
+        idx = torch.arange(b, device=self.device)
+        valid = idx < n
+        evict = self.evict_slots2[:b]
+        src = self.src_indices2[:b]
+        slots = evict.long()
+        cur = self.id_of_slot[slots]
+        used = valid & (cur == src) & (self.usage[slots] > self.pf_stamp[0:1])
+        self.pf_used += used.sum()
+        self.pf_evicted_unused += (valid & (cur != src)).sum()
+        self.pf_steps += 1
+
     def record_decode_stats(self, layer_id: int) -> None:
         """No-op: ``ensure_experts`` accumulates into ``lru_stats`` inside its own launch.
 
@@ -876,21 +1127,11 @@ class OffloadMoeCache:
         """
 
     def record_decode_stats_hybrid(self, layer_id: int) -> None:
-        """Hybrid stats: full miss count (pre-cap), the PCIe-fetched count (capped), and
-        the active count. The CPU computes (missing - fetched) experts. Device-side;
-        accumulates both the scalar totals and the per-layer breakdown."""
+        """No-op: ``ensure_experts_hybrid`` accumulates the hybrid stats (full miss count
+        pre-cap, PCIe-fetched count, active count; scalar + per-layer) inside its own
+        launch when ``collect_stats`` is set. Kept for call-site symmetry; the previous
+        version was eleven torch ops per layer per step captured into the decode graph."""
         assert 0 <= layer_id < self.num_layers, f"layer_id {layer_id} out of range [0, {self.num_layers})"
-        missing = self.num_missing_full.sum()
-        fetched = self.num_indices.sum()
-        active = self.active_mask.sum()
-        self.stat_missing += missing
-        self.stat_fetched += fetched
-        self.stat_active += active
-        self.stat_calls += 1
-        self.stat_missing_layer[layer_id] += missing
-        self.stat_fetched_layer[layer_id] += fetched
-        self.stat_active_layer[layer_id] += active
-        self.stat_steps_layer[layer_id] += 1
 
     def decode_miss_stats(self) -> dict:
         if self.decode_target == "hybrid":
@@ -900,7 +1141,7 @@ class OffloadMoeCache:
         else:
             active, missing, calls = (int(x) for x in self.lru_stats.sum(0))
         fetched = int(self.stat_fetched.item())
-        return {
+        out = {
             "layer_calls": calls,
             "active_per_layer": (active / calls) if calls else 0.0,
             "missing_per_layer": (missing / calls) if calls else 0.0,
@@ -914,6 +1155,18 @@ class OffloadMoeCache:
             "prefill_hit_rows": self.prefill_hit_rows,
             "prefill_rows": self.prefill_total_rows,
         }
+        if self.num_indices2 is not None:
+            issued = int(self.pf_issued.item())
+            used = int(self.pf_used.item())
+            steps = int(self.pf_steps.item())
+            out.update(
+                prefetch_issued=issued,
+                prefetch_used=used,
+                prefetch_evicted_unused=int(self.pf_evicted_unused.item()),
+                prefetch_use_rate=(used / issued) if issued else 0.0,
+                prefetch_issued_per_step=(issued / steps) if steps else 0.0,
+            )
+        return out
 
     def decode_miss_stats_per_layer(self) -> dict:
         """Per-MoE-layer realized decode stats for one (reset_stats-delimited) window.

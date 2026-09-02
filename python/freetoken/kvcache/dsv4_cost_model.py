@@ -66,6 +66,20 @@ def _idx_state_bytes(args) -> int:
     return 2 * 2 * args.index_head_dim * _FP32_BYTES
 
 
+def _extra_window_layers(args) -> int:
+    """Window-only KV layers past ``n_layers`` (the DSpark drafter stages under speculative
+    decoding; 0 otherwise). They add window-pool rows and nothing else."""
+    return int(getattr(args, "n_extra_window_layers", 0) or 0)
+
+
+def dsv4_n_scratch(config) -> int:
+    """Per-row scratch rows the cmp/idx pools reserve: one per decode row. A speculative
+    verify batch runs ``num_speculative_tokens + 1`` rows of ONE request, so it needs at least
+    that many (each row scatters its not-yet-complete block to its own scratch row)."""
+    spec_rows = int(getattr(config.model_config, "num_speculative_tokens", 0) or 0) + 1
+    return max(int(config.max_running_req) + 1, spec_rows)
+
+
 def dsv4_cache_per_page(args, swa_ratio: float, P: int = 128) -> int:
     """Bytes per P-token across ALL tiers, summed over layers per ratio class.
 
@@ -95,6 +109,8 @@ def dsv4_cache_per_page(args, swa_ratio: float, P: int = 128) -> int:
             total += round(swa_ratio * ring_size_for_ratio(4)) * _idx_state_bytes(args)
         # Compress-state ring: ring_size slots per WINDOW page (swa_ratio-scaled), fp32.
         total += round(swa_ratio * ring_size_for_ratio(ratio)) * _state_bytes(args, ratio)
+    # DSpark draft-KV layers: window tier only.
+    total += _extra_window_layers(args) * round(swa_ratio * P) * kv_b
     return int(total)
 
 
@@ -123,7 +139,8 @@ def dsv4_window_unit_bytes(args, P: int = 128) -> int:
     how many window tokens exist, not the per-token cost. This is ``swa_bytes_per_token``."""
     kv_b = _kv_bytes(args)
     ratios = tuple(args.compress_ratios)[: args.n_layers]
-    per_page = len(ratios) * P * kv_b  # window KV: P slots per page, every layer
+    # window KV: P slots per page, every layer (+ the DSpark draft-KV layers)
+    per_page = (len(ratios) + _extra_window_layers(args)) * P * kv_b
     for ratio in ratios:
         if ratio == 0:
             continue
@@ -215,7 +232,8 @@ def dsv4_pool_bytes(sizes: DSV4PoolSizes, args, n_scratch: int = 1) -> int:
     idx_b = _index_bytes(args)
     ratios = tuple(args.compress_ratios)[: args.n_layers]
 
-    total = len(ratios) * sizes.n_win_slots * kv_b  # window pool, every layer
+    # window pool, every layer (+ the DSpark draft-KV layers)
+    total = (len(ratios) + _extra_window_layers(args)) * sizes.n_win_slots * kv_b
     total += (sizes.full_token + 1) * _INT64_BYTES  # full_to_window (+ sentinel row)
     for L, ratio in enumerate(ratios):
         if ratio == 0:
@@ -293,6 +311,7 @@ __all__ = [
     "dsv4_auto_cost_model",
     "dsv4_cache_per_page",
     "dsv4_kv_unit_bytes",
+    "dsv4_n_scratch",
     "dsv4_pool_bytes",
     "dsv4_pool_sizes",
     "dsv4_reserved_window_pages",

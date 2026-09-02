@@ -191,6 +191,22 @@ def test_chat_reasoning_effort_none_disables_thinking():
     assert spec.chat_template_kwargs == {"enable_thinking": False, "thinking_mode": "disabled"}
 
 
+def test_chat_default_reasoning_effort_only_applies_when_request_omits_one():
+    default_off = chat_request_to_genspec(
+        chat_request(), {}, default_reasoning_effort="none"
+    )
+    assert default_off.chat_template_kwargs == {
+        "enable_thinking": False, "thinking_mode": "disabled"
+    }
+
+    explicit = chat_request_to_genspec(
+        chat_request(reasoning_effort="high"), {}, default_reasoning_effort="none"
+    )
+    assert explicit.chat_template_kwargs == {
+        "enable_thinking": True, "thinking_mode": "enabled", "reasoning_effort": "high"
+    }
+
+
 def test_chat_reasoning_effort_broadcasts_every_toggle_spelling():
     """The toggle is broadcast in every spelling templates read (enable_thinking
     bool + M3's thinking_mode); each template picks the knob it knows and Jinja
@@ -661,6 +677,21 @@ def test_stream_chat_usage_chunk_carries_cached_tokens():
     usage = next(e["usage"] for e in reversed(events) if isinstance(e, dict) and e.get("usage"))
     assert usage["prompt_tokens"] == 5
     assert usage["prompt_tokens_details"] == {"cached_tokens": 3}
+
+
+def test_usage_includes_open_webui_throughput_when_timed():
+    from freetoken.server.openai_api import _usage
+
+    usage = _usage(5, 8, response_duration_s=0.5)
+
+    assert usage["response_token/s"] == 16.0
+    assert usage["response_time"] == 0.5
+
+
+def test_usage_omits_throughput_without_generated_tokens():
+    from freetoken.server.openai_api import _usage
+
+    assert "response_token/s" not in _usage(5, 0, response_duration_s=0.5)
 
 
 # --------------------------------------------------------------- minimax think

@@ -185,6 +185,66 @@ def fast_index_copy_multi_jit(
     module.launch(dst_ptrs, src_ptrs, feat_bytes, dst_indices, src_indices, num_indices)
 
 
+@lru_cache(maxsize=None)
+def _jit_fast_index_copy_multi_layered_module(
+    *, num_threads: int, blocks_per_bank: int
+) -> Module:
+    args = make_cpp_args(num_threads, blocks_per_bank)
+    return load_jit(
+        "fast_index_copy_multi_layered",
+        *args,
+        cuda_files=["fast_index_copy.cuh"],
+        cuda_wrappers=[
+            ("launch", f"&MultiLayerIndexCopyKernel<{args}>::run"),
+            ("launch_normal", f"&MultiLayerIndexCopyKernel<{args}>::run_normal"),
+        ],
+    )
+
+
+def fast_index_copy_multi_layered_jit(
+    dst_ptrs: torch.Tensor,
+    src_ptr_table: torch.Tensor,
+    feat_bytes: torch.Tensor,
+    dst_indices: torch.Tensor,
+    src_indices: torch.Tensor,
+    num_indices: torch.Tensor | None = None,
+    *,
+    num_experts: int,
+    num_threads: int = 1024,
+    blocks_per_bank: int = 2,
+    priority: str | None = None,
+    sync_flag: torch.Tensor | None = None,
+) -> None:
+    """Cross-layer variant of :func:`fast_index_copy_multi_jit` for expert prefetch.
+
+    ``src_indices`` are FLAT expert ids (``layer * num_experts + expert``); each row's
+    host source base is looked up from ``src_ptr_table`` (``[num_layers * num_banks]``
+    int64 device tensor, the stacked per-layer fused-copy source pointers), so one launch
+    serves rows spanning many layers. ``priority="normal"`` runs the yielding variant
+    that pauses while a demand copy holds ``sync_flag`` high (update_copy_flag_jit /
+    fast_index_copy_jit's run_high). The default ``blocks_per_bank=2`` keeps the
+    speculative copy's SM footprint small (12 blocks for 6 NVFP4 banks): it runs
+    concurrently with compute on a side stream, unlike the demand copy's 8.
+    """
+    if _skip_fast_index_copy_enabled():
+        return
+    module = _jit_fast_index_copy_multi_layered_module(
+        num_threads=num_threads, blocks_per_bank=blocks_per_bank
+    )
+    if priority is None:
+        module.launch(
+            dst_ptrs, src_ptr_table, feat_bytes, dst_indices, src_indices, num_indices,
+            num_experts,
+        )
+        return
+    assert priority == "normal"
+    assert sync_flag is not None
+    module.launch_normal(
+        dst_ptrs, src_ptr_table, feat_bytes, dst_indices, src_indices, num_indices,
+        sync_flag, num_experts,
+    )
+
+
 def update_copy_flag_jit(sync_flag: torch.Tensor, delta: int) -> None:
     assert sync_flag.is_cuda
     assert sync_flag.numel() == 1

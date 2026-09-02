@@ -57,6 +57,48 @@ class VocabParallelEmbedding(BaseOP):
         return y
 
 
+class HostUVAEmbedding(VocabParallelEmbedding):
+    """``VocabParallelEmbedding`` whose table lives in pinned HOST memory; rows are gathered
+    over UVA by the PLE gather kernel (``kernel/triton/ple.py``), so the 1.27 GB bf16 table of
+    a 248K-vocab model costs no VRAM (~460 NVFP4 expert slots on Qwen3.8). Decode gathers
+    <= 4 rows per step (a few us of PCIe latency); an 8K-token prefill chunk gathers ~40 MB
+    (~2-3 ms, against seconds of compute). Single-GPU only (no vocab sharding)."""
+
+    def load_state_dict(self, state_dict, *, prefix: str = "", _internal: bool = False) -> None:
+        from freetoken.kernel.pinned import alloc_pinned_tensor, device_ptr
+
+        assert self.tp_size == 1, "HostUVAEmbedding is single-GPU only"
+        key = f"{prefix}.weight" if prefix else "weight"
+        w = state_dict.pop(key)
+        assert w.shape == (self.num_embeddings_tp, self.weight.shape[1]), w.shape
+        host = alloc_pinned_tensor(*w.shape, dtype=torch.bfloat16)
+        host.copy_(w.to(torch.bfloat16))  # D2H; the GPU copy is dropped by the caller's loop
+        torch.cuda.synchronize()
+        self.weight = host
+        self._table_ptr = device_ptr(host)
+        if not _internal and state_dict:
+            raise RuntimeError(f"Unexpected keys in state_dict: {list(state_dict.keys())}")
+
+    @nvtx_annotate("Embedding")
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        from freetoken.kernel.triton.ple import ple_gather_rows
+
+        if self.weight.device.type != "cpu":
+            # a device table was assigned directly (tests / tools): plain resident lookup
+            return super().forward(x)
+        ids = x.reshape(-1)
+        out = torch.empty((ids.numel(), self.weight.shape[1]), dtype=torch.bfloat16, device=x.device)
+        ple_gather_rows(
+            self._table_ptr, self.num_embeddings_tp, self.weight.shape[1], ids, out, 1.0, False
+        )
+        y = out.view(*x.shape, -1)
+        if self._embed_scale is not None:
+            if self._embed_scale_t is None:
+                self._embed_scale_t = torch.tensor(self._embed_scale, dtype=y.dtype, device=y.device)
+            y = y * self._embed_scale_t
+        return y
+
+
 class ParallelLMHead(VocabParallelEmbedding):
     def __init__(
         self,
@@ -123,3 +165,39 @@ class ParallelLMHead(VocabParallelEmbedding):
         output_tensor = output_tensor.permute(1, 0, 2).contiguous()
         output_tensor = output_tensor.reshape(input_shape[:1] + (self.tp_size * input_shape[1],))
         return output_tensor[:, : self.num_embeddings]
+
+class Fp8LMHead(ParallelLMHead):
+    """Untied lm_head held as fp8-e4m3 ``weight`` [V, H] + per-row fp32 ``weight_scale`` [V]
+    (quantized at load, no checkpoint change). The full-vocab logits GEMM reads the whole head
+    every decode step, so fp8 halves its bytes. M=1 runs the exact-activation W8A16 split-K
+    GEMV; M>1 (speculative verify rows, prefill) per-token dynamic W8A8 through row-wise
+    cuBLASLt ``_scaled_mm`` (see :func:`~freetoken.kernel.triton.fp8_pertensor_linear.fp8_pertensor_linear`).
+    TP=1 only; logits come back in the activation dtype like the bf16 head."""
+
+    def __init__(self, num_embeddings: int, embedding_dim: int):
+        super().__init__(num_embeddings, embedding_dim, tie_word_embeddings=False)
+        assert self.tp_size == 1, "Fp8LMHead is TP=1 only"
+        self.weight = torch.empty(num_embeddings, embedding_dim, dtype=torch.float8_e4m3fn)
+        self.weight_scale = torch.empty(num_embeddings, dtype=torch.float32)
+
+    def load_state_dict(
+        self,
+        state_dict: Dict[str, torch.Tensor],
+        *,
+        prefix: str = "",
+        _internal: bool = False,
+    ) -> None:
+        super().load_state_dict(state_dict, prefix=prefix, _internal=_internal)
+        from freetoken.kernel.triton.fp8_pertensor_linear import dynamic_w8a8_ok
+
+        dynamic_w8a8_ok()  # decide (and probe _scaled_mm) at load, never under graph capture
+
+    @nvtx_annotate("LMHead")
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        from freetoken.kernel.triton.fp8_pertensor_linear import fp8_pertensor_linear
+
+        batch = get_global_ctx().batch
+        if batch.is_prefill:
+            indices = batch.attn_metadata.get_last_indices(batch.size)
+            x = x[indices].contiguous()
+        return fp8_pertensor_linear(x, self.weight, self.weight_scale)

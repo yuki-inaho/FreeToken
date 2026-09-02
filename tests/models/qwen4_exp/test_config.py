@@ -168,3 +168,61 @@ def test_eos_token_id_list_uses_the_first_entry():
     hf = _hf_config()
     hf.text_config.eos_token_id = [base, base + 1]
     assert parse_config(hf).qwen4_args.ngram_boundary_token_id == base
+
+
+def test_dense_quant_override_upgrades_only_bf16_parts(monkeypatch):
+    from freetoken.models.qwen4_exp.config import dense_fp8_part_of
+
+    monkeypatch.setenv("FREETOKEN_DENSE_QUANT", "fp8")
+    monkeypatch.delenv("FREETOKEN_DENSE_FP8_PARTS", raising=False)
+    cfg = parse_config(_hf_config())
+    assert cfg.expert_quant == "nvfp4"  # the routed experts' native quant is untouched
+    assert cfg.attn_quant == "fp8_pertensor"
+    assert cfg.dense_quant == "fp8_pertensor"
+    assert cfg.lm_head_quant == "fp8_pertensor"
+    args = cfg.qwen4_args
+    assert set(args.dense_fp8_parts) == {"gdn", "attn", "hc", "shared", "lm_head", "mtp"}
+    # part gating: selected parts take the flag, unselected ones stay bf16
+    assert args.part_quant("gdn", cfg.attn_quant) == "fp8_pertensor"
+    assert args.part_quant("index", cfg.attn_quant) == "none"
+    assert args.part_quant("ple", cfg.dense_quant) == "none"
+    # loader predicate mirrors the constructors
+    parts = set(args.dense_fp8_parts)
+    assert dense_fp8_part_of("model.layers.0.linear_attn.in_proj_qkvz.weight", parts) == "gdn"
+    assert dense_fp8_part_of("model.layers.0.linear_attn.in_proj_ba.weight", parts) is None
+    assert dense_fp8_part_of("model.layers.3.self_attn.qkv_proj.weight", parts) == "attn"
+    assert dense_fp8_part_of("model.layers.3.self_attn.indexer.index_qk_proj.weight", parts) is None
+    assert dense_fp8_part_of("model.hyper_connection_mixer.input_mix_weight_down.weight", parts) == "hc"
+    assert dense_fp8_part_of("model.layers.0.mlp.shared_expert.down_proj.weight", parts) == "shared"
+    assert dense_fp8_part_of("model.layers.0.mlp.gate.weight", parts) is None
+    assert dense_fp8_part_of("lm_head.weight", parts) == "lm_head"
+    # "mtp" is in the default set: the MTP layer's attention takes the attn part; without it, None
+    assert dense_fp8_part_of("mtp.layers.0.self_attn.o_proj.weight", parts) == "attn"
+    assert dense_fp8_part_of("mtp.layers.0.self_attn.o_proj.weight", parts - {"mtp"}) is None
+    assert dense_fp8_part_of("mtp.layers.0.self_attn.o_proj.weight", parts | {"mtp"}) == "attn"
+    assert dense_fp8_part_of("mtp.fc_hidden.weight", parts | {"mtp"}) is None
+
+
+def test_dense_quant_parts_subset(monkeypatch):
+    monkeypatch.setenv("FREETOKEN_DENSE_QUANT", "fp8")
+    monkeypatch.setenv("FREETOKEN_DENSE_FP8_PARTS", "gdn,lm_head")
+    cfg = parse_config(_hf_config())
+    assert cfg.attn_quant == "fp8_pertensor"
+    assert cfg.dense_quant == "none"
+    assert cfg.lm_head_quant == "fp8_pertensor"
+    assert cfg.qwen4_args.dense_fp8_parts == ("gdn", "lm_head")
+    assert cfg.qwen4_args.part_quant("attn", cfg.attn_quant) == "none"
+    monkeypatch.setenv("FREETOKEN_DENSE_FP8_PARTS", "gdn,bogus")
+    with pytest.raises(ValueError):
+        parse_config(_hf_config())
+
+
+@pytest.mark.parametrize("value", ["auto", "bf16", None])
+def test_dense_quant_off_is_byte_identical_config(monkeypatch, value):
+    if value is None:
+        monkeypatch.delenv("FREETOKEN_DENSE_QUANT", raising=False)
+    else:
+        monkeypatch.setenv("FREETOKEN_DENSE_QUANT", value)
+    cfg = parse_config(_hf_config())
+    assert (cfg.attn_quant, cfg.dense_quant, cfg.lm_head_quant) == ("none", "none", "none")
+    assert cfg.qwen4_args.dense_fp8_parts == ()

@@ -123,6 +123,11 @@ def moe_sum_reduce_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_DIM: tl.constexpr,
     NUM_STAGE: tl.constexpr,
+    addend_ptr=None,
+    addend_stride_0=0,
+    HAS_ADDEND: tl.constexpr = False,
+    ids_ptr=None,
+    SKIP_NEG: tl.constexpr = False,
 ):
     input_stride_0 = tl.cast(input_stride_0, dtype=tl.int64)
     input_stride_1 = tl.cast(input_stride_1, dtype=tl.int64)
@@ -143,8 +148,20 @@ def moe_sum_reduce_kernel(
         accumulator = tl.zeros((BLOCK_DIM,), dtype=tl.float32)
         input_t_ptr = input_ptr + token_index * input_stride_0 + offs_dim
         for i in tl.range(0, topk_num, num_stages=NUM_STAGE):
-            tmp = tl.load(input_t_ptr + i * input_stride_1, mask=offs_dim < dim_end, other=0.0)
+            if SKIP_NEG:
+                # routes computed elsewhere (hybrid: on the CPU) left their rows unwritten
+                live = tl.load(ids_ptr + token_index * topk_num + i) >= 0
+                tmp = tl.load(
+                    input_t_ptr + i * input_stride_1, mask=(offs_dim < dim_end) & live, other=0.0
+                )
+            else:
+                tmp = tl.load(input_t_ptr + i * input_stride_1, mask=offs_dim < dim_end, other=0.0)
             accumulator += tmp
+        if HAS_ADDEND:
+            # Fold a [token_num, hidden] partial (the hybrid backend's CPU-computed
+            # routes) into the reduce instead of a separate add kernel.
+            add_t_ptr = addend_ptr + token_index * tl.cast(addend_stride_0, tl.int64) + offs_dim
+            accumulator += tl.load(add_t_ptr, mask=offs_dim < dim_end, other=0.0).to(tl.float32)
         store_t_ptr = output_ptr + token_index * output_stride_0 + offs_dim
         tl.store(
             store_t_ptr,

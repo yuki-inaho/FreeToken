@@ -58,14 +58,18 @@ def _thinking_type(req: Any) -> str | None:
 def chat_request_to_genspec(
     req: ChatCompletionRequest,
     model_sampling: dict[str, Any],
+    default_reasoning_effort: str | None = None,
 ) -> GenSpec:
     """OpenAI ChatCompletionRequest -> GenSpec (the OpenAI 'to_sampling_params')."""
     from .model_meta import effort_toggle_kwargs
 
     ctk = req.chat_template_kwargs
     thinking_type = _thinking_type(req)
-    if req.reasoning_effort or thinking_type:
-        ctk = effort_toggle_kwargs(req.reasoning_effort, ctk, thinking_type=thinking_type)
+    reasoning_effort = req.reasoning_effort
+    if not reasoning_effort and thinking_type is None:
+        reasoning_effort = default_reasoning_effort
+    if reasoning_effort or thinking_type:
+        ctk = effort_toggle_kwargs(reasoning_effort, ctk, thinking_type=thinking_type)
     return GenSpec(
         messages=render_messages([m.model_dump(exclude_none=True) for m in req.messages]),
         sampling_params=resolve_sampling(
@@ -179,7 +183,13 @@ async def handle_chat_completion(
             )
 
     try:
-        spec = chat_request_to_genspec(req, model_sampling)
+        spec = chat_request_to_genspec(
+            req,
+            model_sampling,
+            default_reasoning_effort=getattr(
+                state.config, "default_reasoning_effort", None
+            ),
+        )
     except ValueError as exc:
         return create_error_response(str(exc))
 
@@ -224,6 +234,7 @@ async def handle_chat_completion(
             result.prompt_tokens,
             result.completion_tokens,
             _reported_cached(state, result.cached_tokens),
+            engine_stats=result.engine_stats,
         ),
     }
 
@@ -250,6 +261,8 @@ async def stream_chat_completion_chunks(
     cached_tokens = 0
     tool_calls_sent = 0
     open_tool: dict[str, Any] | None = None
+    response_started_at = time.monotonic()
+    response_duration_s: float | None = None
     events = generate_events(uid, spec, state, source="/v1/chat/completions")
     while True:
         try:
@@ -357,6 +370,8 @@ async def stream_chat_completion_chunks(
             prompt_tokens = ev.prompt_tokens
             completion_tokens = ev.completion_tokens
             cached_tokens = ev.cached_tokens
+            engine_stats = ev.engine_stats
+            response_duration_s = time.monotonic() - response_started_at
             yield _sse(_chat_chunk(req, uid, [{"delta": {}, "index": 0, "finish_reason": ev.finish_reason}]))
 
     if req.stream_options and req.stream_options.include_usage:
@@ -368,7 +383,11 @@ async def stream_chat_completion_chunks(
                 "model": req.model,
                 "choices": [],
                 "usage": _usage(
-                    prompt_tokens, completion_tokens, _reported_cached(state, cached_tokens)
+                    prompt_tokens,
+                    completion_tokens,
+                    _reported_cached(state, cached_tokens),
+                    response_duration_s=response_duration_s,
+                    engine_stats=engine_stats,
                 ),
             }
         )
@@ -408,6 +427,7 @@ async def handle_completion(
     prompt_tokens = 0
     completion_tokens = 0
     cached_tokens = 0
+    engine_stats: dict | None = None
     for index, prompt in enumerate(prompts):
         uid = state.new_user()
         await state.send_one(TokenizeMsg(uid=uid, text=prompt, sampling_params=_resolve_sampling(req, model_sampling)))
@@ -422,6 +442,7 @@ async def handle_completion(
             text += ack.incremental_output
             if ack.finished:
                 finish_reason = getattr(ack, "finish_reason", None) or "stop"
+                engine_stats = getattr(ack, "engine_stats", None) or engine_stats
                 break
         choices.append({"index": index, "text": text, "finish_reason": finish_reason, "logprobs": None})
 
@@ -440,6 +461,9 @@ async def stream_completion_chunks(uid: int, req: CompletionRequest, state: Any)
     completion_tokens = 0
     cached_tokens = 0
     finish_reason = "stop"
+    engine_stats: dict | None = None
+    response_started_at = time.monotonic()
+    response_duration_s: float | None = None
     async for ack in state.wait_for_ack(uid):
         if getattr(ack, "error", None):
             yield _sse({"error": {"message": ack.error, "type": "invalid_request_error", "code": None}})
@@ -467,6 +491,8 @@ async def stream_completion_chunks(uid: int, req: CompletionRequest, state: Any)
             )
         if ack.finished:
             finish_reason = getattr(ack, "finish_reason", None) or "stop"
+            engine_stats = getattr(ack, "engine_stats", None)
+            response_duration_s = time.monotonic() - response_started_at
             break
 
     yield _sse(
@@ -487,7 +513,11 @@ async def stream_completion_chunks(uid: int, req: CompletionRequest, state: Any)
                 "model": req.model,
                 "choices": [],
                 "usage": _usage(
-                    prompt_tokens, completion_tokens, _reported_cached(state, cached_tokens)
+                    prompt_tokens,
+                    completion_tokens,
+                    _reported_cached(state, cached_tokens),
+                    response_duration_s=response_duration_s,
+                    engine_stats=engine_stats,
                 ),
             }
         )
@@ -606,7 +636,14 @@ def _reported_cached(state: Any, cached_tokens: int) -> int:
     return cached_tokens if getattr(state.config, "enable_cache_report", False) else 0
 
 
-def _usage(prompt_tokens: int, completion_tokens: int, cached_tokens: int = 0) -> dict[str, Any]:
+def _usage(
+    prompt_tokens: int,
+    completion_tokens: int,
+    cached_tokens: int = 0,
+    *,
+    response_duration_s: float | None = None,
+    engine_stats: dict | None = None,
+) -> dict[str, Any]:
     usage: dict[str, Any] = {
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
@@ -616,6 +653,16 @@ def _usage(prompt_tokens: int, completion_tokens: int, cached_tokens: int = 0) -
     # disabled report and a 0-token hit serialize identically.
     if cached_tokens > 0:
         usage["prompt_tokens_details"] = {"cached_tokens": cached_tokens}
+    if response_duration_s is not None and response_duration_s > 0 and completion_tokens > 0:
+        # Open WebUI exposes arbitrary usage fields in the response-statistics
+        # tooltip. Match its Ollama metric spelling so local and OpenAI-compatible
+        # backends present the same familiar tokens-per-second label.
+        usage["response_token/s"] = round(completion_tokens / response_duration_s, 2)
+        usage["response_time"] = round(response_duration_s, 3)
+    if engine_stats:
+        # FreeToken extension: per-request engine telemetry (prefill/decode wall time,
+        # decode steps, speculative draft/accept counters). Standard clients ignore it.
+        usage["freetoken"] = engine_stats
     return usage
 
 
@@ -663,13 +710,20 @@ async def _effort_fields(state: Any) -> tuple[list[str] | None, str | None]:
         profile = await asyncio.to_thread(manager.effort_profile)
     except Exception:  # noqa: BLE001 -- metadata only; the generation path reports real faults
         return None, None
-    from freetoken.tokenizer.effort import effective_efforts
+    from freetoken.tokenizer.effort import effective_efforts, quantize_effort
 
     served = effective_efforts(profile)
     if not served:
         return None, None
+    default = profile.default
+    configured_default = getattr(state.config, "default_reasoning_effort", None)
+    if configured_default == "none":
+        served = frozenset((*served, configured_default))
+        default = configured_default
+    elif configured_default:
+        default = quantize_effort(configured_default, profile) or profile.default
     ordered = sorted(served, key=lambda name: -EFFORT_SCALE.get(name, 0.0))
-    return ordered, profile.default
+    return ordered, default
 
 
 def _served_model_name(state: Any) -> str:

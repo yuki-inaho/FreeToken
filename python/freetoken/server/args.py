@@ -26,6 +26,9 @@ class ServerArgs(SchedulerConfig):
     # Reasoning parser that splits <think> reasoning from content for OpenAI
     # responses. None disables it (default for models without a reasoning protocol).
     reasoning_parser: str | None = None
+    # Reasoning effort applied only when a request does not explicitly select a
+    # thinking mode. None preserves the checkpoint template's own default.
+    default_reasoning_effort: str | None = None
     # "model": fill unspecified request sampling params from generation_config.json
     # (temperature/top_k/top_p), like sglang. "none": use framework defaults only.
     sampling_defaults: str = "model"
@@ -224,6 +227,34 @@ def parse_args(
         default="auto",
         choices=["auto", "float16", "bfloat16", "float32"],
         help="Data type for model weights and activations. 'auto' will use FP16 for FP32/FP16 models and BF16 for BF16 models.",
+    )
+
+    parser.add_argument(
+        "--kv-cache-dtype",
+        type=str,
+        default=ServerArgs.kv_cache_dtype,
+        choices=["auto", "bf16", "fp8"],
+        help=(
+            "KV-cache storage dtype. 'auto' (and 'bf16') keep the compute dtype. 'fp8' stores "
+            "the paged K/V of Qwen3.8-Flash-Next's QSA layers as e4m3 codes with a per-token "
+            "scale -- about half the KV bytes per token, so a 256K context costs what 128K "
+            "does in expert-cache slots; other models reject it."
+        ),
+    )
+
+    parser.add_argument(
+        "--dense-quant",
+        type=str,
+        default=ServerArgs.dense_quant,
+        choices=["auto", "bf16", "fp8"],
+        help=(
+            "Resident dense-linear weight format. 'auto'/'bf16' keep the checkpoint's dtypes. "
+            "'fp8' quantizes Qwen3.8-Flash-Next's bf16 GDN/attention/hyper-connection/shared-"
+            "expert projections and lm_head to per-channel FP8 at load (no checkpoint change): "
+            "about half their decode weight traffic, and ~4 GB of VRAM freed for expert-cache "
+            "slots. FREETOKEN_DENSE_FP8_PARTS=gdn,attn,hc,shared,lm_head[,index,ple,mtp] "
+            "narrows the set. Other models ignore it."
+        ),
     )
 
     parser.add_argument(
@@ -467,6 +498,17 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--default-reasoning-effort",
+        type=str,
+        default=ServerArgs.default_reasoning_effort,
+        choices=["model", "none", "minimal", "low", "medium", "high", "xhigh", "max"],
+        help=(
+            "Reasoning effort for requests that omit one. 'model' preserves the "
+            "checkpoint template default; 'none' disables thinking on toggleable models."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-backend",
         default=ServerArgs.moe_backend,
         choices=["auto"] + SUPPORTED_MOE_BACKENDS.supported_names(),
@@ -529,6 +571,42 @@ def parse_args(
         default=ServerArgs.kv_reserve_tokens,
         help="KV-cache token floor reserved before --moe-cache-auto fills experts.",
     )
+    parser.add_argument(
+        "--kv-elastic-max-tokens",
+        type=int,
+        default=ServerArgs.kv_elastic_max_tokens,
+        help=(
+            "Elastic KV pool: boot at --kv-reserve-tokens (max expert slots) and grow the KV "
+            "pool up to this many tokens on demand (idle-time rebuild, paying expert slots), "
+            "shrinking back to the base after --kv-elastic-idle-seconds of inactivity. 0 = off."
+        ),
+    )
+    parser.add_argument(
+        "--linear-state-cache",
+        type=int,
+        default=ServerArgs.linear_state_cache,
+        help=(
+            "Cross-request GDN snapshot-cache slots (hybrid_radix prefix reuse across turns), "
+            "~110 MiB each on Qwen3.8; -1 = ratio-derived (>= 4). 1 keeps reuse for the most "
+            "recent conversation only and hands the rest to the expert cache."
+        ),
+    )
+    parser.add_argument(
+        "--gpu-reserve-mb",
+        type=int,
+        default=ServerArgs.gpu_reserve_mb,
+        help=(
+            "VRAM (MiB) left free for other GPU processes (desktop, browser, OBS...) on top of "
+            "the --memory-ratio transient headroom; taken out of the expert-slot budget."
+        ),
+    )
+    parser.add_argument(
+        "--kv-elastic-idle-seconds",
+        dest="kv_elastic_idle_s",
+        type=float,
+        default=ServerArgs.kv_elastic_idle_s,
+        help="Idle time after which an elastic KV pool shrinks back to --kv-reserve-tokens.",
+    )
 
     parser.add_argument(
         "--moe-cache-policy",
@@ -576,6 +654,42 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-prefetch",
+        type=str,
+        choices=["off", "mtp", "layer"],
+        default=ServerArgs.moe_prefetch,
+        help=(
+            "Speculative expert prefetch (never changes routing or output; requires "
+            "--moe-backend offload/hybrid). 'layer': in-graph cross-layer lookahead -- "
+            "at decode layer J, layer J+N's own mix+gate run on J's residual and the "
+            "predicted experts stream in on a side stream while layers J..J+N-1 compute "
+            "(knobs: FREETOKEN_PREFETCH_LOOKAHEAD/_LAYER_TOPK/_HOOK_STRIDE/_PROXY). "
+            "'mtp': eager-window future-token predictor (measured weak; kept for "
+            "experiments; needs --speculative-algorithm mtp)."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-prefetch-budget",
+        type=int,
+        default=ServerArgs.moe_prefetch_budget,
+        help=(
+            "Max experts admitted+copied per step by --moe-prefetch (the speculative "
+            "bandwidth cap). -1 = auto (35, sized to a spec step's idle-PCIe window)."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-prefetch-topk",
+        type=int,
+        default=ServerArgs.moe_prefetch_topk,
+        help=(
+            "Prediction candidates kept per (layer, verify row) before the global "
+            "budget sort of --moe-prefetch."
+        ),
+    )
+
+    parser.add_argument(
         "--disable-moe-prefill-overlap",
         action="store_false",
         dest="moe_prefill_overlap",
@@ -612,6 +726,45 @@ def parse_args(
             "the double buffer and stream only the misses over PCIe "
             "(cudaMemcpyBatchAsync, CUDA >= 13.0). Effective with "
             "--moe-cache-size > 2 * num_experts."
+        ),
+    )
+
+    parser.add_argument(
+        "--speculative-algorithm",
+        type=str,
+        choices=["off", "mtp", "dspark"],
+        default=ServerArgs.speculative_algorithm,
+        help=(
+            "Speculative decoding. 'mtp' drafts with the checkpoint's own multi-token-"
+            "prediction head (models that ship one, e.g. Qwen3.8-Flash-Next) and verifies "
+            "the drafts in one forward; 'dspark' uses DeepSeek-V4-Flash-0731's block drafter "
+            "(the checkpoint's mtp.* stages: one draft pass emits a 5-token block). Both "
+            "engage only while exactly one request is decoding and fall back to normal "
+            "decode otherwise."
+        ),
+    )
+
+    parser.add_argument(
+        "--speculative-num-draft-tokens",
+        type=int,
+        dest="num_draft_tokens",
+        default=ServerArgs.num_draft_tokens,
+        help=(
+            "Draft tokens per speculative step; each step verifies this many + 1 tokens. "
+            "The shipped MTP heads have one layer, so 1 is the quality sweet spot. For "
+            "dspark this is the most drafts verified per step (at most the drafter's block "
+            "size, 5)."
+        ),
+    )
+    parser.add_argument(
+        "--speculative-adaptive-k-max",
+        dest="spec_adaptive_k_max",
+        type=int,
+        default=ServerArgs.spec_adaptive_k_max,
+        help=(
+            "Adaptive draft count: capture graph sets for every k from "
+            "--speculative-num-draft-tokens up to this value and choose the next step's "
+            "draft count per request from its running acceptance rate. 0 = fixed k."
         ),
     )
 
@@ -666,6 +819,22 @@ def parse_args(
         kwargs["reasoning_parser"] = _infer_reasoning_parser(kwargs["model_path"])
     elif kwargs["reasoning_parser"] == "off":
         kwargs["reasoning_parser"] = None
+
+    if kwargs["default_reasoning_effort"] == "model":
+        kwargs["default_reasoning_effort"] = None
+
+    if kwargs["speculative_algorithm"] != "off":
+        if kwargs["tensor_parallel_size"] > 1:
+            parser.error("--speculative-algorithm requires --tensor-parallel-size 1")
+        if kwargs["num_draft_tokens"] < 1:
+            parser.error("--speculative-num-draft-tokens must be >= 1")
+        # The MTP head's weights are opt-in at load time (mtp_load_enabled); the flag is the
+        # single source of truth and the env var reaches the spawned engine workers.
+        os.environ["FREETOKEN_LOAD_MTP"] = "1"
+
+    # --dense-quant reaches parse_config (a property of the HF config alone) and the spawned
+    # engine workers through the environment; the flag is the single source of truth.
+    os.environ["FREETOKEN_DENSE_QUANT"] = kwargs["dense_quant"]
 
     # Offload-family backends (offload/cpu/hybrid) need a slot cache; if the user gave no
     # sizing flag at all, default to --moe-cache-auto so a bare `ft serve <FTW MoE>` works

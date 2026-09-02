@@ -63,6 +63,15 @@ def _sgl_flash_attn_available() -> bool:
     return True
 
 
+def _extra_fixed_bytes(config) -> int:
+    """Fixed VRAM the pools must leave alone besides the GDN state pool: the speculative
+    executor's scratch + graph sets (engine/spec.spec_fixed_bytes) and the operator's reserve
+    for other GPU processes (--gpu-reserve-mb)."""
+    from freetoken.engine.spec import spec_fixed_bytes
+
+    return spec_fixed_bytes(config) + int(getattr(config, "gpu_reserve_mb", 0) or 0) * (1 << 20)
+
+
 def _startup_kv_budget(memory_ratio: float, init_free_memory: int, new_free_memory: int) -> int:
     """Bytes available to the KV pool at startup: ratio-scaled pre-load free memory minus
     what the resident model consumed. Kept as a pure function so the composition with the
@@ -317,6 +326,9 @@ class Engine:
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
         self.model.load_state_dict(self._load_weight_state_dict(config))
+        # Return the loader's transient GPU copies (host-resident tables, load-time
+        # quantization inputs) to the driver so they do not count as resident weights.
+        torch.cuda.empty_cache()
         post_weights_free = self._sync_get_memory()[0]
         self._weights_bytes = self._baseline_free - post_weights_free
         # Pool-budget baseline for the desktop cache sliders: free VRAM after the weights are
@@ -335,6 +347,24 @@ class Engine:
             self._host_tables_bytes = int(self.model.load_host_tables(config) or 0)
         if is_offload_moe_backend(config.moe_backend):
             self._init_offload_moe_cache(config)
+        self.moe_lookahead = None
+        if config.moe_prefetch == "layer" and self.moe_offload_cache is not None:
+            # Must attach BEFORE GraphRunner/SpecGraphs capture: the hooks become nodes
+            # of every decode graph. Only models exposing the per-layer lookahead seam
+            # (qwen4_exp's decoder layers) can serve it.
+            inner = getattr(self.model, "model", None)
+            layers = getattr(getattr(inner, "layers", None), "op_list", None)
+            if layers and all(hasattr(la, "_moe_lookahead") for la in layers):
+                from freetoken.moe.prefetch import LayerLookahead, attach_moe_lookahead
+
+                self.moe_lookahead = LayerLookahead(
+                    self.moe_offload_cache, self.model, device=self.device
+                )
+                attach_moe_lookahead(self.model, self.moe_lookahead)
+            else:
+                logger.warning_rank0(
+                    "--moe-prefetch layer: this model has no lookahead seam; disabled"
+                )
         if hasattr(self.model, "prepare_for_runtime"):
             self.model.prepare_for_runtime()
 
@@ -344,6 +374,7 @@ class Engine:
         # off it; the KV pool family owns every geometry-specific formula behind the rest.
         available_memory = _startup_kv_budget(config.memory_ratio, init_free_memory, new_free)
         available_memory -= state_pool_bytes(config)
+        available_memory -= _extra_fixed_bytes(config)
         self.num_pages = self._pool_cls.solve_num_pages(config, available_memory)
         num_tokens = self.num_pages * config.page_size
         self.ctx.kv_cache = self.kv_cache = create_kv_pool(
@@ -421,6 +452,35 @@ class Engine:
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
         )
+
+        # ======================= Speculative decoding (MTP) ========================
+        self.spec_executor = None
+        if config.spec_enabled and config.speculative_algorithm == "dspark":
+            # DSpark (DeepSeek-V4-Flash-0731): the drafter stages are loaded, their draft KV
+            # joins the window tier and their experts the offload cache (see
+            # models/deepseek_v4/dspark.py); the executor runs the multi-row verify +
+            # block draft. FREETOKEN_DSPARK_EXECUTOR=0 keeps decoding plain (the drafter
+            # still loads; FREETOKEN_DSPARK_HARNESS=1 scores it teacher-forced after prefill).
+            if os.getenv("FREETOKEN_DSPARK_EXECUTOR", "1") != "0":
+                from freetoken.engine.spec_dspark import DsparkExecutor
+
+                self.spec_executor = DsparkExecutor(self)
+            else:
+                logger.warning_rank0(
+                    "--speculative-algorithm dspark with FREETOKEN_DSPARK_EXECUTOR=0: drafter "
+                    "loaded, decoding runs without speculation"
+                )
+        elif config.spec_enabled:
+            from freetoken.engine.spec import SpecExecutor
+
+            assert hasattr(self.model, "mtp"), (
+                "--speculative-algorithm mtp needs the model's MTP head "
+                "(is FREETOKEN_LOAD_MTP set and does the checkpoint ship one?)"
+            )
+            self.spec_executor = SpecExecutor(self)
+            if self.spec_executor.graphs is not None:
+                self._spec_graphs_enabled = True
+
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
             self._warmup_prefill()
@@ -479,8 +539,21 @@ class Engine:
 
         cache_per_page, fixed_cache_size, page_tokens, min_reserve = self._pool_cls.kv_cost(config)
         fixed_cache_size += state_pool_bytes(config)  # sibling GDN state pool, engine-summed
+        fixed_cache_size += _extra_fixed_bytes(config)  # spec scratch/graph sets + external reserve
+        if config.moe_prefetch == "mtp":
+            # Only the eager (mtp) prefetcher allocates the stacked router-gate copy
+            # ([bank layers, hidden, experts] bf16, ~129 MB here) after this solve;
+            # reserve it so --moe-cache-auto does not hand its bytes to the slot cache.
+            # The in-graph layer mode reuses the resident per-layer weights (no stack),
+            # so reserving there would waste ~49 slots.
+            layers = len(next(iter(banks.sources.values())))
+            fixed_cache_size += (
+                layers * config.model_config.num_experts * config.model_config.hidden_size * 2
+            )
         num_experts = config.model_config.num_experts
-        total_experts = config.model_config.num_moe_layers * num_experts
+        # Derived from the banks, not num_moe_layers: append_spec_expert_bank may have added
+        # an extra bank layer (MTP draft experts) that the slot budget must cover too.
+        total_experts = len(next(iter(banks.sources.values()))) * num_experts
         return resolve_moe_cache_auto(
             baseline_free=self._baseline_free,
             weights_bytes=self._weights_bytes,
@@ -559,6 +632,7 @@ class Engine:
                 "(locked layers prefill via synchronous pageable copies)"
             )
             object.__setattr__(config, "moe_prefill_overlap", False)
+        extra_bank_layers = 0
         if cache_factory is None:
             # Fast path: an FTW checkpoint loads its repacked banks directly.
             # Slow path: load_expert_banks auto-picks parallel vs serial baseline by
@@ -585,6 +659,13 @@ class Engine:
                 decode_target=("cpu" if decode_target in ("cpu", "hybrid") else "gpu"),
                 layer_residency=requested_residency,
             )
+            # A model may append extra bank layers past the main tower's (qwen4_exp: the MTP
+            # draft experts quantized into the cache's format, so speculative decoding costs
+            # slots instead of resident VRAM). The cache, the auto-size budget and the layer
+            # walk below all size to num_moe_layers + this.
+            append_bank_hook = getattr(self.model, "append_spec_expert_bank", None)
+            if append_bank_hook is not None:
+                extra_bank_layers = append_bank_hook(banks, config, self.device)
             if config.moe_cache_auto:
                 size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks)
                 object.__setattr__(config, "moe_cache_size", size)
@@ -606,7 +687,7 @@ class Engine:
             cache = OffloadMoeCache(
                 # Models with leading dense layers (GLM-4) only have experts on the MoE
                 # layers; num_moe_layers == num_layers when first_k_dense_replace == 0.
-                num_layers=config.model_config.num_moe_layers,
+                num_layers=config.model_config.num_moe_layers + extra_bank_layers,
                 num_experts=config.model_config.num_experts,
                 cache_size=config.moe_cache_size,
                 device=self.device,
@@ -629,14 +710,27 @@ class Engine:
         if decode_target == "hybrid":
             self._resolve_hybrid_fetch(config, cache)
         # Must be set before CUDA graph capture so the (device-side) accumulation ops are
-        # captured and re-run on every decode replay.
-        cache.collect_stats = config.moe_collect_stats
+        # captured and re-run on every decode replay. The periodic stats log implies it.
+        from freetoken.moe.offload_cache import moe_stats_log_interval
+
+        cache.collect_stats = config.moe_collect_stats or moe_stats_log_interval() > 0
         # attach_offload_moe_cache walks for OffloadMoELayers, or defers to a model's
         # _iter_offload_moe_layers() hook when its MoE blocks are bespoke nn.Modules (DSV4).
         layers = attach_offload_moe_cache(self.model, cache)
-        assert len(layers) == config.model_config.num_moe_layers
+        assert len(layers) == config.model_config.num_moe_layers + extra_bank_layers
         if cache.decode_target in ("cpu", "hybrid"):
             self._init_cpu_moe_executor(config, cache, layers)
+        if config.moe_prefetch == "mtp":
+            budget = config.moe_prefetch_budget if config.moe_prefetch_budget > 0 else 35
+            cache.init_prefetch_plan(budget)
+        elif config.moe_prefetch == "layer":
+            # Per-hook plans: the budget is per admission call (rows * layer topk, small);
+            # the ring holds one plan per in-flight lookahead target (N + 1).
+            import os as _os
+
+            n = max(1, int(_os.getenv("FREETOKEN_PREFETCH_LOOKAHEAD", "2")))
+            budget = config.moe_prefetch_budget if config.moe_prefetch_budget > 0 else 64
+            cache.init_prefetch_plan(budget, ring=n + 1)
         self.ctx.moe_offload_cache = cache
         self.moe_offload_cache = cache
         return cache
@@ -652,6 +746,15 @@ class Engine:
         """
         if config.moe_hybrid_max_fetch >= 0:
             return  # explicit fixed cap
+        override = os.getenv("FREETOKEN_HYBRID_FETCH_FRACTION")
+        if override:
+            cache.hybrid_max_fetch = cache.num_experts
+            cache.hybrid_fetch_fraction = float(override)
+            logger.info_rank0(
+                f"FREETOKEN_HYBRID_FETCH_FRACTION={override}: fetching that fraction of "
+                "each decode step's expert misses over PCIe, the rest on the CPU"
+            )
+            return
         from freetoken.moe.bench_profile import load_hybrid_fetch_fraction
 
         gpu_name, gpu_uuid = _profile_gpu(self.device.index)
@@ -690,8 +793,11 @@ class Engine:
                 f"(MoE layer {type(sample).__name__} is missing {required})."
             )
         # Decode batches never exceed max_running_req, but CUDA-graph padding can
-        # round a batch up to the largest captured size; cover both.
-        max_tokens = max(config.max_running_req, config.cuda_graph_max_bs or 0, 1)
+        # round a batch up to the largest captured size; cover both. A speculative verify
+        # step pushes num_spec_tokens + 1 rows through the decode path in one shot.
+        max_tokens = max(
+            config.max_running_req, config.cuda_graph_max_bs or 0, config.num_spec_tokens + 1
+        )
         # gpt-oss mxfp4 carries clamped-swiglu scalars; other formats use the defaults.
         executor = CpuMoeExecutor(
             cache,
@@ -850,7 +956,8 @@ class Engine:
             per_expert_bytes=per_expert_bytes, baseline_free=self._baseline_free,
             weights_bytes=self._weights_bytes, current_num_pages=self.num_pages,
             extra_fixed_bytes=(
-                state_pool_bytes(config, target_mamba) if target_mamba is not None else 0
+                (state_pool_bytes(config, target_mamba) if target_mamba is not None else 0)
+                + _extra_fixed_bytes(config)
             ),
             extra_note=(
                 f", mamba={target_mamba - 1} slots" if target_mamba is not None else ""
@@ -868,7 +975,19 @@ class Engine:
         # pools start being freed. A failure BEFORE this flag flips leaves the engine serving
         # untouched (no rollback needed); after it, only a rebuild restores service.
         self.rebuild_teardown_started = True
-        # 1. Tear down CUDA graphs + backend capture scratch (free-before-alloc).
+        # 1. Tear down CUDA graphs + backend capture scratch (free-before-alloc). The
+        # speculative verify/draft graphs bake the KV slabs and the page table too, so they
+        # must go with the decode graphs (they are re-captured after step 4; a stale replay
+        # against the freed tensors would read garbage or crash).
+        # "Were speculative graphs in use" must survive a failed attempt: the attempt sets
+        # graphs = None before its teardown, so the rollback rebuild would otherwise skip the
+        # re-capture and leave the server on the eager (host-bound, ~4x slower) verify.
+        spec_had_graphs = self.spec_executor is not None and (
+            getattr(self.spec_executor, "graphs", None) is not None
+            or getattr(self, "_spec_graphs_enabled", False)
+        )
+        if spec_had_graphs:
+            self.spec_executor.graphs = None
         self.attn_backend.reset_capture()
         self.graph_runner.destroy_cuda_graphs()
         # 2. Resize caches in place (each frees its old GPU tensors before allocating).
@@ -878,13 +997,19 @@ class Engine:
         # FrozenInstanceError, which here aborts the rebuild after the CUDA graphs are gone (→ 503).
         if num_swa_pages is not None:
             object.__setattr__(config, "swa_num_pages_override", num_swa_pages)
+        # Free-before-alloc across pools too: when the KV pool shrinks (elastic KV handing
+        # pages back to expert slots) resize it FIRST so the bigger MoE cache is allocated
+        # into the freed bytes; when it grows, shrink the MoE cache first (the original order).
+        kv_shrinks = num_pages is not None and num_pages < self.num_pages
+        if kv_shrinks:
+            self._resize_kv_pool(config, num_pages, num_swa_pages)
         if moe_cache_size is not None:
             assert self.moe_offload_cache is not None, "no MoE offload cache to resize"
             self.moe_offload_cache.rebuild(moe_cache_size)
-        if num_pages is not None:
+        if num_pages is not None and not kv_shrinks:
             # sets self.num_pages (rebuilds KV + window)
             self._resize_kv_pool(config, num_pages, num_swa_pages)
-        elif num_swa_pages is not None:
+        elif num_swa_pages is not None and num_pages is None:
             # Window-only change: no page-count change, but re-derive the window pool at the new
             # pin against the CURRENT page count. This re-allocs the same-size full pool and
             # the resized window, both inside the pool's own rebuild_from_config.
@@ -914,14 +1039,36 @@ class Engine:
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
         )
+        if spec_had_graphs:
+            # 5. Re-capture the speculative graphs against the new pools/table (same fallback
+            # convention as the initial capture: eager verify on failure).
+            self.spec_executor.capture_graphs()  # logs + eager fallback inside
+            if self.spec_executor.graphs is not None:
+                self._spec_graphs_enabled = True
+                logger.info_rank0("Speculative verify/draft CUDA graphs re-captured after rebuild")
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
+        # Expert-prefetch fence (invariant I3): no forward may run a demand ensure while
+        # a speculative expert copy is in flight on the side stream -- a demand HIT on a
+        # half-copied slot would read garbage. Enqueue-only; no-op when nothing is in flight.
+        prefetcher = getattr(self.spec_executor, "prefetcher", None)
+        if prefetcher is not None:
+            prefetcher.join()
+        if batch.spec is not None:
+            # Speculative verify step: the executor runs the whole cycle (verify forward,
+            # acceptance, state commit, token-pool scatters, next draft). Bookkeeping is
+            # settled by the scheduler drain via Req.commit_verify, not complete_one.
+            with self.ctx.forward_batch(batch):
+                return self.spec_executor.verify_step(batch, args)
         with self.ctx.forward_batch(batch):
             if self.graph_runner.can_use_cuda_graph(batch):
                 logits = self.graph_runner.replay(batch)
             else:
                 logits = self.model.forward()
+            if self.spec_executor is not None and batch.is_prefill:
+                # Populate the MTP layer's KV over this prompt chunk (one-row lag).
+                self.spec_executor.prefill_mtp(batch)
         if self.cpu_moe_executor is not None:
             # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
             # -> stale expert outputs) as a loud error instead of silent corruption.
@@ -932,6 +1079,10 @@ class Engine:
 
         batch_logits = logits[: batch.size]
         next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
+        if self.spec_executor is not None and getattr(batch, "spec_warmup", None) is not None:
+            # First decode step of a speculative session: also stage the first draft.
+            with self.ctx.forward_batch(batch):
+                self.spec_executor.warmup_draft(batch, next_tokens_gpu)
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
@@ -1215,6 +1366,9 @@ _DENSE_MOE_SETTINGS = {
     "moe_hybrid_max_fetch": -1,
     "moe_prefill_overlap": True,
     "moe_prefill_hit_d2d": False,
+    "moe_prefetch": "off",
+    "moe_prefetch_budget": -1,
+    "moe_prefetch_topk": 4,
     "expert_load": "auto",
 }
 
@@ -1230,6 +1384,62 @@ def _adjust_config(config: EngineConfig):
     has_linear_attention = getattr(model_config, "has_linear_attention", False)
     is_moe = getattr(model_config, "is_moe", False)
     expert_quant = getattr(model_config, "expert_quant", "none")
+
+    # ----- KV storage dtype (--kv-cache-dtype) -> config.kv_dtype, before any pool sizing -----
+    # (solve_num_pages / --moe-cache-auto / validate_rebuild all price the slab from it.)
+    kv_choice = getattr(config, "kv_cache_dtype", "auto") or "auto"
+    compute_dtype = getattr(config, "dtype", None)
+    if kv_choice == "fp8":
+        from freetoken.kvcache import resolve_pool_class
+        from freetoken.kvcache.qsa_pool import QSAKVCache
+
+        if resolve_pool_class(model_config) is not QSAKVCache:
+            raise ValueError(
+                "--kv-cache-dtype fp8 is implemented for the QSA KV pool (Qwen3.8-Flash-Next) "
+                "only; this model's KV cache stores the compute dtype"
+            )
+        from freetoken.kernel.triton.e4m3_compat import e4m3_native
+
+        if not e4m3_native():
+            raise ValueError("--kv-cache-dtype fp8 needs native e4m3 support (sm_89 or newer)")
+        override("kv_dtype", torch.float8_e4m3fn)
+    elif kv_choice in ("auto", "bf16"):
+        override("kv_dtype", compute_dtype)
+    else:
+        raise ValueError(f"--kv-cache-dtype {kv_choice!r}: expected auto, bf16 or fp8")
+
+    # ----- --dense-quant fp8: load-time FP8 of the bf16 dense linears (qwen4_exp) -----
+    dense_choice = getattr(config, "dense_quant", "auto") or "auto"
+    if dense_choice == "fp8":
+        qwen4_args = getattr(model_config, "qwen4_args", None)
+        if qwen4_args is None:
+            logger.warning(
+                "--dense-quant fp8 is implemented for Qwen3.8-Flash-Next (qwen4_exp) only; "
+                "ignored for this model"
+            )
+        elif not getattr(qwen4_args, "dense_fp8_parts", ()):
+            raise ValueError(
+                "--dense-quant fp8 was requested but parse_config saw no FP8 parts "
+                "(FREETOKEN_DENSE_QUANT must reach the engine process)"
+            )
+        else:
+            from freetoken.kernel.triton.e4m3_compat import e4m3_native
+            from freetoken.kernel.triton.fp8_pertensor_linear import rowwise_scaled_mm_ok
+
+            # Without the row-wise cuBLASLt path the M>1 layers would silently fall to the
+            # latency-bound Triton W8A16 GEMM and decode would get SLOWER than bf16.
+            if not (e4m3_native() and rowwise_scaled_mm_ok()):
+                raise ValueError(
+                    "--dense-quant fp8 needs native e4m3 (sm_89+) and row-wise torch._scaled_mm"
+                )
+            logger.info_rank0(
+                "dense quant: per-channel FP8 at load for parts "
+                + ",".join(qwen4_args.dense_fp8_parts)
+                + f" (attn_quant={model_config.attn_quant}, dense_quant={model_config.dense_quant}, "
+                f"lm_head_quant={getattr(model_config, 'lm_head_quant', 'none')})"
+            )
+    elif dense_choice not in ("auto", "bf16"):
+        raise ValueError(f"--dense-quant {dense_choice!r}: expected auto, bf16 or fp8")
 
     if not is_moe:
         # A dense model has no routed experts: the MoE knobs are inert, and the offload family
@@ -1479,6 +1689,23 @@ def _adjust_config(config: EngineConfig):
             "--moe-cpu-layers requires --moe-backend offload or hybrid (got "
             f"{config.moe_backend!r}); use --moe-backend cpu to run all layers on CPU"
         )
+
+    if config.moe_prefetch not in ("off", "mtp", "layer"):
+        raise ValueError(
+            f"--moe-prefetch must be off, mtp or layer, got {config.moe_prefetch!r}"
+        )
+    if config.moe_prefetch != "off":
+        if config.moe_backend not in ("offload", "hybrid"):
+            raise ValueError(
+                "--moe-prefetch requires --moe-backend offload or hybrid (the prefetcher "
+                f"admits into the offload slot cache), got {config.moe_backend!r}"
+            )
+        if config.moe_prefetch == "mtp" and not config.spec_enabled:
+            logger.warning_rank0(
+                "--moe-prefetch mtp needs MTP speculative decoding "
+                "(--speculative-algorithm mtp); disabling expert prefetch"
+            )
+            override("moe_prefetch", "off")
 
     if is_moe:
         object.__setattr__(model_config, "moe_backend", config.moe_backend)

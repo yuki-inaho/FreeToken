@@ -256,7 +256,13 @@ class FlashInferBackend(BaseAttnBackend):
             pos_encoding_mode="NONE",
             seq_lens_cpu=seq_len_cpu,
             dtype=self.kvcache.dtype,
-            wrapper=self.decode_wrappers if batch.is_decode else self.prefill_wrapper,
+            # A speculative verify batch (phase "decode", batch.spec set, k+1 rows per
+            # request) is ragged like prefill: the decode wrapper assumes one query per row.
+            wrapper=(
+                self.decode_wrappers
+                if batch.is_decode and max_seqlen_q == 1
+                else self.prefill_wrapper
+            ),
         )
 
     def reset_capture(self) -> None:
@@ -311,3 +317,123 @@ class FlashInferBackend(BaseAttnBackend):
         assert self.capture is not None and bs in self.capture_bs
         metadata.wrapper = self.graph_wrappers[bs]
         self._initialize_metadata_once(metadata)
+
+    # ------------------------------------------------------------------
+    # Speculative-decoding graphs (engine/spec.py): the verify graph (k+1 ragged rows of
+    # one request) and the chained-draft graph (one row) each get their own graph-capable
+    # wrapper bound to static indptr/indices buffers; every replay re-plans those buffers
+    # host-side from the batch's current addressing.
+    # ------------------------------------------------------------------
+
+    def prepare_spec_capture(self, batch: Batch, key: str) -> None:
+        """Bind ``batch.attn_metadata`` (already built by ``prepare_metadata``) to a fresh
+        graph-capable wrapper keyed by ``key`` and plan it, so the forward captured next
+        reads static buffers that :meth:`stage_spec` refreshes per replay."""
+        from flashinfer import (
+            BatchPrefillWithPagedKVCacheWrapper,
+            CUDAGraphBatchDecodeWithPagedKVCacheWrapper,
+        )
+
+        metadata = batch.attn_metadata
+        assert isinstance(metadata, FIMetadata)
+        bs = len(batch.padded_reqs)
+        # Static indices buffer sized for the longest request row the page table can hold:
+        # every replay's plan() copies that request's [0, device_len) page ids into it.
+        max_rows = int(get_global_ctx().page_table.shape[1]) * bs + 1
+        spec_bufs = getattr(self, "_spec_bufs", None)
+        if spec_bufs is None:
+            spec_bufs = self._spec_bufs = {}
+        dev = self.device
+        bufs = spec_bufs[key] = {
+            "qo_indptr": torch.zeros(bs + 1, dtype=torch.int32, device=dev),
+            "kv_indptr": torch.zeros(bs + 1, dtype=torch.int32, device=dev),
+            "indices": torch.zeros(max_rows, dtype=torch.int32, device=dev),
+            "last_page_len": torch.ones(bs, dtype=torch.int32, device=dev),
+        }
+        if int(metadata.cu_seqlens_q_cpu[-1]) == bs:  # one query row per request
+            wrapper = CUDAGraphBatchDecodeWithPagedKVCacheWrapper(
+                self.float_workspace_buffer,
+                kv_layout="NHD",
+                use_tensor_cores=self.use_tensor_cores,
+                indptr_buffer=bufs["kv_indptr"],
+                indices_buffer=bufs["indices"],
+                last_page_len_buffer=bufs["last_page_len"],
+            )
+            wrapper._backend = "fa2"
+            wrapper._int_workspace_buffer = self.int_workspace_buffer
+        else:
+            wrapper = BatchPrefillWithPagedKVCacheWrapper(
+                self.float_workspace_buffer,
+                kv_layout="NHD",
+                use_cuda_graph=True,
+                qo_indptr_buf=bufs["qo_indptr"],
+                paged_kv_indptr_buf=bufs["kv_indptr"],
+                paged_kv_indices_buf=bufs["indices"],
+                paged_kv_last_page_len_buf=bufs["last_page_len"],
+            )
+        spec_wrappers = getattr(self, "_spec_wrappers", None)
+        if spec_wrappers is None:
+            spec_wrappers = self._spec_wrappers = {}
+        spec_wrappers[key] = wrapper
+        metadata.wrapper = wrapper
+        metadata.initialized = False
+        self._initialize_metadata_once(metadata)
+
+    def stage_spec(self, metadata: FIMetadata, batch: Batch, key: str) -> None:
+        """Re-plan the ``key`` spec graph's static buffers for this replay from the batch's
+        current rows (host-known: cached_len / device_len / table_idx)."""
+        self.prepare_metadata(batch)
+        fresh = batch.attn_metadata
+        assert isinstance(fresh, FIMetadata)
+        fresh.wrapper = self._spec_wrappers[key]
+        # Plan WITHOUT the shared last_event sync: each spec wrapper owns its static buffers
+        # and is planned once per step from freshly allocated pinned host tensors, so no
+        # earlier plan's staging copy can still be in flight on them. The sync would make
+        # every step's tail wait for all queued GPU work (killing the drain/draft overlap).
+        self._plan_no_sync(fresh)
+        # The captured graph launched through the same wrapper object; keep the metadata
+        # object the executor holds pointing at the freshly planned one.
+        metadata.wrapper = fresh.wrapper
+        metadata.initialized = True
+
+    def _plan_no_sync(self, metadata: FIMetadata) -> None:
+        from flashinfer import BatchDecodeWithPagedKVCacheWrapper
+
+        metadata.initialized = True
+        if isinstance(metadata.wrapper, BatchDecodeWithPagedKVCacheWrapper):
+            metadata.wrapper.plan(
+                indptr=metadata.cu_seqlens_k_cpu,
+                indices=metadata.indices,
+                last_page_len=metadata.last_page_len_cpu,
+                num_qo_heads=metadata.num_qo_heads,
+                num_kv_heads=metadata.num_kv_heads,
+                head_dim=metadata.head_dim,
+                page_size=metadata.page_size,
+                pos_encoding_mode=metadata.pos_encoding_mode,
+                seq_lens=metadata.seq_lens_cpu,
+                data_type=metadata.dtype,
+                q_data_type=metadata.dtype,
+                kv_data_type=metadata.dtype,
+                non_blocking=True,
+            )
+        else:
+            metadata.wrapper.plan(
+                qo_indptr=metadata.cu_seqlens_q_cpu,
+                paged_kv_indptr=metadata.cu_seqlens_k_cpu,
+                paged_kv_indices=metadata.indices,
+                paged_kv_last_page_len=metadata.last_page_len_cpu,
+                num_qo_heads=metadata.num_qo_heads,
+                num_kv_heads=metadata.num_kv_heads,
+                head_dim_qk=metadata.head_dim,
+                page_size=metadata.page_size,
+                pos_encoding_mode=metadata.pos_encoding_mode,
+                seq_lens=metadata.seq_lens_cpu,
+                q_data_type=metadata.dtype,
+                kv_data_type=metadata.dtype,
+                non_blocking=True,
+                causal=True,
+            )
+
+    def spec_indices_buffer(self, key: str) -> torch.Tensor:
+        """The ``key`` spec graph's static paged-KV indices buffer (for device-side patches)."""
+        return self._spec_bufs[key]["indices"]

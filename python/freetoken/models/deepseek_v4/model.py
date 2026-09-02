@@ -21,6 +21,8 @@ activation quant + Hadamard rotation re-introduced; see ``ops.py`` / the dsv4 ke
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -43,6 +45,7 @@ from .layers import (  # noqa: F401
     RMSNorm,
     get_compress_topk_idxs,
     get_window_topk_idxs,
+    hc_head_combine,
 )
 from .moe import Expert, Gate  # noqa: F401
 
@@ -50,12 +53,12 @@ from .moe import Expert, Gate  # noqa: F401
 class Block(nn.Module):
     """Decoder block with manifold-constrained Hyper-Connections (4 residual streams)."""
 
-    def __init__(self, layer_id: int, args: DeepseekV4Args):
+    def __init__(self, layer_id: int, args: DeepseekV4Args, attention_cls=Attention):
         super().__init__()
         self.layer_id = layer_id
         self.norm_eps = args.norm_eps
         self.dim = args.dim
-        self.attn = Attention(layer_id, args)
+        self.attn = attention_cls(layer_id, args)
         self.ffn = MoE(layer_id, args)
         self.attn_norm = RMSNorm(args.dim, self.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, self.norm_eps)
@@ -112,11 +115,11 @@ class Block(nn.Module):
         x = self.hc_post(x, residual, post, comb)
         return x
 
-    def decode_step(self, x, pos, rows, cmp_stage_cap, input_ids, wctx=None):
+    def decode_step(self, x, pos, rows, cmp_stage_cap, input_ids, wctx=None, spec=None):
         residual = x
         x, post, comb = self.hc_pre(x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
         x = self.attn_norm(x)
-        x = self.attn.decode_step(x, pos, rows, cmp_stage_cap, wctx)
+        x = self.attn.decode_step(x, pos, rows, cmp_stage_cap, wctx, spec)
         x = self.hc_post(x, residual, post, comb)
 
         residual = x
@@ -144,19 +147,76 @@ class Transformer(nn.Module):
         self.hc_head_base = nn.Parameter(torch.empty(hc_mult, dtype=torch.float32), requires_grad=False)
         self.hc_head_scale = nn.Parameter(torch.empty(1, dtype=torch.float32), requires_grad=False)
 
+        # DSpark drafter stages (checkpoint ``mtp.*``), built only for speculative decoding
+        # (FREETOKEN_LOAD_MTP, set by --speculative-algorithm) on checkpoints that ship one.
+        # Their draft KV over the main sequence lives in the paged window tier as layers
+        # n_layers.. (see dspark.py); the target-layer hidden stash below feeds it.
+        self.mtp = nn.ModuleList()
+        self.target_layer_ids: tuple[int, ...] = tuple(args.dspark_target_layer_ids)
+        self._keep_main_hidden = False
+        # Decode: the CURRENT batch's [B, n_targets*dim] stash (eager) / per captured batch
+        # size (the static intermediate's address is stable per graph). Prefill: each
+        # request's FINAL row (the warmup draft's context).
+        self._main_hidden: torch.Tensor | None = None
+        self._main_hidden_graph: dict[int, torch.Tensor] = {}
+        self._main_hidden_last: torch.Tensor | None = None
+        from .config import dspark_build_enabled
+
+        if dspark_build_enabled(args):
+            from .dspark import DSparkBlock
+
+            self.mtp = nn.ModuleList(
+                [DSparkBlock(args.n_layers + s, args, s) for s in range(args.n_mtp_layers)]
+            )
+            self._keep_main_hidden = True
+
     def bind(self, pool, device: torch.device) -> None:
         for layer in self.layers:
             layer.attn.bind(pool, device)
+        for stage in self.mtp:
+            stage.attn.bind(pool, device)
 
     def hc_head(self, x):
-        shape, dtype = x.size(), x.dtype
-        dim = self.args.dim
-        xf = x.flatten(2).float()
-        rsqrt = torch.rsqrt(xf.square().mean(-1, keepdim=True) + self.norm_eps)
-        mixes = F.linear(xf, self.hc_head_fn) * rsqrt
-        pre = torch.sigmoid(mixes * self.hc_head_scale + self.hc_head_base) + self.hc_eps
-        M = shape[0] * shape[1]
-        return hc_pre_combine(xf.view(M, self.hc_mult, dim), pre.view(M, self.hc_mult), dtype).view(*shape[:2], dim)
+        return hc_head_combine(
+            x, self.hc_head_fn, self.hc_head_scale, self.hc_head_base,
+            hc_mult=self.hc_mult, dim=self.args.dim, norm_eps=self.norm_eps, hc_eps=self.hc_eps,
+        )
+
+    def _stash_main_hidden(self, mains: list[torch.Tensor], B: int) -> None:
+        # Decode-side stash of the target-layer HC-stream means (the DSpark context rows).
+        mh = torch.cat(mains, dim=-1).view(B, -1)
+        if mh.is_cuda and torch.cuda.is_current_stream_capturing():
+            self._main_hidden_graph[B] = mh
+        else:
+            self._main_hidden = mh
+
+    def _dspark_prefill(
+        self, main_hidden, input_ids, segments, flat_positions, last_indices
+    ) -> None:
+        """Write the DSpark stages' main-sequence KV for every prefill row (at the rows' window
+        slots, like the main layers) and keep each request's final context row for warmup.
+        ``main_hidden`` is ``[T, n_targets*dim]`` over the ragged batch."""
+        stage0 = self.mtp[0]
+        main_x = stage0.main_x(main_hidden)  # [T, dim]
+        self._main_hidden_last = main_hidden.index_select(0, last_indices)
+        attn0 = stage0.attn
+        freqs = attn0.freqs_cis.index_select(0, flat_positions)  # window-regime rope, all stages
+        slots = torch.cat(
+            [attn0.attn.window_slots_of(ti, start, start + n) for (_off, n, ti, start) in segments]
+        )
+        for stage in self.mtp:
+            kv = stage.attn.main_kv(main_x, freqs)
+            stage.attn.attn.store_window(kv, stage.layer_id, slots)
+        if (
+            os.getenv("FREETOKEN_DSPARK_HARNESS")
+            and len(segments) == 1
+            and segments[0][3] == 0
+        ):
+            # Wiring check on a cold single-request prompt (the stages' KV for every
+            # position is in the window tier at this point).
+            from .dspark import teacher_forced_report
+
+            teacher_forced_report(self, input_ids.view(-1), segments[0][2])
 
     def prefill_batched(
         self, input_ids: torch.Tensor, segments, flat_positions: torch.Tensor,
@@ -174,18 +234,29 @@ class Transformer(nn.Module):
         # final token -> its next-token logits row.
         h = self.embed(input_ids)
         h = h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
-        for layer in self.layers:
+        mains: list[torch.Tensor] = []
+        for i, layer in enumerate(self.layers):
             h = layer.prefill_batched(h, input_ids, segments, flat_positions)
+            if self._keep_main_hidden and i in self.target_layer_ids:
+                mains.append(h.mean(dim=2))  # [1, T, dim]: the DSpark context source
+        if mains:
+            self._dspark_prefill(
+                torch.cat(mains, dim=-1)[0], input_ids, segments, flat_positions, last_indices
+            )
         h = self.hc_head(h)
         h = self.norm(h)
         return F.linear(h[0, last_indices], self.head)  # [B, vocab]
 
     def decode(
-        self, input_ids: torch.Tensor, pos: torch.Tensor, cmp_stage_cap: int
+        self, input_ids: torch.Tensor, pos: torch.Tensor, cmp_stage_cap: int, spec=None
     ) -> torch.Tensor:
         # input_ids [B,1], pos [B] (GPU int). cmp_stage_cap = max position any row reaches; each
         # layer derives its compressed staging width = (cmp_stage_cap+1)//ratio (max valid count
         # over rows in eager; a static capture width = max_seq-1 under graph).
+        #
+        # spec (Batch.spec): a speculative VERIFY -- the B rows are consecutive tokens of one
+        # request (the snapshot holds B copies of its page-table row). Same path, with the
+        # compressors chained (Attention.decode_step) and the DSpark context rows stashed.
         #
         # Overlap safety: the global page-table rows are NOT read inside the graph. The attention
         # metadata carries a snapshot of the active rows' whole-history full locs (staged before a
@@ -202,8 +273,17 @@ class Transformer(nn.Module):
         # into every layer. They read only the shared snapshot / positions, so they are identical
         # across layers.
         wctx = get_global_ctx().batch.attn_metadata.window_ctx(pos, rows)
-        for layer in self.layers:
-            h = layer.decode_step(h, pos, rows, cmp_stage_cap, input_ids, wctx)
+        if spec is not None:
+            spec.scratch.window_slots = wctx[0]  # the verify rows' slots: the commit's addressing
+        mains: list[torch.Tensor] = []
+        for i, layer in enumerate(self.layers):
+            h = layer.decode_step(h, pos, rows, cmp_stage_cap, input_ids, wctx, spec)
+            if self._keep_main_hidden and i in self.target_layer_ids:
+                mains.append(h.mean(dim=2))  # [B, 1, dim]
+        if mains:
+            self._stash_main_hidden(mains, B)
+            if spec is not None:
+                spec.scratch.main_hidden_rows[:B].copy_(torch.cat(mains, dim=-1).view(B, -1))
         h = self.hc_head(h)
         h = self.norm(h)
         return F.linear(h[:, -1], self.head)
@@ -240,9 +320,38 @@ class DeepseekV4ForCausalLM(BaseLLMModel):
     def _iter_offload_moe_layers(self):
         # Hook for moe.offload_cache.iter_offload_moe_layers: DSV4's MoE block (block.ffn)
         # is a bespoke nn.Module (not OffloadMoELayer), so yield its inner routed-expert
-        # layer instead, whose .offload_cache the generic attach sets.
+        # layer instead, whose .offload_cache the generic attach sets. The DSpark stages'
+        # experts follow the main tower's (cache layer ids n_layers..), matching the bank
+        # layers append_spec_expert_bank appends.
         for block in self._transformer.layers:
             yield block.ffn.experts
+        for stage in self._transformer.mtp:
+            yield stage.ffn.experts
+
+    def append_spec_expert_bank(self, banks, engine_config, device: torch.device) -> int:
+        """Engine hook (offload-cache construction): the DSpark stages' routed experts join
+        the unified ds_fp4 offload cache as extra bank layers right after the main tower's.
+        Returns the number of bank layers appended (0 without a drafter)."""
+        stages = len(self._transformer.mtp)
+        if stages == 0:
+            return 0
+        if banks.quant_format != "ds_fp4":
+            raise ValueError(
+                "DSpark experts join the expert cache as extra ds_fp4 bank layers and require "
+                f"the ds_fp4 format, got {banks.quant_format!r}"
+            )
+        from .weight import load_dspark_expert_bank_layers
+
+        layer_banks = load_dspark_expert_bank_layers(
+            engine_config.model_path, self._args, dummy=engine_config.use_dummy_weight
+        )
+        for name, tensors in layer_banks.items():
+            banks.sources[name].extend(tensors)
+        if banks.layer_residency is not None:
+            from freetoken.moe.host_banks import HostResidency
+
+            banks.layer_residency.extend([HostResidency.PINNED.value] * stages)
+        return stages
 
     def state_dict(self, *, prefix: str = "", result=None):
         result = {} if result is None else result
@@ -280,7 +389,9 @@ class DeepseekV4ForCausalLM(BaseLLMModel):
         # DECODE (bs>=1): per-row position (GPU int tensor -> no host syncs / graph safe). The
         # compressed staging cap is the max position any row reaches (eager); a static max_seq-1
         # under graph capture (so the captured static-shape graph serves any real replay position).
-        B = batch.padded_size
+        # A speculative verify (batch.spec) is one request's k+1 consecutive tokens as k+1 rows.
+        spec = getattr(batch, "spec", None)
+        B = spec.num_input_tokens if spec is not None else batch.padded_size
         pos = batch.positions.long().view(-1)[:B]
         if torch.cuda.is_current_stream_capturing():
             # Stage exactly as wide as the snapshot those columns are gathered FROM. The backend
@@ -290,7 +401,7 @@ class DeepseekV4ForCausalLM(BaseLLMModel):
             cmp_stage_cap = md.stage_width - 1
         else:
             cmp_stage_cap = int(pos.max().item())
-        return self._transformer.decode(input_ids.view(B, 1), pos, cmp_stage_cap)
+        return self._transformer.decode(input_ids.view(B, 1), pos, cmp_stage_cap, spec)
 
 
 __all__ = ["Transformer", "DeepseekV4ForCausalLM"]
