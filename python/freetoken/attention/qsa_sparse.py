@@ -284,6 +284,10 @@ class QSASparseAttnBackend(BaseAttnBackend):
             _QSA_DECODE_FUSED
             and T <= 4
             and self.kvcache.kv_quantized
+            # The fused kernel's K/V half writes the fp8 slab. NVFP4 packs two codes per byte
+            # with a second scale tier, so it takes the separate store_kv + _update_index_cache
+            # pair (one extra launch per QSA layer at decode).
+            and not self.kvcache.kv_nvfp4
             and md.block_table is not None
             and T + self.ratio - 1 <= self.ring_capacity
         )
@@ -333,9 +337,12 @@ class QSASparseAttnBackend(BaseAttnBackend):
             md.token_to_req,
             torch.empty_like(q),
             # fp8 pools (--kv-cache-dtype fp8): per-(token, kv head) scales the kernel folds
-            # in; None (16-bit slabs) keeps the historical path.
+            # in; None (16-bit slabs) keeps the historical path. NVFP4 pools add the per-16
+            # block scales, which the kernel must apply BEFORE the dot.
             k_scale=self.kvcache.k_scale(layer_id),
             v_scale=self.kvcache.v_scale(layer_id),
+            k_blk=self.kvcache.k_blk(layer_id),
+            v_blk=self.kvcache.v_blk(layer_id),
         )
 
     def _plan_index_writes(self, md: QSASparseMetadata, batch: Batch) -> None:

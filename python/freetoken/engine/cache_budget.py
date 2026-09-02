@@ -70,22 +70,30 @@ def plan_cache_budget(
     # Prefill overlap borrows two full expert-layer buffers, so it needs >= 2*num_experts
     # slots; disable it (and lower the floor) if the cap cannot fit that.
     overlap = prefill_overlap and hi >= 2 * num_experts
-    lo = 2 * num_experts if overlap else num_experts
-    assert hi >= lo, f"slot cap {hi} below the minimum {lo} slots"
-
     kv_reserve_bytes = kv_reserve_pages * cache_per_page
-    # MoE-priority: reserve KV first, then experts greedily take the remaining budget.
-    raw = (budget_bytes - kv_reserve_bytes) // per_expert_bytes
-    moe_cache_size = max(lo, min(raw, hi))
-    # A tiny budget may have forced moe_cache_size below 2*num_experts even with overlap on.
-    overlap = overlap and moe_cache_size >= 2 * num_experts
 
-    remaining = budget_bytes - moe_cache_size * per_expert_bytes
-    num_pages = max(remaining // cache_per_page, kv_reserve_pages)
-    # A tiny budget can floor num_pages at kv_reserve_pages even when ``remaining`` is below
+    def _plan(with_overlap: bool) -> tuple[int, int, bool, int]:
+        """(moe_cache_size, num_pages, overlap, total_bytes) for one overlap choice."""
+        lo = 2 * num_experts if with_overlap else num_experts
+        assert hi >= lo, f"slot cap {hi} below the minimum {lo} slots"
+        # MoE-priority: reserve KV first, then experts greedily take the remaining budget.
+        raw = (budget_bytes - kv_reserve_bytes) // per_expert_bytes
+        size = max(lo, min(raw, hi))
+        # A tiny budget may have forced size below 2*num_experts even with overlap on.
+        got = with_overlap and size >= 2 * num_experts
+        pages = max((budget_bytes - size * per_expert_bytes) // cache_per_page, kv_reserve_pages)
+        return size, pages, got, size * per_expert_bytes + pages * cache_per_page
+
+    moe_cache_size, num_pages, overlap, total = _plan(overlap)
+    if total > budget_bytes and overlap:
+        # The 2*num_experts overlap floor, not the budget itself, is what overflowed: a small
+        # card can afford a useful cache but not two whole expert-layer buffers on top of it.
+        # Degrade to the num_experts floor rather than refusing to plan at all.
+        moe_cache_size, num_pages, overlap, total = _plan(False)
+
+    # A tiny budget can floor num_pages at kv_reserve_pages even when the remainder is below
     # the reserve (or negative), yielding a plan that exceeds budget_bytes. Reject here so
     # --moe-cache-auto fails in arithmetic instead of OOMing in a later CUDA allocation.
-    total = moe_cache_size * per_expert_bytes + num_pages * cache_per_page
     assert total <= budget_bytes, (
         f"cache budget too small: minimum plan (moe={moe_cache_size} slots, "
         f"kv={num_pages} pages) needs {total} B > budget {budget_bytes} B "

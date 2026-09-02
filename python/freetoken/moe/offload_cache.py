@@ -42,6 +42,8 @@ from freetoken.utils import init_logger
 
 logger = init_logger(__name__)
 
+from contextlib import nullcontext as _nullcontext
+
 # quant_format -> bank names, in registration order: the single place a format's bank
 # layout is declared. The cache machinery (copy_missing, the prefill double buffers,
 # bank_views) iterates banks in this order, the layers' kernel dispatch unpacks views
@@ -119,6 +121,10 @@ MARLIN_MAX_CACHE_SIZE = 992
 
 # decode routes per step (bs * top_k) are far below this; the ensure kernel's BLOCK_A must fit
 ROUTING_PACK_COLS = 256
+# Rows of the pinned routing pack: [cpu ids, fp32 router weight bits, tier-3 host slots].
+# cpu_executor._io_for mirrors this exactly; decode_submit compares the two shapes and falls
+# back to per-row copies if they differ, so the two MUST be changed together.
+ROUTING_PACK_ROWS = 3
 
 
 class HybridRoutes(NamedTuple):
@@ -184,6 +190,31 @@ class OffloadMoeCache:
         # Attached by the engine for decode_target == "cpu" (CpuMoeExecutor); None
         # for the GPU decode path.
         self.cpu_executor = None
+        # Tier-3 (NVMe) support. host_slots is the number of expert rows each layer's HOST bank
+        # actually holds: == num_experts (full residency, today's behaviour and the default), or
+        # fewer when freetoken.tier3 is paging experts in from disk. The GPU copy path addresses
+        # a host row as base[layer, bank] + row * feat_bytes, so a smaller per-layer bank needs
+        # no kernel change -- only the meaning of `row` changes, from expert id to host slot,
+        # and the ensure kernel writes that translation into src_indices.
+        self.host_slots = self.num_experts
+        self.host_tier = None  # tier3.Tier3Handle when the NVMe tier is active
+        # --moe-residency-routing: max routing weight one substitution may displace. 0 = off.
+        # Only ever consulted when host_tier is set (see OffloadMoELayer._maybe_residency_route).
+        self.residency_route_tau = 0.0
+        self.residency_route_stats = None  # [2] int64: substitutions, host-missing routes
+        # tier3.PrefillStager: prefill needs a full [num_experts, ...] layer at expert-id
+        # positions, which a host_slots-wide pool cannot provide; the stager assembles one.
+        self._tier3_stager = None
+        # Prefill layers whose NVMe reads are in flight: the resident half of the buffer is
+        # gathered immediately, the disk half only once the reads land (see _tier3_finish_fill).
+        self._tier3_pending_fill: dict[int, int] = {}
+        # Device mirror of host_slot_for_id. The ensure kernel used to read the pinned map
+        # directly over UVA -- a 512-lane uncoalesced host gather per layer per step, measured
+        # at ~35% of decode throughput even when nothing was missing. The mirror is refreshed
+        # with one 2 KB H2D per layer right after the resolver runs, so the kernel reads device
+        # memory. It cannot go stale in a way that matters: a layer's residency only changes in
+        # its own resolve(), and the refresh is ordered after that and before the next ensure.
+        self.host_slot_dev = None
         # MoE layer ids whose decode runs on the CPU executor; the rest use the GPU
         # offload/PCIe path. Set by the engine after construction (empty = all-GPU,
         # all layers = the plain --moe-backend cpu case).
@@ -223,9 +254,15 @@ class OffloadMoeCache:
         # -1); sliced to the step's [bs * top_k] and viewed like expert_ids.
         # hybrid only: the CPU route list + the routes' router weights (fp32 bits) side by
         # side, so the executor ships both to the pool in ONE D2H memcpy (rows: ids, weights).
-        self.routing_pack = torch.empty((2, ROUTING_PACK_COLS), dtype=torch.int32, device=self.device)
+        # Row 2 (tier 3): the HOST SLOT each GPU-fetched route is about to read over UVA, -1
+        # elsewhere. The hybrid path runs the CPU pass for a layer concurrently with that same
+        # layer's PCIe gather, so without this the tier-3 installer could recycle a slot whose
+        # bytes are mid-flight. It rides the same single D2H as the ids and weights.
+        self.routing_pack = torch.empty((ROUTING_PACK_ROWS, ROUTING_PACK_COLS),
+                                        dtype=torch.int32, device=self.device)
         self.cpu_ids = self.routing_pack[0]
         self.cpu_w = self.routing_pack[1]
+        self.gpu_host_slots = self.routing_pack[2]
         # hybrid only: the GPU routes split by residency (hit = resident before this step,
         # fetched = given a slot this step), for the demand-copy overlap.
         self.hit_ids = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
@@ -399,8 +436,14 @@ class OffloadMoeCache:
             head = per_layer[0]
             for layer_id, source in enumerate(per_layer):
                 assert source.is_contiguous(), f"bank {name!r} layer {layer_id} must be contiguous"
-                assert source.size(0) == self.num_experts, (name, layer_id, source.shape)
-                assert source.shape == head.shape and source.dtype == head.dtype, (
+                # Row COUNT may differ per layer; only the row SHAPE has to match, and that
+                # is all the copy plan and the slot caches ever use (feat bytes come from
+                # shape[1:]). Tier 3 relies on this: its paged layers are host_slots rows wide
+                # while an appended MTP draft layer stays full num_experts and resident.
+                assert source.size(0) in (self.host_slots, self.num_experts), (
+                    name, layer_id, source.shape, self.host_slots, self.num_experts,
+                )
+                assert source.shape[1:] == head.shape[1:] and source.dtype == head.dtype, (
                     name, layer_id, source.shape, source.dtype,
                 )
             self.bank_sources[name] = list(per_layer)
@@ -511,6 +554,7 @@ class OffloadMoeCache:
         """
         assert self.bank_sources, "set_bank_sources must run before rebuild"
         self.validate_rebuild(cache_size)
+        self._tier3_invalidate()
         # 1. Tear down prefill-overlap (its buffer views alias the old bank_caches).
         self.prefill_bank_buffers = []
         self.prefill_copy_stream = None
@@ -547,9 +591,15 @@ class OffloadMoeCache:
         # -1); sliced to the step's [bs * top_k] and viewed like expert_ids.
         # hybrid only: the CPU route list + the routes' router weights (fp32 bits) side by
         # side, so the executor ships both to the pool in ONE D2H memcpy (rows: ids, weights).
-        self.routing_pack = torch.empty((2, ROUTING_PACK_COLS), dtype=torch.int32, device=self.device)
+        # ROUTING_PACK_ROWS, not a literal: the pack carries the tier-3 host-slot row too, and
+        # cpu_executor shape-checks it against its pinned mirror and SILENTLY falls back to
+        # per-row copies when they disagree -- so a rebuild that narrowed it would drop the
+        # exclusion list without a word, and leave gpu_host_slots pointing at the freed tensor.
+        self.routing_pack = torch.empty((ROUTING_PACK_ROWS, ROUTING_PACK_COLS),
+                                        dtype=torch.int32, device=self.device)
         self.cpu_ids = self.routing_pack[0]
         self.cpu_w = self.routing_pack[1]
+        self.gpu_host_slots = self.routing_pack[2]
         # hybrid only: the GPU routes split by residency (hit = resident before this step,
         # fetched = given a slot this step), for the demand-copy overlap.
         self.hit_ids = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
@@ -749,8 +799,11 @@ class OffloadMoeCache:
 
         def copy() -> None:
             self._invalidate_prefill_buffer(buffer_id)
-            for (per_layer, _), buffer in zip(self.banks, self.prefill_bank_buffers):
-                buffer[buffer_id].copy_(per_layer[layer_id], non_blocking=True)
+            if self._tier3_stager is not None:
+                self._tier3_prefill_fill(layer_id, buffer_id)
+                return
+            for src, buffer in zip(self._prefill_sources(layer_id), self.prefill_bank_buffers):
+                buffer[buffer_id].copy_(src, non_blocking=True)
 
         if self._prefill_hit_d2d_active:
             self._prefetch_split(layer_id, buffer_id)
@@ -766,6 +819,131 @@ class OffloadMoeCache:
         self._prefill_buffer_layer[buffer_id] = layer_id
         self._prefill_buffer_released[buffer_id] = False
 
+    def _tier3_invalidate(self) -> None:
+        """Drop tier-3 state that records the addresses of buffers a rebuild is about to free.
+
+        ``_tier3_buffer_ptrs`` and ``_materialize_dst_ptrs`` cache DEVICE ADDRESSES of the
+        prefill overlap buffers and the slot caches; rebuild reallocates both, so keeping them
+        hands the gather kernel dangling pointers -- an illegal memory access surfacing at
+        whatever CUDA call comes next, which is what took a live server down after an elastic-KV
+        grow. Any deferred prefill gather is dropped for the same reason: its destination is
+        gone.
+        """
+        if self._tier3_stager is None:
+            return
+        self._tier3_buf_ptrs = None
+        self._tier3_mat_ptrs = None
+        self._tier3_pending_fill.clear()
+        self._tier3_stager.discard_inflight()
+
+    def refresh_host_map(self) -> None:
+        """Publish the residency map to the device mirror the ensure kernel reads.
+
+        Once per STEP, not once per layer: a per-layer refresh meant 48 extra 2 KiB stream
+        operations, and it bought nothing in staleness terms. A layer's residency only changes
+        in its own resolve(), so a whole-map copy at the top of a step shows every layer
+        exactly the state its previous step left -- which is what the per-layer version did too.
+        """
+        if self.host_slot_dev is not None:
+            self.host_slot_dev.copy_(self.host_slot_for_id, non_blocking=True)
+
+    def _tier3_finish_fill(self, layer_id: int) -> None:
+        """Join a deferred prefill read and gather the disk half into its buffer."""
+        buffer_id = self._tier3_pending_fill.pop(layer_id, None)
+        if buffer_id is None:
+            return
+        from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
+
+        stager = self._tier3_stager
+        _, n_miss = stager.join(layer_id)
+        ix = stager.idx(layer_id)
+        stream = self.prefill_copy_stream
+        ctx = torch.cuda.stream(stream) if stream is not None else _nullcontext()
+        with ctx:
+            if n_miss:
+                fast_index_copy_multi_jit(
+                    self._tier3_buffer_ptrs(buffer_id), stager.stage_ptrs(layer_id),
+                    self._copy_feat_bytes, ix["miss_dst"][:n_miss],
+                    ix["miss_src"][:n_miss], ix["miss_num"],
+                )
+            stager.mark_gathered(layer_id, stream)
+            if stream is not None and self.prefill_ready_events:
+                self.prefill_ready_events[buffer_id].record(stream)
+
+    def _tier3_prefill_fill(self, layer_id: int, buffer_id: int) -> None:
+        """Fill one prefill buffer under tier 3, without touching the CPU for resident experts.
+
+        Two gathers, both ``fast_index_copy_multi_jit``:
+
+        * pool-resident experts move host pool row -> buffer row at their expert id, one launch
+          straight over PCIe. This is the bulk (~70% of the layer) and it never enters host
+          compute -- the earlier staging version copied it on the CPU and cost ~30 s a chunk,
+          because torch's intra-op pool is pinned to one thread here (the cores belong to the
+          MoE workers).
+        * the rest are read from NVMe into a compact staging bank and scattered from there.
+        """
+        from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
+
+        stager = self._tier3_stager
+        # Start the disk reads and return: they are joined in wait_prefill_layer, one layer
+        # later, so they overlap the previous layer's GEMMs instead of blocking on them.
+        n_res, n_miss = stager.begin(layer_id)
+        ix = stager.idx(layer_id)
+        if n_res:
+            fast_index_copy_multi_jit(
+                self._tier3_buffer_ptrs(buffer_id), self._copy_src_ptrs[layer_id],
+                self._copy_feat_bytes, ix["res_dst"][:n_res],
+                ix["res_src"][:n_res], ix["res_num"],
+            )
+        self._tier3_pending_fill[layer_id] = buffer_id
+
+    def _materialize_dst_ptrs(self) -> torch.Tensor:
+        """Device table of the slot caches' base addresses (materialize_layer writes slots
+        0..num_experts-1, so expert id == destination row)."""
+        t = getattr(self, "_tier3_mat_ptrs", None)
+        if t is None:
+            t = self._tier3_mat_ptrs = self._copy_dst_ptrs
+        return t
+
+    def _tier3_gather_into(self, layer_id: int, dst_ptrs: torch.Tensor) -> None:
+        """Synchronous whole-layer fill (materialize_layer; no double buffer to overlap with)."""
+        from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
+
+        stager = self._tier3_stager
+        n_res, n_miss = stager.plan(layer_id)
+        ix = stager.idx(layer_id)
+        if n_res:
+            fast_index_copy_multi_jit(
+                dst_ptrs, self._copy_src_ptrs[layer_id], self._copy_feat_bytes,
+                ix["res_dst"][:n_res], ix["res_src"][:n_res], ix["res_num"],
+            )
+        if n_miss:
+            stager.read_missing(layer_id)
+            fast_index_copy_multi_jit(
+                dst_ptrs, stager.stage_ptrs(layer_id), self._copy_feat_bytes,
+                ix["miss_dst"][:n_miss], ix["miss_src"][:n_miss], ix["miss_num"],
+            )
+
+    def _tier3_buffer_ptrs(self, buffer_id: int) -> torch.Tensor:
+        """Device table of this prefill buffer's per-bank base addresses (built once)."""
+        cache = getattr(self, "_tier3_buf_ptrs", None)
+        if cache is None:
+            cache = self._tier3_buf_ptrs = {}   # reset by _tier3_invalidate on rebuild
+        t = cache.get(buffer_id)
+        if t is None:
+            t = cache[buffer_id] = torch.tensor(
+                [b[buffer_id].data_ptr() for b in self.prefill_bank_buffers],
+                dtype=torch.int64, device=self.device)
+        return t
+
+    def _prefill_sources(self, layer_id: int) -> list[torch.Tensor]:
+        """Per-bank whole-layer sources for a prefill copy, in bank registration order.
+
+        Tier 3 does not come through here: its pool is host-slot indexed, so it fills the
+        buffer with two index gathers instead (see _tier3_prefill_fill).
+        """
+        return [per_layer[layer_id] for per_layer, _ in self.banks]
+
     def _hit_d2d_usable(self) -> bool:
         """Whether the hit-D2D split can serve this prefill; logs the first fallback.
 
@@ -775,7 +953,10 @@ class OffloadMoeCache:
         """
         from freetoken.kernel.fast_index_copy import _skip_fast_index_copy_enabled
 
-        if self._prefill_slot_snapshot is None or self.prefill_copy_stream is None:
+        if self._tier3_stager is not None:
+            reason = ("the NVMe tier is active: the hit gather addresses host banks by expert "
+                      "id, but the tier-3 pool is host-slot indexed")
+        elif self._prefill_slot_snapshot is None or self.prefill_copy_stream is None:
             reason = "prefill overlap buffers are not initialized for this device"
         elif _skip_fast_index_copy_enabled():
             reason = "FREETOKEN_SKIP_FAST_INDEX_COPY is set (the hit gather would be a no-op)"
@@ -889,6 +1070,8 @@ class OffloadMoeCache:
         assert self.prefill_overlap
         assert self.prefill_bank_buffers
         self.prefetch_prefill_layer(layer_id)
+        if self._tier3_stager is not None:
+            self._tier3_finish_fill(layer_id)
         buffer_id = layer_id % 2
         assert self._prefill_buffer_layer[buffer_id] == layer_id
         if self.prefill_ready_events:
@@ -1006,11 +1189,22 @@ class OffloadMoeCache:
         torch.cuda.current_stream(self.device).wait_event(self._demand_ev_copy)
 
     def materialize_layer(self, layer_id: int) -> None:
+        """Bring a whole layer into the first ``num_experts`` slots (prefill, no overlap).
+
+        Under tier 3 the fused whole-layer copy cannot be used: it addresses host rows 0..E-1,
+        but the pool holds only ``host_slots`` of them. Stage the layer and copy from there --
+        the slot maps are rewritten to the identity the same way either path.
+        """
         from freetoken.moe.offload_kernels import materialize_layer
 
         self._pending_src_layer = layer_id
         self._pending_whole_layer = True
         materialize_layer(self, layer_id)
+        if self._tier3_stager is not None:
+            # The kernel staged a plan addressing host rows 0..E-1, which the pool does not
+            # have; replace it with the two tier-3 gathers straight into the slot cache.
+            self.num_indices.zero_()
+            self._tier3_gather_into(layer_id, self._materialize_dst_ptrs())
 
     def reset(self) -> None:
         from freetoken.moe.offload_kernels import reset_cache
@@ -1114,6 +1308,14 @@ class OffloadMoeCache:
         src = self.src_indices2[:b]
         slots = evict.long()
         cur = self.id_of_slot[slots]
+        if self.host_tier is not None:
+            # src2 holds the copy-source row (a HOST SLOT under tier 3) while id_of_slot keeps
+            # the flat expert id, so the comparison needs the same translation the admission
+            # made. Reading today's map means a row whose host slot was reassigned since
+            # admission scores as unused -- conservative, and pf_used is a lower bound anyway.
+            hmap = self.host_slot_for_id.view(-1).to(cur.device)
+            hrow = hmap[cur.clamp(min=0)]
+            cur = (cur // self.num_experts) * self.num_experts + hrow
         used = valid & (cur == src) & (self.usage[slots] > self.pf_stamp[0:1])
         self.pf_used += used.sum()
         self.pf_evicted_unused += (valid & (cur != src)).sum()

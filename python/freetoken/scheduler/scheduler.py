@@ -1029,6 +1029,7 @@ class Scheduler(SchedulerIOMixin):
         if cache is None:
             return
         self._log_cpu_moe_timing(cache)
+        self._log_tier3_stats(cache)
         if not cache.collect_stats:
             return
         try:
@@ -1061,6 +1062,58 @@ class Scheduler(SchedulerIOMixin):
             cache.reset_stats()
         except Exception as e:  # noqa: BLE001 -- diagnostics must never take down the loop
             logger.warning(f"could not log MoE decode stats: {e!r}")
+
+    def _log_tier3_stats(self, cache) -> None:
+        """NVMe tier readout at the moe-stats cadence, as PER-STEP deltas over the window.
+
+        The C++ counters are cumulative and include the prefill scan, which dwarfs decode by
+        orders of magnitude -- a cumulative figure would read as "always paging" no matter what
+        decode does. Differencing against the previous window is the only form of this number
+        that answers the question the tier exists to answer: does a warm decode step touch the
+        disk at all, and if so how much?"""
+        executor = getattr(cache, "cpu_executor", None)
+        if executor is None or getattr(executor, "_tier3_handle", None) is None:
+            return
+        try:
+            from freetoken.tier3.wiring import tier3_stats
+
+            s = tier3_stats(executor)
+        except Exception as e:  # noqa: BLE001 -- diagnostics must never take down the loop
+            logger.warning(f"could not read tier-3 stats: {e!r}")
+            return
+        prev = getattr(self, "_tier3_prev", None)
+        self._tier3_prev = s
+        steps = max(1, _MOE_STATS_LOG)
+        if prev is None:
+            logger.info_rank0(
+                f"[tier3] cumulative host_hit_rate={s['host_hit_rate']:.4f}"
+                f" nvme_fetches={s['nvme_fetches']} (first window includes prefill)"
+            )
+            return
+        d_hits = s["host_hits"] - prev["host_hits"]
+        d_fetch = s["nvme_fetches"] - prev["nvme_fetches"]
+        d_bytes = s["nvme_bytes"] - prev["nvme_bytes"]
+        d_stall = s["stall_ms"] - prev["stall_ms"]
+        rate = d_hits / max(1, d_hits + d_fetch)
+        extra = ""
+        rr = getattr(cache, "residency_route_stats", None)
+        if rr is not None:
+            # Without this the feature is unobservable: "no quality change" and "the kernel
+            # never fired" look identical from the outside.
+            subs, seen = (int(x) for x in rr.tolist())
+            prev_rr = getattr(self, "_rr_prev", (0, 0))
+            self._rr_prev = (subs, seen)
+            d_sub, d_seen = subs - prev_rr[0], seen - prev_rr[1]
+            extra = (f" rroute_subs/step={d_sub / steps:.2f}"
+                     f" rroute_missing/step={d_seen / steps:.2f}"
+                     f" rroute_cover={d_sub / max(1, d_seen):.3f}")
+        logger.info_rank0(
+            f"[tier3] host_hit_rate={rate:.4f}"
+            f" nvme_reads/step={d_fetch / steps:.2f}"
+            f" nvme_MB/step={d_bytes / steps / (1 << 20):.3f}"
+            f" stall_us/step={d_stall * 1000 / steps:.1f}"
+            f" pool_exhausted={s['pool_exhausted']}" + extra
+        )
 
     def _log_cpu_moe_timing(self, cache) -> None:
         """FREETOKEN_CPU_MOE_TIMING=1: the hybrid/cpu backend's host-side per-layer

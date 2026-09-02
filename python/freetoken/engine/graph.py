@@ -116,6 +116,9 @@ class GraphRunner:
         self.graph_bs_list = sorted(cuda_graph_bs)
         self.dummy_req = dummy_req
         self.moe_offload_cache = moe_offload_cache
+        # Kept for the pre-replay host-table hook (see replay); capture itself takes `model`
+        # as an argument rather than reading it back off self.
+        self._model = model
         self.stream = stream
         self.device = device
         self._capture_graphs(max_seq_len, vocab_size, model)
@@ -195,6 +198,11 @@ class GraphRunner:
     def replay(self, batch: Batch) -> torch.Tensor:
         assert self.can_use_cuda_graph(batch)
         self.buffer.copy_from(batch)
+        # Host-backed tables whose indices must be resolved on the CPU (the tier-3 PLE row
+        # cache) publish them here: outside the graph, after the static inputs are staged.
+        prep = getattr(self._model, "prepare_host_tables_for_replay", None)
+        if prep is not None:
+            prep(batch)
         g = self.graph_map[batch.padded_size]
         self.attn_backend.prepare_for_replay(batch)
         g.replay()

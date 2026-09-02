@@ -515,19 +515,24 @@ class CpuMoeExecutor:
     def _io_for(self, bs: int) -> dict[str, torch.Tensor]:
         io = self._io.get(bs)
         if io is None:
-            # ids + weights live side by side in one pinned routing pack (rows: ids, fp32
-            # weight bits), the host mirror of OffloadMoeCache.routing_pack: the hybrid path
-            # ships both with ONE memcpy; the plain path copies into the same views.
-            from freetoken.moe.offload_cache import ROUTING_PACK_COLS
+            # ids + weights + tier-3 host slots live side by side in one pinned routing pack
+            # (rows: ids, fp32 weight bits, host slot of each GPU-fetched route), the host
+            # mirror of OffloadMoeCache.routing_pack: the hybrid path ships them with ONE
+            # memcpy; the plain path copies into the same views. The row count must match
+            # OffloadMoeCache.routing_pack exactly -- decode_submit shape-checks the two and
+            # silently falls back to per-row copies (dropping row 2) when they disagree.
+            from freetoken.moe.offload_cache import ROUTING_PACK_COLS, ROUTING_PACK_ROWS
 
             assert bs * self.top_k <= ROUTING_PACK_COLS, (bs, self.top_k)
             if getattr(self, "_rpack", None) is None:
-                self._rpack = alloc_pinned_tensor(2, ROUTING_PACK_COLS, dtype=torch.int32)
+                self._rpack = alloc_pinned_tensor(ROUTING_PACK_ROWS, ROUTING_PACK_COLS,
+                                                  dtype=torch.int32)
             io = {
                 "x": alloc_pinned_tensor(bs, self.H, dtype=torch.bfloat16),
                 "rpack": self._rpack,
                 "ids": self._rpack[0, : bs * self.top_k].view(bs, self.top_k),
                 "w": self._rpack[1, : bs * self.top_k].view(torch.float32).view(bs, self.top_k),
+                "host_slots": self._rpack[2, : bs * self.top_k].view(bs, self.top_k),
                 "y": alloc_pinned_tensor(bs, self.H, dtype=torch.bfloat16),
             }
             if self._gpu_prequant_i8:
@@ -635,7 +640,8 @@ class CpuMoeExecutor:
         else:
             io["x"].copy_(hidden_states, non_blocking=True)
         if routing_pack is not None and routing_pack.shape == io["rpack"].shape:
-            # the ensure kernel wrote ids (row 0) and weight bits (row 1): one D2H
+            # the ensure kernel wrote ids (row 0), weight bits (row 1) and, under tier 3, the
+            # host slot each GPU route is reading (row 2): one D2H for all of them
             io["rpack"].copy_(routing_pack, non_blocking=True)
         else:
             io["ids"].copy_(topk_ids.to(torch.int32), non_blocking=True)

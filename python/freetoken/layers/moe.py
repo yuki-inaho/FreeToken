@@ -285,7 +285,29 @@ class OffloadMoELayer(MoELayer):
             topk=self.top_k,
             renormalize=self.renormalize,
         )
+        self._maybe_residency_route(router_logits, topk_ids, topk_weights)
         return self._decode_routed(hidden_states, topk_weights, topk_ids, epilogue)
+
+    def _maybe_residency_route(self, router_logits, topk_ids, topk_weights) -> None:
+        """Swap a routed expert that is not in host RAM for a near-tied one that is.
+
+        Off unless the NVMe tier is active AND --moe-residency-routing set a tau: with every
+        expert resident there is nothing to substitute and this would be a pure cost. See
+        kernel/triton/moe_residency_route.py -- it changes model outputs, deliberately.
+        """
+        cache = self.offload_cache
+        if cache is None or cache.host_tier is None or not cache.residency_route_tau:
+            return
+        if router_logits is None or not topk_ids.is_cuda:
+            return
+        from freetoken.kernel.triton.moe_residency_route import residency_route
+        from freetoken.moe.offload_kernels import _host_map_addr
+
+        residency_route(
+            router_logits, topk_ids, topk_weights, _host_map_addr(cache),
+            self.layer_id, cache.num_experts, cache.residency_route_tau,
+            stats=cache.residency_route_stats,
+        )
 
     def prefill_forward(
         self,

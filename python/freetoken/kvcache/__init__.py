@@ -139,7 +139,8 @@ def create_kvcache_pool(
     is_qsa = len(kv_specs_probe) == 1 and kv_specs_probe[0].attn_type == _AttnTypeProbe.QSA
     if kv_dtype is not None and kv_dtype != dtype and not is_qsa:
         raise ValueError(
-            f"--kv-cache-dtype {kv_dtype}: a quantized K/V slab is implemented for the QSA "
+            f"--kv-cache-dtype {kv_dtype}: a quantized K/V slab (fp8 or NVFP4) is implemented "
+            "for the QSA "
             "pool (Qwen3.8-Flash-Next) only; this model's KV pool stores the compute dtype"
         )
     if model_config.has_swa_attention:

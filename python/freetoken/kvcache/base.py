@@ -22,6 +22,23 @@ def kv_storage_dtype(config) -> torch.dtype:
     return getattr(config, "kv_dtype", None) or config.dtype
 
 
+def kv_row_bytes(head_dim: int, kv_dtype: torch.dtype) -> int:
+    """Bytes one (token slot, kv head) K or V row costs in the slab, scale tiers included.
+
+    * 16-bit -- ``head_dim * itemsize``, no scales.
+    * fp8 e4m3 -- one code per element plus one fp32 scale for the row
+      (see ``QSAKVCache._kv_scale``).
+    * NVFP4 -- two codes per byte, plus one e4m3 scale per 16 elements
+      (``QSAKVCache._kv_blk``), plus the same fp32 row global. For head_dim 128 that is
+      64 + 8 + 4 = 76 B against fp8's 132 B and bf16's 256 B.
+    """
+    from .qsa_pool import NVFP4_KV_BLOCK, NVFP4_KV_DTYPE
+
+    if kv_dtype == NVFP4_KV_DTYPE:
+        return head_dim // 2 + head_dim // NVFP4_KV_BLOCK + 4
+    return head_dim * kv_dtype.itemsize + (4 if kv_dtype.itemsize == 1 else 0)
+
+
 def spec_kv_bytes_per_token(spec, config) -> int:
     """One paged-KV group's bytes per token: (1|2 slabs) x local kv heads x layers x
     (head_dim x storage dtype [+ the fp32 per-(token, head) scale of an fp8 slab]), plus the
@@ -33,13 +50,11 @@ def spec_kv_bytes_per_token(spec, config) -> int:
     ``index_ratio`` > 1 (QSA) stores one index key per token group, not per token; that slab's
     ring and scratch rows are fixed-size and priced in QSAKVCache.kv_cost instead."""
     kv_dtype = kv_storage_dtype(config)
-    # fp8 K/V rows carry one fp32 scale per (token slot, kv head) -- see QSAKVCache._kv_scale.
-    scale_bytes = 4 if kv_dtype.itemsize == 1 else 0
     per_token = (
         (1 if spec.mla else 2)  # MLA latent groups store one slab (V aliases K)
         * div_even(spec.num_kv_heads, config.tp_info.size, allow_replicate=True)
         * spec.num_layers
-        * (spec.head_dim * kv_dtype.itemsize + scale_bytes)
+        * kv_row_bytes(spec.head_dim, kv_dtype)
     )
     return per_token + spec.index_head_dim * spec.num_index_layers * 2 // spec.index_ratio
 

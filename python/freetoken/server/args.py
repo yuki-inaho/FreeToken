@@ -230,15 +230,35 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-residency-routing",
+        type=float,
+        default=ServerArgs.moe_residency_routing,
+        help=(
+            "Residency-aware routing for LOW-RAM systems: requires the NVMe expert tier "
+            "(FREETOKEN_TIER3_FTW) and is refused without it. When a routed expert is not in "
+            "the host pool, substitute the best near-tied expert that is, provided the swap "
+            "displaces at most this much of the token's routed weight (0 = off). Measured on "
+            "the 48 GiB profile: tau=0.05 avoids 88.7%% of NVMe reads while moving 1.5e-4 of "
+            "all routed expert weight. THIS CHANGES MODEL OUTPUTS -- gate it on your own "
+            "quality suite before using it."
+        ),
+    )
+
+    parser.add_argument(
         "--kv-cache-dtype",
         type=str,
         default=ServerArgs.kv_cache_dtype,
-        choices=["auto", "bf16", "fp8"],
+        choices=["auto", "bf16", "fp8", "nvfp4"],
         help=(
             "KV-cache storage dtype. 'auto' (and 'bf16') keep the compute dtype. 'fp8' stores "
             "the paged K/V of Qwen3.8-Flash-Next's QSA layers as e4m3 codes with a per-token "
             "scale -- about half the KV bytes per token, so a 256K context costs what 128K "
-            "does in expert-cache slots; other models reject it."
+            "does in expert-cache slots. 'nvfp4' packs two E2M1 codes per byte with an e4m3 "
+            "scale per 16 elements, 0.58x the fp8 bytes (0.30x bf16) -- measured on a 32 GiB "
+            "card at 128K: KV 1.75 -> 1.04 GiB, expert slots 7342 -> 7616, decode 95.4 -> "
+            "94.3 tok/s, TTFT 25.9 -> 28.6 s at a 90K prompt, needle and reasoning gates "
+            "unchanged. The saving grows with context; reach for it where expert slots are "
+            "the binding constraint. Other models reject both."
         ),
     )
 

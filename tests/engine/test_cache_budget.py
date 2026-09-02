@@ -145,6 +145,7 @@ def _dsv4_adjust_cfg(**over):
         page_size = 1
         attention_backend = "dsv4_sparse"
         moe_cpu_layers = None
+        moe_prefetch = "off"
         nvfp4_backend = "auto"
         num_page_override = None
         num_token_override = None
@@ -293,6 +294,7 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
         max_running_req = 4
         hybrid_swa_cache_mode = "auto"
         memory_ratio = 0.9
+        moe_prefetch = "off"
         moe_prefill_overlap = True
         kv_reserve_tokens = 0
         swa_full_tokens_ratio = 0.2
@@ -500,3 +502,37 @@ def test_uncapped_platform_stays_uncapped(monkeypatch):
     if hasattr(os, "uname") and "microsoft" in os.uname().release.lower():
         pytest.skip("WSL caps pinning")
     assert _pin_budget_bytes(reserved=2**30) is None
+
+
+# --- prefill-overlap degradation -------------------------------------------------------
+# `overlap` is decided from the slot CAP (total_experts), which on a MoE model is huge, so a
+# small card would take the 2*num_experts floor and then fail the budget assert -- even though
+# the same budget plans fine with overlap off. The planner degrades instead.
+
+_SMALL_CARD = dict(per_expert_bytes=2_772_480, cache_per_page=12_480, num_experts=512,
+                   total_experts=24_576, kv_reserve_pages=1024, max_slots=24_576)
+
+
+def test_overlap_degrades_instead_of_failing_when_only_its_floor_overflows():
+    # affords ~600 slots; the 1024-slot overlap floor does not fit
+    budget = 600 * 2_772_480 + 1024 * 12_480
+    size, pages, overlap = plan_cache_budget(budget_bytes=budget, prefill_overlap=True, **_SMALL_CARD)
+    assert overlap is False, "should have dropped overlap rather than asserting"
+    assert size == 600 and pages == 1024
+    # identical to what the caller would have got by passing prefill_overlap=False
+    assert (size, pages, overlap) == plan_cache_budget(
+        budget_bytes=budget, prefill_overlap=False, **_SMALL_CARD)
+
+
+def test_overlap_is_kept_when_the_budget_can_afford_its_floor():
+    budget = 4000 * 2_772_480 + 1024 * 12_480
+    size, _, overlap = plan_cache_budget(budget_bytes=budget, prefill_overlap=True, **_SMALL_CARD)
+    assert overlap is True and size >= 2 * 512
+
+
+def test_a_genuinely_too_small_budget_still_fails_in_arithmetic():
+    # below even the num_experts floor: degrading cannot save it, and it must not silently
+    # return a plan that would OOM in a later CUDA allocation
+    budget = 100 * 2_772_480
+    with pytest.raises(AssertionError, match="cache budget too small"):
+        plan_cache_budget(budget_bytes=budget, prefill_overlap=True, **_SMALL_CARD)

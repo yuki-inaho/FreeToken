@@ -16,6 +16,8 @@ immediate combine::
 from __future__ import annotations
 
 import os
+
+import os
 from typing import TYPE_CHECKING, List
 
 import torch
@@ -371,6 +373,23 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 emb.attach_table(ZeroTable(offsets[-1] + sizes[-1], args.ngram_head_dim))
             return 0
 
+        ple_cache_gb = float(os.environ.get("FREETOKEN_TIER3_PLE_GB", "0") or "0")
+        if ple_cache_gb > 0:
+            # Tier 3: keep a row cache instead of the whole 47.7 GiB table (see
+            # freetoken.tier3.ple_table). Slots are published by
+            # prepare_host_tables_for_replay, which both GraphRunner.replay and the
+            # speculative executor's verify graph call before replaying.
+            from freetoken.tier3.ple_table import RowCacheTable
+
+            max_rows = max(8192, getattr(engine_config, "max_extend_tokens", 8192) *
+                           self._config.qwen4_args.num_ngram_heads)
+            tbl = RowCacheTable(engine_config.model_path, int(ple_cache_gb * 2**30),
+                                torch.device("cuda", torch.cuda.current_device()), max_rows)
+            self._ple_table = tbl
+            for ple in ple_layers:
+                ple.ple_embedding.attach_table(tbl)
+            return tbl.num_rows * tbl.head_dim
+
         from .weight import load_ple_table
 
         table = load_ple_table(engine_config.model_path, self._config.qwen4_args)
@@ -380,6 +399,24 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 PinnedUVATable(table.bank.tensor, float(table.weight_scale))
             )
         return table.bank.nbytes
+
+    def prepare_host_tables_for_replay(self, batch) -> None:
+        """Publish this step's PLE cache slots before a captured graph replays.
+
+        The row ids are a deterministic hash of the preceding tokens, computed on the GPU; the
+        cache lives in host RAM, so resolving them needs a round trip that a captured graph
+        cannot make. Doing it here -- outside the graph, after the static inputs are staged --
+        leaves the graph a plain gather from a static slot buffer. No-op unless the PLE table
+        is the tier-3 row cache.
+        """
+        tables = getattr(self, "_ple_table", None)
+        if tables is None or not hasattr(tables, "resolve_for"):
+            return
+        from .ple import build_ple_metadata
+
+        for ple in self.model.ple_layers:
+            meta = build_ple_metadata(batch, ple.args, batch.input_ids.device)
+            tables.resolve_for(ple.ple_embedding.row_ids(meta))
 
     def forward(self) -> torch.Tensor:
         batch = get_global_ctx().batch

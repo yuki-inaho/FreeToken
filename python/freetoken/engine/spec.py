@@ -935,6 +935,13 @@ class SpecExecutor:
             evts[0].record()
         if use_graph:
             g.stage(batch, req)
+            # Graph A is the verify pass over the MAIN tower, so it contains the PLE layer and
+            # needs its host-resolved cache slots published first (same contract as
+            # GraphRunner.replay). Graphs B and C chain the MTP head only, which has no PLE
+            # layer -- ple_layer_ids indexes the main tower.
+            prep = getattr(self.model, "prepare_host_tables_for_replay", None)
+            if prep is not None:
+                prep(batch)
             g.graph_a.replay()
             logits = g.logits
         else:

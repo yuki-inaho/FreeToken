@@ -1068,6 +1068,8 @@ void fp8_roundtrip_bf16(const bf16_t* src, bf16_t* dst, int K) {
 
 struct CpuMoeExecutor;
 
+#include "expert_nvme.h"
+
 struct MoeTask {
   CpuMoeExecutor* exec;
   int layer_id;
@@ -1081,6 +1083,10 @@ struct MoeTask {
   // (kernel/triton/cpu_moe_prequant.py). When set, submit() skips its serial prep.
   const int8_t* xi8 = nullptr;   // [num_tokens, H]
   const float* xas = nullptr;    // [num_tokens, H / 16]
+  // Tier 3: host slots the GPU is gathering from RIGHT NOW (routing pack row 2, written by the
+  // ensure kernel in the same launch that produced `ids`). The installer must not recycle them.
+  const int32_t* excl = nullptr;
+  int n_excl = 0;
 };
 
 // Output-row tiling. Small enough to give every worker independent work even at
@@ -1224,6 +1230,7 @@ enum WFmt { WF_BF16 = 0, WF_NVFP4 = 1, WF_MXFP4 = 2, WF_DSFP4 = 3, WF_Q4_0 = 4 }
 // _make_table), not a single flat bank. tbl_at resolves
 // tbl[layer_id] once per task/pass; a null table (bank unused by this fmt, ptr
 // arg 0) resolves to nullptr without dereferencing.
+// Host bank row for (layer, expert). Identity without tier 3; see host_slot_tbl.
 inline const void* tbl_at(const uint64_t* tbl, int layer_id) {
   return tbl ? reinterpret_cast<const void*>(tbl[layer_id]) : nullptr;
 }
@@ -1247,6 +1254,24 @@ struct CpuMoeExecutor {
   const uint64_t* dn_global_tbl; // nvfp4: [E,H] fp16 row globals
   const uint64_t* gu_bias_tbl;   // mxfp4: [E,2I] bf16 biases
   const uint64_t* dn_bias_tbl;   // mxfp4: [E,H] bf16 biases
+  // Tier 3 (NVMe expert streaming): [num_layers * num_experts] int32 map from expert id to
+  // the row it occupies in this layer's HOST bank, or -1 when the expert currently lives only
+  // on disk. nullptr (the default) means full residency and row == expert id, which is what
+  // every pre-tier-3 checkpoint gets -- row_of then compiles to a predictable branch over a
+  // hot pointer and costs nothing measurable.
+  int32_t* host_slot_tbl = nullptr;
+  ft_tier3::ExpertTier3 tier3;
+  bool tier3_on = false;
+  // Tier 3 pages EVERY bank of a layer, so one row index addresses all of them. That is forced
+  // by the GPU side: fast_index_copy_multi applies a single row index across the banks it
+  // gathers, so a bank left at full num_experts width would be read at the fetched expert's
+  // host slot and return another expert's scales. See freetoken.tier3.budget.BankSplit.
+
+  inline int row_of(int layer_id, int e) const {
+    return host_slot_tbl == nullptr
+               ? e
+               : host_slot_tbl[static_cast<size_t>(layer_id) * num_experts + e];
+  }
   float swiglu_alpha;
   float swiglu_limit;          // +inf == no clamp
   dot_fn dot;
@@ -1506,9 +1531,14 @@ struct CpuMoeExecutor {
     }
   }
 
-  // gate_up output row `row` (in [0, 2I)) dotted with activation over K = H. ``e`` is
-  // the layer-local expert row (0..num_experts); the layer bases (already resolved
-  // once per task/pass by the caller via tbl_at) pick the layer's own tensors.
+  // gate_up output row `row` (in [0, 2I)) dotted with activation over K = H.
+  //
+  // ``e`` is the row in the PAGED banks and ``es`` the expert id, which index the RESIDENT
+  // banks. They are equal without tier 3. Under tier 3 the packed weight banks hold only
+  // host_slots rows (whichever experts are currently paged in), while the small scale/global
+  // banks stay full width and resident -- so addressing the scales by the host row would read
+  // another expert's scales and produce plausible, wrong activations.
+  // The layer bases (resolved once per task/pass via tbl_at) pick the layer's own tensors.
   // bf16 uses the interleaved bf16 row; nvfp4 uses the pre-split fp32 even/odd halves
   // (or, with AVX-VNNI, the per-16-block int8 activations).
   inline float gemm1_dot(const bf16_t* gate_up_l, const uint8_t* gu_packed_l,
@@ -1524,12 +1554,13 @@ struct CpuMoeExecutor {
           gu_packed_l + ((size_t)e * (2 * I) + row) * (size_t)q4_gu_row_bytes;
       return q4dot(w, xi8, xas, H);  // W4A8: int8 activations (Q8_0), scale in xas
     }
-    const size_t r = (size_t)e * (2 * I) + row;
+    const size_t r = (size_t)e * (2 * I) + row;    // paged: packed codes
+    const size_t rs = (size_t)e * (2 * I) + row;  // block scales + row globals
     if (use_vnni)
-      return nvi8dot(gu_packed_l + r * (size_t)(H / 2), gu_scale_l + r * (size_t)(H / 16),
-                     fp16_to_f32(gu_global_l[r]), xi8, H, e4m3_lut, xas);
-    return nvdot(gu_packed_l + r * (size_t)(H / 2), gu_scale_l + r * (size_t)(H / 16),
-                 fp16_to_f32(gu_global_l[r]), xe, xo, H, e2m1_lut, e4m3_lut);
+      return nvi8dot(gu_packed_l + r * (size_t)(H / 2), gu_scale_l + rs * (size_t)(H / 16),
+                     fp16_to_f32(gu_global_l[rs]), xi8, H, e4m3_lut, xas);
+    return nvdot(gu_packed_l + r * (size_t)(H / 2), gu_scale_l + rs * (size_t)(H / 16),
+                 fp16_to_f32(gu_global_l[rs]), xe, xo, H, e2m1_lut, e4m3_lut);
   }
 
   // down output row `row` (in [0, H)) dotted with the intermediate over K = I. Same
@@ -1546,12 +1577,13 @@ struct CpuMoeExecutor {
       const uint8_t* w = dn_packed_l + ((size_t)e * H + row) * (size_t)q4_dn_row_bytes;
       return q4dot(w, gi8, gas, I);  // W4A8: int8 activations (Q8_0), scale in gas
     }
-    const size_t r = (size_t)e * H + row;
+    const size_t r = (size_t)e * H + row;    // paged: packed codes
+    const size_t rs = (size_t)e * H + row;  // block scales + row globals
     if (use_vnni)
-      return nvi8dot(dn_packed_l + r * (size_t)(I / 2), dn_scale_l + r * (size_t)(I / 16),
-                     fp16_to_f32(dn_global_l[r]), gi8, I, e4m3_lut, gas);
-    return nvdot(dn_packed_l + r * (size_t)(I / 2), dn_scale_l + r * (size_t)(I / 16),
-                 fp16_to_f32(dn_global_l[r]), ge, go, I, e2m1_lut, e4m3_lut);
+      return nvi8dot(dn_packed_l + r * (size_t)(I / 2), dn_scale_l + rs * (size_t)(I / 16),
+                     fp16_to_f32(dn_global_l[rs]), gi8, I, e4m3_lut, gas);
+    return nvdot(dn_packed_l + r * (size_t)(I / 2), dn_scale_l + rs * (size_t)(I / 16),
+                 fp16_to_f32(dn_global_l[rs]), ge, go, I, e2m1_lut, e4m3_lut);
   }
 
   void pin_self(int tid) {
@@ -1582,7 +1614,8 @@ struct CpuMoeExecutor {
 
   uintptr_t create_task(int layer_id, int num_tokens, uintptr_t x_ptr,
                         uintptr_t ids_ptr, uintptr_t w_ptr, uintptr_t y_ptr,
-                        uintptr_t xi8_ptr = 0, uintptr_t xas_ptr = 0) {
+                        uintptr_t xi8_ptr = 0, uintptr_t xas_ptr = 0,
+                        uintptr_t excl_ptr = 0, int n_excl = 0) {
     MoeTask* t = new MoeTask{this,
                              layer_id,
                              num_tokens,
@@ -1591,7 +1624,9 @@ struct CpuMoeExecutor {
                              reinterpret_cast<const float*>(w_ptr),
                              reinterpret_cast<bf16_t*>(y_ptr),
                              reinterpret_cast<const int8_t*>(xi8_ptr),
-                             reinterpret_cast<const float*>(xas_ptr)};
+                             reinterpret_cast<const float*>(xas_ptr),
+                             reinterpret_cast<const int32_t*>(excl_ptr),
+                             n_excl};
     owned_tasks.push_back(t);
     return reinterpret_cast<uintptr_t>(t);
   }
@@ -1634,8 +1669,13 @@ struct CpuMoeExecutor {
     const int64_t tk = p / n_iblk;
     const int k = static_cast<int>(tk % top_k);
     const int tok = static_cast<int>(tk / top_k);
-    const int e = t->ids[static_cast<size_t>(tok) * top_k + k];
-    if (e < 0 || e >= num_experts) return;
+    const int e_id = t->ids[static_cast<size_t>(tok) * top_k + k];
+    if (e_id < 0 || e_id >= num_experts) return;
+    // tier 3: address the HOST BANK ROW, not the expert id (identity without the tier). A
+    // negative row means the installer did not fetch this expert, which resolve() guarantees
+    // it does before waking the workers.
+    const int e = row_of(t->layer_id, e_id);
+    if (e < 0) return;
     const float w_in = apply_on_input ? t->w[static_cast<size_t>(tok) * top_k + k] : 1.0f;
     // Resolve this task's layer base once; row indexing below is layer-local (e).
     const bf16_t* gate_up_l = reinterpret_cast<const bf16_t*>(tbl_at(gate_up_tbl, t->layer_id));
@@ -1662,7 +1702,8 @@ struct CpuMoeExecutor {
     for (int i = i0; i < i1; ++i) {
       // gate = row i, up = row I+i
       float gate =
-          gemm1_dot(gate_up_l, gu_packed_l, gu_scale_l, gu_global_l, e, i, x_row, xe, xo, xi8, xas) * w_in;
+          gemm1_dot(gate_up_l, gu_packed_l, gu_scale_l, gu_global_l, e, i, x_row, xe, xo,
+                    xi8, xas) * w_in;
       float up = gemm1_dot(gate_up_l, gu_packed_l, gu_scale_l, gu_global_l, e, I + i, x_row,
                            xe, xo, xi8, xas) * w_in;
       if (swigluoai) {
@@ -1702,8 +1743,10 @@ struct CpuMoeExecutor {
     for (int h = h0; h < h1; ++h) {
       float acc = 0.0f;
       for (int k = 0; k < top_k; ++k) {
-        const int e = t->ids[static_cast<size_t>(tok) * top_k + k];
-        if (e < 0 || e >= num_experts) continue;
+        const int e_id = t->ids[static_cast<size_t>(tok) * top_k + k];
+        if (e_id < 0 || e_id >= num_experts) continue;
+        const int e = row_of(t->layer_id, e_id);  // tier 3: host bank row (see row_of)
+        if (e < 0) continue;
         const float w_out = apply_on_input ? 1.0f : t->w[static_cast<size_t>(tok) * top_k + k];
         const size_t gr = (size_t)tok * top_k + k;
         const bf16_t* g_row = g_scratch.data() + gr * I;
@@ -1734,8 +1777,13 @@ struct CpuMoeExecutor {
     const int64_t tk = p / n_iblk;
     const int k = static_cast<int>(tk % top_k);
     const int tok = static_cast<int>(tk / top_k);
-    const int e = t->ids[static_cast<size_t>(tok) * top_k + k];
-    if (e < 0 || e >= num_experts) return;
+    const int e_id = t->ids[static_cast<size_t>(tok) * top_k + k];
+    if (e_id < 0 || e_id >= num_experts) return;
+    // tier 3: address the HOST BANK ROW, not the expert id (identity without the tier). A
+    // negative row means the installer did not fetch this expert, which resolve() guarantees
+    // it does before waking the workers.
+    const int e = row_of(t->layer_id, e_id);
+    if (e < 0) return;
     // Resolve this task's layer base once; row indexing below is layer-local (e).
     const uint8_t* gu_packed_l = reinterpret_cast<const uint8_t*>(tbl_at(gate_up_tbl, t->layer_id));
     const uint8_t* gu_scale_l = reinterpret_cast<const uint8_t*>(tbl_at(gu_scale_tbl, t->layer_id));
@@ -1748,7 +1796,7 @@ struct CpuMoeExecutor {
     const int col0 = 2 * i0;         // first gate_up column
     const int ncol = 2 * nunit;      // gate_up columns owned by this tile
     const bf16_t* x_row = t->x + (size_t)tok * H;
-    const uint8_t* blk_e = gu_packed_l + (size_t)e * Hh * N2;
+    const uint8_t* blk_e = gu_packed_l + (size_t)e * Hh * N2;              // paged
     const uint8_t* scl_e = gu_scale_l + (size_t)e * (size_t)(H / 32) * N2;
     float gu[2 * IBLK];
     mxgemv(gu, blk_e + col0, scl_e + col0, x_row, Hh, N2, ncol, e2m1_lut, e8m0_lut);
@@ -1780,11 +1828,13 @@ struct CpuMoeExecutor {
     float acc[HBLK];
     for (int c = 0; c < nh; ++c) acc[c] = 0.0f;
     for (int k = 0; k < top_k; ++k) {
-      const int e = t->ids[static_cast<size_t>(tok) * top_k + k];
-      if (e < 0 || e >= num_experts) continue;
+      const int e_id = t->ids[static_cast<size_t>(tok) * top_k + k];
+      if (e_id < 0 || e_id >= num_experts) continue;
+      const int e = row_of(t->layer_id, e_id);  // tier 3: host bank row (see row_of)
+      if (e < 0) continue;
       const float wt = t->w[static_cast<size_t>(tok) * top_k + k];
       const bf16_t* g_row = g_scratch.data() + ((size_t)tok * top_k + k) * I;
-      const uint8_t* blk_e = dn_packed_l + (size_t)e * Ih * H;
+      const uint8_t* blk_e = dn_packed_l + (size_t)e * Ih * H;              // paged
       const uint8_t* scl_e = dn_scale_l + (size_t)e * (size_t)(I / 32) * H;
       float part[HBLK];
       mxgemv(part, blk_e + h0, scl_e + h0, g_row, Ih, H, nh, e2m1_lut, e8m0_lut);
@@ -1805,8 +1855,13 @@ struct CpuMoeExecutor {
     const int64_t tk = p / n_iblk;
     const int k = static_cast<int>(tk % top_k);
     const int tok = static_cast<int>(tk / top_k);
-    const int e = t->ids[static_cast<size_t>(tok) * top_k + k];
-    if (e < 0 || e >= num_experts) return;
+    const int e_id = t->ids[static_cast<size_t>(tok) * top_k + k];
+    if (e_id < 0 || e_id >= num_experts) return;
+    // tier 3: address the HOST BANK ROW, not the expert id (identity without the tier). A
+    // negative row means the installer did not fetch this expert, which resolve() guarantees
+    // it does before waking the workers.
+    const int e = row_of(t->layer_id, e_id);
+    if (e < 0) return;
     // Resolve this task's layer base once; row indexing below is layer-local (e).
     const uint8_t* gu_packed_l = reinterpret_cast<const uint8_t*>(tbl_at(gate_up_tbl, t->layer_id));
     const uint8_t* gu_scale_l = reinterpret_cast<const uint8_t*>(tbl_at(gu_scale_tbl, t->layer_id));
@@ -1868,8 +1923,10 @@ struct CpuMoeExecutor {
     for (int h = h0; h < h1; ++h) {
       float acc = 0.0f;
       for (int k = 0; k < top_k; ++k) {
-        const int e = t->ids[static_cast<size_t>(tok) * top_k + k];
-        if (e < 0 || e >= num_experts) continue;
+        const int e_id = t->ids[static_cast<size_t>(tok) * top_k + k];
+        if (e_id < 0 || e_id >= num_experts) continue;
+        const int e = row_of(t->layer_id, e_id);  // tier 3: host bank row (see row_of)
+        if (e < 0) continue;
         const float wt = t->w[static_cast<size_t>(tok) * top_k + k];
         const float* ge = ge_scratch.data() + ((size_t)tok * top_k + k) * (I / 2);
         const float* go = go_scratch.data() + ((size_t)tok * top_k + k) * (I / 2);
@@ -1973,6 +2030,12 @@ struct CpuMoeExecutor {
   }
 
   void submit(MoeTask* t) {
+    // Tier 3: page in any routed expert that is not in the host pool. This blocks the
+    // coordinator on NVMe, which simply lengthens the cuStreamWaitValue64 the GPU is already
+    // parked on -- no CUDA graph structure changes, no new stall primitive.
+    if (tier3_on) {
+      tier3.resolve(t->layer_id, t->ids, t->num_tokens * top_k, t->excl, t->n_excl);
+    }
     n_iblk = (I + IBLK - 1) / IBLK;
     n_hblk = (H + HBLK - 1) / HBLK;
     // Grow the per-token intermediate scratch if a larger batch shows up than the
@@ -2277,7 +2340,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("core_ids"))
       .def("create_task", &CpuMoeExecutor::create_task, py::arg("layer_id"),
            py::arg("num_tokens"), py::arg("x_ptr"), py::arg("ids_ptr"), py::arg("w_ptr"),
-           py::arg("y_ptr"), py::arg("xi8_ptr") = 0, py::arg("xas_ptr") = 0)
+           py::arg("y_ptr"), py::arg("xi8_ptr") = 0, py::arg("xas_ptr") = 0,
+           py::arg("excl_ptr") = 0, py::arg("n_excl") = 0)
       .def("quant_i8_pg16_ref", &CpuMoeExecutor::quant_i8_pg16_ref, py::arg("x_ptr"),
            py::arg("K"), py::arg("q_ptr"), py::arg("s_ptr"))
       .def("submit_with_cuda_stream", &CpuMoeExecutor::submit_with_cuda_stream,
@@ -2298,6 +2362,59 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("set_input_prequant",
            [](CpuMoeExecutor& e, bool v) { e.input_prequant = v; },
            py::arg("value"))
+      .def("tier3_configure",
+           [](CpuMoeExecutor& self, int paged_layers, int host_slots, int readers,
+              const std::vector<int64_t>& feat_bytes,
+              const std::vector<uintptr_t>& dst_tbl,
+              const std::vector<int64_t>& entry_off,
+              const std::vector<std::string>& shard_paths,
+              const std::vector<int64_t>& shard_off,
+              const std::vector<int64_t>& shard_nbytes) {
+             auto& t3 = self.tier3;
+             t3.num_banks = (int)feat_bytes.size();
+             t3.feat_bytes = feat_bytes;
+             t3.dst_tbl.clear();
+             for (auto p : dst_tbl) t3.dst_tbl.push_back(reinterpret_cast<const uint64_t*>(p));
+             t3.entry_off = entry_off;
+             t3.shards.clear();
+             for (size_t i = 0; i < shard_paths.size(); ++i) {
+               t3.shards.push_back({shard_off[i], shard_nbytes[i], shard_paths[i]});
+             }
+             t3.host_slot_tbl = self.host_slot_tbl;
+             // paged_layers, NOT self.num_layers: a model may append resident bank layers
+             // past the paged corpus (qwen4_exp's full-width MTP draft experts). Sizing the
+             // tier to the executor's layer count would let resolve() run on those, indexing
+             // entry_off and the per-layer slot arrays out of range -- silently, because the
+             // reads land on whatever follows them.
+             t3.init(paged_layers, self.num_experts, host_slots, readers);
+             self.tier3_on = true;
+           },
+           py::arg("paged_layers"), py::arg("host_slots"), py::arg("readers"),
+           py::arg("feat_bytes"),
+           py::arg("dst_tbl"), py::arg("entry_off"), py::arg("shard_paths"),
+           py::arg("shard_off"), py::arg("shard_nbytes"),
+           "Turn on NVMe expert streaming. set_host_slot_table must be called first.")
+      .def("tier3_prewarm",
+           [](CpuMoeExecutor& self, int layer_id, int count) {
+             self.tier3.prewarm_identity(layer_id, count);
+           },
+           py::arg("layer_id"), py::arg("count"),
+           "Mark slots 0..count-1 of a layer as holding experts 0..count-1 (already filled).")
+      .def("tier3_stats",
+           [](CpuMoeExecutor& self) {
+             auto& t = self.tier3;
+             return py::make_tuple(t.n_hit.load(), t.n_fetch.load(), t.n_bytes.load(),
+                                   t.n_stall_ns.load(), t.n_calls.load(),
+                                   t.n_exhausted.load());
+           },
+           "(host_hits, fetches, bytes_read, stall_ns, calls, pool_exhausted) since start.")
+      .def("set_host_slot_table",
+           [](CpuMoeExecutor& self, uintptr_t ptr) {
+             self.host_slot_tbl = reinterpret_cast<int32_t*>(ptr);
+             self.tier3.host_slot_tbl = self.host_slot_tbl;
+           },
+           py::arg("ptr"),
+           "Tier 3: [num_layers * num_experts] int32 expert -> host bank row map (0 = off).")
       .def("isa_name", &CpuMoeExecutor::isa_name);
   m.def("memops_probe", &cumemops_probe, py::arg("stream"), py::arg("scratch_addr"));
   m.def("memop_submit", &cumemop_submit, py::arg("stream"), py::arg("done_addr"),

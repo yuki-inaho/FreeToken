@@ -121,10 +121,16 @@ class EngineConfig:
     # count per request from its running draft-acceptance rate (code-like sessions with
     # high acceptance use more drafts; prose falls back to the base). 0 = fixed k.
     spec_adaptive_k_max: int = 0
-    # KV-cache storage dtype (--kv-cache-dtype): "auto" | "bf16" | "fp8". "auto"/"bf16" store
+    # KV-cache storage dtype (--kv-cache-dtype): "auto"|"bf16"|"fp8"|"nvfp4". "auto"/"bf16" store
     # the compute dtype; "fp8" stores the paged K/V slabs as e4m3 codes with a per-(token, kv
-    # head) fp32 scale -- half the KV bytes -- implemented for the QSA pool (Qwen3.8-Flash-Next)
-    # only. _adjust_config resolves it into kv_dtype (a torch dtype) before the pool is sized.
+    # head) fp32 scale -- half the KV bytes; "nvfp4" packs two E2M1 codes per byte plus an
+    # e4m3 scale per 16 elements and the same fp32 row global, 0.58x fp8. Both are implemented
+    # for the QSA pool (Qwen3.8-Flash-Next) only. _adjust_config resolves the choice into
+    # kv_dtype (a torch dtype; NVFP4's is a sentinel -- the slab is uint8) before pool sizing.
+    # --moe-residency-routing TAU: under the NVMe expert tier only, substitute a routed
+    # expert that is not in host RAM with the best near-tied one that is, when the swap
+    # displaces <= TAU of the token's routed weight. 0 disables. Changes model outputs.
+    moe_residency_routing: float = 0.0
     kv_cache_dtype: str = "auto"
     kv_dtype: torch.dtype | None = None
     # Resident dense-linear weight format (--dense-quant): "auto" | "bf16" keep the checkpoint's

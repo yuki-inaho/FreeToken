@@ -151,13 +151,16 @@ def prefetch_admit(cache, cand: torch.Tensor, budget: int, plan: int = 0) -> Non
         cache.step,
         evict2,
         src2,
+        _host_map_addr(cache),
         num2,
         stamp,
         cache.pf_issued,
         cand.numel(),
         int(budget),
         int(cache.prefetch_reserve_lo),
-        cache.cache_size,
+        num_experts=cache.num_experts,
+        cache_size=cache.cache_size,
+        HOST_TIER=cache.host_tier is not None,
         BLOCK_C=block_c,
         num_warps=8 if block_c >= 2048 else 4,
     )
@@ -171,11 +174,19 @@ def _prefetch_admit_cpu(cache, cand, budget, evict2, src2, num2, stamp) -> None:
     usage = cache.usage.tolist()
     admitted = 0
     flat_map = cache.slot_for_id.view(-1)
+    host_map = None if cache.host_tier is None else cache.host_slot_for_id.view(-1)
+    num_experts = cache.num_experts
     for flat in cand.view(-1).tolist():
         if admitted >= budget or flat < 0:
             continue
         if int(flat_map[flat].item()) >= 0:
             continue
+        src_flat = flat
+        if host_map is not None:
+            hrow = int(host_map[flat].item())
+            if hrow < 0:  # not in the host pool -- nothing to gather from
+                continue
+            src_flat = (flat // num_experts) * num_experts + hrow
         victim = min(
             range(reserve_lo, cache.cache_size), key=lambda s: (usage[s], s)
         )
@@ -187,7 +198,7 @@ def _prefetch_admit_cpu(cache, cand, budget, evict2, src2, num2, stamp) -> None:
         cache.usage[victim] = step
         usage[victim] = 1 << 62  # claimed: out of the victim scan
         evict2[admitted] = victim
-        src2[admitted] = flat
+        src2[admitted] = src_flat
         admitted += 1
     num2.fill_(admitted)
     cache.pf_issued += admitted
@@ -201,14 +212,17 @@ def _prefetch_admit_kernel(
     usage_ptr,         # [S] int64
     step_ptr,          # [] int64 -- READ only; admission does not advance the clock
     evict2_ptr,        # [budget] int32 out: victim slots (plan-2 dst)
-    src2_ptr,          # [budget] int32 out: FLAT expert ids (plan-2 src)
+    src2_ptr,          # [budget] int32 out: FLAT copy-source rows (see HOST_TIER)
+    host_slot_ptr,     # HOST_TIER: raw address of the [L*E] int32 host residency map
     num2_ptr,          # [1] int64 out: admitted count
     pf_stamp_ptr,      # [1] int64 out: usage-clock snapshot (used-check baseline)
     pf_issued_ptr,     # [1] int64: cumulative admitted counter
     num_cand,
     budget,
     reserve_lo,        # 2 * num_experts under prefill_overlap else 0
+    num_experts: tl.constexpr,
     cache_size: tl.constexpr,
+    HOST_TIER: tl.constexpr,   # False -> compiles to exactly the pre-tier-3 kernel
     BLOCK_C: tl.constexpr,
 ):
     step = tl.load(step_ptr)
@@ -227,7 +241,23 @@ def _prefetch_admit_kernel(
     for i in tl.range(num_cand):
         flat = tl.load(cand_ptr + i)
         slot = tl.load(slot_for_id_ptr + tl.maximum(flat, 0))
-        do = (flat >= 0) & (slot < 0) & (admitted < budget)
+        if HOST_TIER:
+            # Same substitution the demand path makes (see _ensure_experts_hybrid_kernel):
+            # the copy source row is the expert id under full residency, its HOST SLOT under
+            # tier 3, because the host bank holds host_slots rows rather than num_experts.
+            # The LRU maps below keep storing the flat EXPERT id -- only the copy source moves.
+            host_base = host_slot_ptr.to(tl.int64).to(tl.pointer_type(tl.int32))
+            hrow = tl.load(host_base + tl.maximum(flat, 0))
+            layer = tl.maximum(flat, 0) // num_experts
+            src_flat = layer * num_experts + hrow
+            # A prediction whose expert is not in the host pool has nothing to gather from;
+            # pulling it off NVMe speculatively is the thing FINDINGS measured as having no
+            # headroom. At a 99.9 % host hit rate this drops almost nothing.
+            resident = hrow >= 0
+        else:
+            src_flat = flat
+            resident = True
+        do = (flat >= 0) & (slot < 0) & (admitted < budget) & resident
         victim = tl.argmin(u, axis=0).to(tl.int32)
         # A slot claimed earlier in this launch sits at INF and is never re-selected, so the
         # victim's owner is still the pre-launch map value: one scalar load, no BLOCK_C-wide
@@ -238,7 +268,7 @@ def _prefetch_admit_kernel(
         tl.store(slot_for_id_ptr + tl.maximum(flat, 0), victim, mask=do)
         tl.store(usage_ptr + victim, step, mask=do)
         tl.store(evict2_ptr + admitted, victim, mask=do)
-        tl.store(src2_ptr + admitted, flat, mask=do)
+        tl.store(src2_ptr + admitted, src_flat, mask=do)
         # Claimed slots leave the victim scan; the map update above is the in-flight dedup.
         u = tl.where(do & (off_c == victim), INF32, u)
         admitted += do.to(tl.int64)
@@ -289,6 +319,10 @@ def _ensure_experts_hybrid_gpu(
         uniq_fetched,
         pairs,
         cache.slot_for_id,
+        # tier 3: the host residency map and the live-gather exclusion row. When the tier is
+        # off both are dummies and HOST_TIER=False compiles them out entirely.
+        _host_map_addr(cache),
+        _gpu_host_slots_or(cache, cache.num_indices),
         cache.id_of_slot,
         cache.usage,
         cache.step,
@@ -312,6 +346,7 @@ def _ensure_experts_hybrid_gpu(
         int(frac_q16),
         cache.num_experts,
         cache.cache_size,
+        getattr(cache, "host_slot_for_id", None) is not None,
         BLOCK_E=block_e,
         BLOCK_C=block_c,
         BLOCK_A=block_a,
@@ -324,6 +359,31 @@ def _ensure_experts_hybrid_gpu(
         COLLECT_STATS=collect,
         num_warps=num_warps,
     )
+
+
+def _host_map_addr(cache) -> int:
+    """Device-visible address of the tier-3 host residency map, or 0 when the tier is off.
+
+    The map lives in PINNED HOST memory: the CPU resolver is its only writer, and the ensure
+    kernel reads it over UVA. Passing the raw address (rather than a tensor) keeps Triton from
+    demanding a device tensor; the kernel rebuilds the typed pointer, as ple_gather_rows does.
+    """
+    dev = getattr(cache, "host_slot_dev", None)
+    if dev is not None:
+        return dev.data_ptr()          # the fast path: plain device memory
+    m = getattr(cache, "host_slot_for_id", None)
+    if m is None:
+        return 0
+    if m.is_cuda:
+        return m.data_ptr()
+    from freetoken.kernel.pinned import device_ptr
+
+    return device_ptr(m)
+
+
+def _gpu_host_slots_or(cache, fallback):
+    m = getattr(cache, "gpu_host_slots", None)
+    return fallback if m is None else m
 
 
 def _ensure_experts_hybrid_cpu(
@@ -356,24 +416,39 @@ def _ensure_experts_hybrid_cpu(
             cache.usage[slot] = step
 
     missing = [e for e in seen if int(cache.slot_for_id[layer_id, e].item()) == -1]
+    # Tier 3: a miss whose expert is not in the HOST pool either cannot cross PCIe -- there is
+    # nothing to gather from. It stays slot -1 and falls through to the CPU branch below, which
+    # is where the NVMe read happens. `missing` (and so num_missing_full) keeps the full count
+    # so the miss-rate statistic still means what it always did.
+    host = getattr(cache, "host_slot_for_id", None)
+    host_row = None if host is None else host[layer_id].tolist()
+    def _hslot(e: int) -> int:
+        return e if host_row is None else host_row[e]
+
+    fetchable = missing if host_row is None else [e for e in missing if host_row[e] >= 0]
     if _HYBRID_FETCH_BY_RECENCY:
         rec = cache.expert_recency[layer_id].tolist()
-        missing.sort(key=lambda e: (-rec[e], e))
+        fetchable.sort(key=lambda e: (-rec[e], e))
     else:
-        missing.sort()
+        fetchable.sort()
     if frac_q16 > 0:
-        m, q = len(missing), 1 << 16
+        m, q = len(fetchable), 1 << 16
         lo = (m * frac_q16) >> 16
         cost = lambda f: max(f * (q - frac_q16), (m - f) * frac_q16)  # noqa: E731
         max_fetch = lo if cost(lo) <= cost(lo + 1) else lo + 1
-    num_fetch = min(len(missing), int(max_fetch))
+    num_fetch = min(len(fetchable), int(max_fetch))
     cache.num_missing_full.fill_(len(missing))
     cache.num_indices.fill_(num_fetch)
 
     usage = cache.usage.tolist()
     fetched_set = set()
+    # only meaningful under tier 3; leave the row untouched otherwise so the two paths write
+    # exactly the same state when the tier is off
+    gpu_hs = getattr(cache, "gpu_host_slots", None) if host_row is not None else None
+    if gpu_hs is not None:
+        gpu_hs.fill_(-1)
     for idx in range(num_fetch):
-        expert = missing[idx]
+        expert = fetchable[idx]
         fetched_set.add(expert)
         victim = min(range(cache.cache_size), key=lambda s: (usage[s], s))
         old_id = int(cache.id_of_slot[victim].item())
@@ -384,7 +459,12 @@ def _ensure_experts_hybrid_cpu(
         cache.usage[victim] = step
         usage[victim] = step
         cache.evict_slots[idx] = victim
-        cache.src_indices[idx] = expert  # layer-local row
+        # The host bank row to gather from: the expert id under full residency, its HOST SLOT
+        # under tier 3. This single substitution is the whole indirection -- the copy kernel
+        # addresses base[layer, bank] + row * feat_bytes either way and is untouched.
+        cache.src_indices[idx] = _hslot(expert)
+        if gpu_hs is not None:
+            gpu_hs[idx] = _hslot(expert)  # exclusion list: this slot is under a live gather
 
     if _HYBRID_FETCH_BY_RECENCY:
         for expert in seen:
@@ -533,6 +613,8 @@ def _ensure_experts_hybrid_kernel(
     uniq_fetched_ptr,
     pairs_ptr,
     slot_for_id_ptr,
+    host_slot_ptr,        # HOST_TIER: raw address of the [L*E] int32 host residency map
+    gpu_host_slots_ptr,   # [A] int32 out (HOST_TIER): host slots under a live gather this step
     id_of_slot_ptr,
     usage_ptr,
     step_ptr,
@@ -556,6 +638,7 @@ def _ensure_experts_hybrid_kernel(
     fetch_frac_q16,
     num_experts: tl.constexpr,
     cache_size: tl.constexpr,
+    HOST_TIER: tl.constexpr,   # False -> compiles to exactly the pre-tier-3 kernel
     BLOCK_E: tl.constexpr,
     BLOCK_C: tl.constexpr,
     BLOCK_A: tl.constexpr,
@@ -606,21 +689,41 @@ def _ensure_experts_hybrid_kernel(
     ids_vec = tl.load(expert_ids_ptr + off_a, mask=a_mask, other=-1)
     is_active = tl.sum((off_e[:, None] == ids_vec[None, :]).to(tl.int32), axis=1) > 0
     tl.store(active_mask_ptr + off_e, is_active.to(tl.int32), mask=e_mask)
+    if HOST_TIER:
+        # Unmasked: the installer reads this row after a whole-pack D2H and must not see
+        # uninitialized lanes past num_active as if they were live gather slots. BLOCK_A is
+        # a power of two <= ROUTING_PACK_COLS, so this stays in bounds.
+        tl.store(gpu_host_slots_ptr + off_a, -1)
     slot = tl.load(slot_for_id_ptr + base + off_e, mask=e_mask, other=-1)
     is_missing = is_active & (slot == -1) & e_mask
     num_missing = tl.sum(is_missing.to(tl.int32))
+    # Tier 3: only a miss whose expert is also in the HOST pool can cross PCIe -- there is
+    # nothing to gather from otherwise. Non-resident misses keep slot -1 and fall through to
+    # the CPU branch, which is where the NVMe read happens. num_missing (and the miss-rate
+    # statistic) still counts every miss.
+    if HOST_TIER:
+        # Rebuild the typed pointer from the raw address (the ple.py idiom): the map may be a
+        # device mirror (normal) or the pinned host map read over UVA (fallback).
+        host_base = host_slot_ptr.to(tl.int64).to(tl.pointer_type(tl.int32))
+        hslot_vec = tl.load(host_base + base + off_e, mask=e_mask, other=-1)
+        is_fetchable = is_missing & (hslot_vec >= 0)
+    else:
+        hslot_vec = off_e.to(tl.int32)
+        is_fetchable = is_missing
+    num_fetchable = tl.sum(is_fetchable.to(tl.int32))
     # Cap the fetches; the overflow misses are computed on the CPU (left non-resident).
     if fetch_frac_q16 > 0:
         # Bandwidth-matched split (fetch_frac = pcie_bw / cpu_bw): fetch time scales with
         # F * (1 - frac), CPU time with (M - F) * frac; they balance at F = frac * M. Pick
         # the integer neighbor that minimizes the slower (max) side of the overlap.
-        lo = (num_missing * fetch_frac_q16) >> 16
-        cost_lo = tl.maximum(lo * ((1 << 16) - fetch_frac_q16), (num_missing - lo) * fetch_frac_q16)
+        lo = (num_fetchable * fetch_frac_q16) >> 16
+        cost_lo = tl.maximum(lo * ((1 << 16) - fetch_frac_q16),
+                             (num_fetchable - lo) * fetch_frac_q16)
         cost_hi = tl.maximum(
-            (lo + 1) * ((1 << 16) - fetch_frac_q16), (num_missing - lo - 1) * fetch_frac_q16
+            (lo + 1) * ((1 << 16) - fetch_frac_q16), (num_fetchable - lo - 1) * fetch_frac_q16
         )
         max_fetch = tl.where(cost_lo <= cost_hi, lo, lo + 1)
-    num_fetch = tl.minimum(num_missing, max_fetch)
+    num_fetch = tl.minimum(num_fetchable, max_fetch)
     tl.store(num_missing_full_ptr, num_missing.to(tl.int64))
     tl.store(num_indices_ptr, num_fetch.to(tl.int64))
     is_hit = is_active & (slot >= 0)
@@ -632,10 +735,10 @@ def _ensure_experts_hybrid_kernel(
     if BY_RECENCY:
         rec = tl.load(expert_recency_ptr + base + off_e, mask=e_mask, other=-1).to(tl.int64)
         score = tl.where(
-            is_missing, rec * num_experts + (num_experts - 1 - off_e), -1152921504606846976
+            is_fetchable, rec * num_experts + (num_experts - 1 - off_e), -1152921504606846976
         ).to(tl.int64)
     else:
-        missing_rank = tl.cumsum(is_missing.to(tl.int32)) - 1
+        missing_rank = tl.cumsum(is_fetchable.to(tl.int32)) - 1
 
     # ---- Phase 2: evict victims by argmin(usage), only for the capped fetches ----
     fetched_e = tl.zeros((BLOCK_E,), dtype=tl.int1)
@@ -666,12 +769,22 @@ def _ensure_experts_hybrid_kernel(
                 e = tl.argmax(score, axis=0).to(tl.int32)
                 score = tl.where(off_e == e, -1152921504606846976, score)
             else:
-                e = tl.sum(tl.where((missing_rank == i) & is_missing, off_e, 0))
+                e = tl.sum(tl.where((missing_rank == i) & is_fetchable, off_e, 0))
             tl.store(id_of_slot_ptr + victim, base + e)
             tl.store(slot_for_id_ptr + base + e, victim)
             tl.store(usage_ptr + victim, step)
             tl.store(evict_slots_ptr + i, victim)
-            tl.store(src_indices_ptr + i, e)  # layer-local row
+            # The host bank row to gather from: the expert id under full residency, its HOST
+            # SLOT under tier 3. This one substitution IS the indirection -- the copy kernel
+            # computes base[layer, bank] + row * feat_bytes either way and is untouched.
+            if HOST_TIER:
+                hrow = tl.load(host_base + base + e)
+                tl.store(src_indices_ptr + i, hrow)
+                # publish the slot as "under a live gather" so the tier-3 installer running
+                # concurrently on the CPU pool cannot recycle it mid-flight
+                tl.store(gpu_host_slots_ptr + i, hrow)
+            else:
+                tl.store(src_indices_ptr + i, e)  # layer-local row
             u = tl.where(off_c == victim, INF32, u)
             fetched_e = fetched_e | (off_e == e)
 

@@ -9,6 +9,37 @@ import torch
 import triton
 import triton.language as tl
 
+from freetoken.kernel.triton.qsa.store_nvfp4 import KV_BLOCK
+
+
+# Reciprocal of the 2^-14 factor the bit-trick decoders below leave on their result. It is a
+# power of two, so folding it into the fp32 row global is exact.
+_E2M1_UNSCALE = tl.constexpr(16384.0)
+
+
+@triton.jit
+def _e2m1_pair_f16(v):
+    """Two E2M1 codes at int32 bits [3:0] and [19:16] -> ``(lo, hi)`` fp16, each ``value *
+    2^-14``. The caller restores the factor via the row global (see ``_E2M1_UNSCALE``).
+
+    Same bit trick as ``kernel/triton/nvfp4_dequant._nvfp4_pair_f16``: the magnitude bits land
+    in fp16's [11:9] and the sign in [15], and fp16's subnormal encoding puts the e == 0 codes
+    on the same 2^-14 scale, so the {0, 0.5} case needs no branch at all. Three integer ops for
+    two elements, against ~10 fp32 ops each for the arithmetic spelling this replaced -- which
+    is what made the prefill-shaped attend 14x the fp8 one.
+    """
+    r = ((v << 9) & 0x0E000E00) | ((v & 0x00080008) << 12)
+    lo = (r & 0xFFFF).to(tl.uint16).to(tl.float16, bitcast=True)
+    hi = (r >> 16).to(tl.uint16).to(tl.float16, bitcast=True)
+    return lo, hi
+
+
+@triton.jit
+def _e2m1_one_f16(code):
+    """One E2M1 code at bits [3:0] -> fp16 ``value * 2^-14``. See :func:`_e2m1_pair_f16`."""
+    r = ((code << 9) & 0x0E00) | ((code & 0x0008) << 12)
+    return (r & 0xFFFF).to(tl.uint16).to(tl.float16, bitcast=True)
+
 
 @triton.jit
 def _qsa_sparse_paged_gqa_splitk_kernel(
@@ -17,6 +48,8 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     v_cache_ptr,
     k_scale_ptr,
     v_scale_ptr,
+    k_blk_ptr,
+    v_blk_ptr,
     indices_ptr,
     block_table_ptr,
     token_to_req_ptr,
@@ -32,6 +65,8 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     stride_v_token,
     stride_v_head,
     stride_scale_token,
+    stride_blk_token,
+    stride_blk_head,
     stride_indices_row,
     stride_table_req,
     stride_output_row,
@@ -50,6 +85,8 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     KV_FP8: tl.constexpr,
+    KV_NVFP4: tl.constexpr,
+    KV_BLOCK: tl.constexpr,
 ) -> None:
     # row * stride can overflow int32 for large row counts.
     row = tl.program_id(0).to(tl.int64)
@@ -105,24 +142,94 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
         valid &= (physical_page >= 0) & (physical_page < num_cache_blocks)
         # physical_page * block stride can overflow int32 for large caches.
         safe_page = tl.maximum(physical_page, 0).to(tl.int64)
-        keys = tl.load(
-            k_cache_ptr
-            + safe_page[None, :] * stride_k_block
-            + page_offset[None, :] * stride_k_token
-            + kv_head * stride_k_head
-            + dim_offsets[:, None],
-            mask=valid[None, :],
-            other=0.0,
-        )
-        values = tl.load(
-            v_cache_ptr
-            + safe_page[:, None] * stride_v_block
-            + page_offset[:, None] * stride_v_token
-            + kv_head * stride_v_head
-            + dim_offsets[None, :],
-            mask=valid[:, None],
-            other=0.0,
-        )
+        if KV_NVFP4:
+            # Two E2M1 codes per byte (low nibble first) plus one e4m3 scale per KV_BLOCK
+            # elements. Unlike fp8's single row scale, the block scale varies ALONG head_dim --
+            # inside the dot product's reduction -- so it cannot be folded onto the scores
+            # afterwards. Dequantize into registers here and let tl.dot see plain values.
+            #
+            # Loads are issued at their NATURAL width and expanded in registers wherever that
+            # is safe. Indexing everything by dim_offsets -- `// 2` for the byte, `// KV_BLOCK`
+            # for the scale -- reads each byte twice and each block scale KV_BLOCK times, and
+            # measured 3.8x the fp8 attend; at their own widths it is 1.8x.
+            #
+            # "Wherever safe" is doing real work here. K is built token-major and transposed
+            # into the dot's A operand, and tl.interleave is correct there. Feeding an
+            # interleaved block STRAIGHT into the dot's B operand (V) is not: on Triton 3.6 it
+            # silently yields exactly 2x the right answer -- no error, no NaN, just a doubled
+            # V. The tl.trans on the K side happens to force a re-layout that avoids it; a
+            # double transpose on V does not (it folds away), and it is the layout rather than
+            # the decode -- both the arithmetic and the bit-trick spelling reproduce it. So V
+            # keeps the per-element byte index, and only its block scale is broadcast. If you
+            # try to interleave V here, tests/kvcache/test_nvfp4_kv_kernel.py will catch it.
+            slot_lin = safe_page * PAGE_SIZE + page_offset
+            glb_off = slot_lin * stride_scale_token + kv_head
+            blk_base = kv_head * stride_blk_head
+            half = tl.arange(0, HEAD_DIM // 2)
+            blk = tl.arange(0, HEAD_DIM // KV_BLOCK)
+
+            # --- K: loaded token-major, transposed into the dot's [HEAD_DIM, BLOCK_N] operand
+            kbytes = tl.load(
+                k_cache_ptr
+                + safe_page[:, None] * stride_k_block
+                + page_offset[:, None] * stride_k_token
+                + kv_head * stride_k_head
+                + half[None, :],
+                mask=valid[:, None], other=0,
+            ).to(tl.int32)
+            klo, khi = _e2m1_pair_f16((kbytes & 0xF) | ((kbytes & 0xF0) << 12))
+            kblk = tl.load(
+                k_blk_ptr + slot_lin[:, None] * stride_blk_token + blk_base + blk[None, :],
+                mask=valid[:, None], other=0.0,
+            ).to(tl.float16)
+            kblk = tl.reshape(
+                tl.broadcast_to(kblk[:, :, None], (BLOCK_N, HEAD_DIM // KV_BLOCK, KV_BLOCK)),
+                (BLOCK_N, HEAD_DIM),
+            )
+            keys = tl.trans(tl.interleave(klo, khi) * kblk).to(query.dtype)
+            kglb = tl.load(k_scale_ptr + glb_off, mask=valid, other=0.0) * _E2M1_UNSCALE
+
+            # --- V: the dot's B operand, so the byte index stays per-element (see above)
+            byte_off = tl.arange(0, HEAD_DIM) // 2
+            is_lo = (tl.arange(0, HEAD_DIM) % 2) == 0
+            vbytes = tl.load(
+                v_cache_ptr
+                + safe_page[:, None] * stride_v_block
+                + page_offset[:, None] * stride_v_token
+                + kv_head * stride_v_head
+                + byte_off[None, :],
+                mask=valid[:, None], other=0,
+            ).to(tl.int32)
+            vcode = tl.where(is_lo[None, :], vbytes & 0xF, (vbytes >> 4) & 0xF)
+            vblk = tl.load(
+                v_blk_ptr + slot_lin[:, None] * stride_blk_token + blk_base + blk[None, :],
+                mask=valid[:, None], other=0.0,
+            ).to(tl.float16)
+            vblk = tl.reshape(
+                tl.broadcast_to(vblk[:, :, None], (BLOCK_N, HEAD_DIM // KV_BLOCK, KV_BLOCK)),
+                (BLOCK_N, HEAD_DIM),
+            )
+            values = (_e2m1_one_f16(vcode) * vblk).to(query.dtype)
+            vglb = tl.load(v_scale_ptr + glb_off, mask=valid, other=0.0) * _E2M1_UNSCALE
+        else:
+            keys = tl.load(
+                k_cache_ptr
+                + safe_page[None, :] * stride_k_block
+                + page_offset[None, :] * stride_k_token
+                + kv_head * stride_k_head
+                + dim_offsets[:, None],
+                mask=valid[None, :],
+                other=0.0,
+            )
+            values = tl.load(
+                v_cache_ptr
+                + safe_page[:, None] * stride_v_block
+                + page_offset[:, None] * stride_v_token
+                + kv_head * stride_v_head
+                + dim_offsets[None, :],
+                mask=valid[:, None],
+                other=0.0,
+            )
         if KV_FP8:
             # e4m3 codes + one fp32 scale per (token, kv head). The codes convert exactly to
             # the compute dtype; the scales fold in algebraically: K's on the scores (per
@@ -137,6 +244,10 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
         scores = tl.dot(query, keys)
         if KV_FP8:
             scores *= k_scale[None, :]
+        elif KV_NVFP4:
+            # Only the BLOCK scale had to be applied before the dot; the row global is constant
+            # along head_dim, so it folds onto the scores exactly as fp8's single scale does.
+            scores *= kglb[None, :]
         # Scaling scores avoids re-quantizing a scaled query to BF16.
         scores *= softmax_scale_log2
         scores = tl.where(valid[None, :], scores, -1.0e20)
@@ -149,6 +260,8 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
             # The denominator stays over the UNSCALED probabilities; only the numerator's
             # operand carries V's per-token scale.
             p_operand = (probabilities * v_scale[None, :]).to(query.dtype)
+        elif KV_NVFP4:
+            p_operand = (probabilities * vglb[None, :]).to(query.dtype)
         else:
             p_operand = probabilities.to(values.dtype)
         accumulator = tl.dot(
@@ -258,10 +371,20 @@ def qsa_sparse_paged_attention(
     *,
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
+    k_blk: torch.Tensor | None = None,
+    v_blk: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run sparse GQA directly over paged K/V caches: 16-bit (the compute dtype), or e4m3
-    codes plus fp32 per-(token slot, kv head) scales ``k_scale``/``v_scale``
-    ``[pages * page_size, kv_heads]`` (the FP8 QSA pool), dequantized inside the kernel."""
+    """Run sparse GQA directly over paged K/V caches, dequantized inside the kernel.
+
+    Three storage formats, picked from ``k_cache.dtype``:
+
+    * 16-bit -- the compute dtype, no scales.
+    * ``float8_e4m3fn`` -- codes plus fp32 per-(token slot, kv head) scales
+      ``k_scale``/``v_scale`` ``[pages * page_size, kv_heads]`` (the FP8 QSA pool).
+    * ``uint8`` -- NVFP4: two E2M1 codes per byte (``head_dim // 2`` bytes per head row), e4m3
+      per-16-element block scales ``k_blk``/``v_blk`` ``[slots, kv_heads, head_dim // 16]``,
+      and the same fp32 row scales as fp8 reused as the per-row global.
+    """
 
     if q.ndim != 3 or k_cache.ndim != 4 or v_cache.shape != k_cache.shape:
         raise ValueError("QSA sparse attention received invalid Q/K/V shapes")
@@ -271,15 +394,31 @@ def qsa_sparse_paged_attention(
         raise ValueError("QSA sparse attention metadata has invalid shapes")
     if logical_indices.shape[1] <= 0:
         raise ValueError("QSA sparse attention requires a positive selection width")
-    if q.shape[2] != k_cache.shape[3] or q.shape[1] % k_cache.shape[2]:
+    kv_nvfp4 = k_cache.dtype == torch.uint8
+    stored_dim = k_cache.shape[3] * 2 if kv_nvfp4 else k_cache.shape[3]
+    if q.shape[2] != stored_dim or q.shape[1] % k_cache.shape[2]:
         raise ValueError("QSA sparse attention requires valid grouped-query heads")
     head_dim = q.shape[2]
     assert head_dim >= 16 and (head_dim & (head_dim - 1)) == 0
     kv_fp8 = k_cache.dtype == torch.float8_e4m3fn
-    assert k_cache.dtype == v_cache.dtype and (kv_fp8 or q.dtype == k_cache.dtype), (
-        q.dtype, k_cache.dtype, v_cache.dtype
-    )
-    if kv_fp8:
+    assert k_cache.dtype == v_cache.dtype and (
+        kv_fp8 or kv_nvfp4 or q.dtype == k_cache.dtype
+    ), (q.dtype, k_cache.dtype, v_cache.dtype)
+    stride_blk_token = stride_blk_head = 0
+    if kv_nvfp4:
+        num_slots = k_cache.shape[0] * k_cache.shape[1]
+        n_blocks = head_dim // KV_BLOCK
+        assert k_scale is not None and v_scale is not None, "NVFP4 K/V needs row globals"
+        assert k_blk is not None and v_blk is not None, "NVFP4 K/V needs block scales"
+        assert k_scale.shape == v_scale.shape == (num_slots, k_cache.shape[2])
+        assert k_scale.dtype == v_scale.dtype == torch.float32
+        assert k_scale.stride() == v_scale.stride() and k_scale.stride(1) == 1
+        assert k_blk.shape == v_blk.shape == (num_slots, k_cache.shape[2], n_blocks)
+        assert k_blk.dtype == v_blk.dtype == torch.float8_e4m3fn
+        assert k_blk.stride() == v_blk.stride() and k_blk.stride(2) == 1
+        stride_scale_token = k_scale.stride(0)
+        stride_blk_token, stride_blk_head = k_blk.stride(0), k_blk.stride(1)
+    elif kv_fp8:
         num_slots = k_cache.shape[0] * k_cache.shape[1]
         assert k_scale is not None and v_scale is not None, "fp8 K/V needs per-token scales"
         assert k_scale.shape == v_scale.shape == (num_slots, k_cache.shape[2]), (
@@ -289,9 +428,11 @@ def qsa_sparse_paged_attention(
         assert k_scale.stride() == v_scale.stride() and k_scale.stride(1) == 1
         stride_scale_token = k_scale.stride(0)
     else:
-        assert k_scale is None and v_scale is None, "scales are for the fp8 K/V pool only"
-        k_scale = v_scale = q  # unused pointer under KV_FP8=False
+        assert k_scale is None and v_scale is None, "scales are for quantized K/V pools only"
+        k_scale = v_scale = q  # unused pointers when the pool is not quantized
         stride_scale_token = 0
+    if not kv_nvfp4:
+        k_blk = v_blk = q  # unused pointer under KV_NVFP4=False
     assert logical_indices.dtype == block_table.dtype == torch.int32
     assert token_to_req.dtype == torch.int32
     assert q.stride(2) == k_cache.stride(3) == v_cache.stride(3) == 1
@@ -349,6 +490,8 @@ def qsa_sparse_paged_attention(
         v_cache,
         k_scale,
         v_scale,
+        k_blk,
+        v_blk,
         logical_indices,
         block_table,
         token_to_req,
@@ -364,6 +507,8 @@ def qsa_sparse_paged_attention(
         v_cache.stride(1),
         v_cache.stride(2),
         stride_scale_token,
+        stride_blk_token,
+        stride_blk_head,
         logical_indices.stride(0),
         block_table.stride(0),
         out.stride(0),
@@ -382,6 +527,8 @@ def qsa_sparse_paged_attention(
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         KV_FP8=kv_fp8,
+        KV_NVFP4=kv_nvfp4,
+        KV_BLOCK=KV_BLOCK,
         num_warps=partial_warps,
         num_stages=2,
     )

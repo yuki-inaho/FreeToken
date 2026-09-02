@@ -302,6 +302,7 @@ class Engine:
         from freetoken.gpu_select import bind_assigned_gpu
 
         self.device = bind_assigned_gpu(config.tp_info.rank)
+        _apply_gpu_mem_cap(self.device)  # before any allocation, so the cap covers everything
         _adjust_config(config)
         torch.manual_seed(42)
         self.stream = torch.cuda.Stream()
@@ -649,16 +650,25 @@ class Engine:
                     else HostResidency.PINNED.value
                     for i in range(config.model_config.num_moe_layers)
                 ]
-            banks = load_expert_banks(
-                config.model_path,
-                config.model_config,
-                device=self.device,
-                dtype=self.dtype,
-                dummy=config.use_dummy_weight,
-                parallel=expert_parallel,
-                decode_target=("cpu" if decode_target in ("cpu", "hybrid") else "gpu"),
-                layer_residency=requested_residency,
-            )
+            tier3_plan = _tier3_request(config)
+            if tier3_plan is not None:
+                # Tier 3: allocate EMPTY host pools (host_slots rows/layer) and read nothing --
+                # the C++ resolver pages experts in on demand. Boot is near-instant and host
+                # RAM is host_slots/num_experts of the corpus.
+                from freetoken.tier3.loader import load_tier3_banks
+
+                banks = load_tier3_banks(tier3_plan[0], tier3_plan[1])
+            else:
+                banks = load_expert_banks(
+                    config.model_path,
+                    config.model_config,
+                    device=self.device,
+                    dtype=self.dtype,
+                    dummy=config.use_dummy_weight,
+                    parallel=expert_parallel,
+                    decode_target=("cpu" if decode_target in ("cpu", "hybrid") else "gpu"),
+                    layer_residency=requested_residency,
+                )
             # A model may append extra bank layers past the main tower's (qwen4_exp: the MTP
             # draft experts quantized into the cache's format, so speculative decoding costs
             # slots instead of resident VRAM). The cache, the auto-size budget and the layer
@@ -700,6 +710,8 @@ class Engine:
             )
             # before set_bank_sources: the residency validation and the copy plan's skip of non-pinned layers key on the CPU-layer set
             cache.cpu_layer_ids = cpu_layer_ids
+            if tier3_plan is not None:
+                cache.host_slots = tier3_plan[1]
             cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency)
             cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
         else:
@@ -720,6 +732,8 @@ class Engine:
         assert len(layers) == config.model_config.num_moe_layers + extra_bank_layers
         if cache.decode_target in ("cpu", "hybrid"):
             self._init_cpu_moe_executor(config, cache, layers)
+            if cache_factory is None and _tier3_request(config) is not None:
+                self._enable_tier3(config, cache, banks)
         if config.moe_prefetch == "mtp":
             budget = config.moe_prefetch_budget if config.moe_prefetch_budget > 0 else 35
             cache.init_prefetch_plan(budget)
@@ -734,6 +748,76 @@ class Engine:
         self.ctx.moe_offload_cache = cache
         self.moe_offload_cache = cache
         return cache
+
+    def _enable_tier3(self, config: EngineConfig, cache, banks) -> None:
+        """Point the resolver at the FTW corpus and publish the residency map to both readers.
+
+        The map lives in pinned host memory: the C++ resolver writes it, and the GPU ensure
+        kernel reads it over UVA to avoid selecting an expert with no host bytes behind it.
+        """
+        from freetoken.tier3.budget import host_bank_split
+        from freetoken.tier3.wiring import enable_cpu_tier3
+
+        ftw_dir, host_slots = _tier3_request(config)
+        feat = {n: t[0][0].numel() * t[0].element_size() for n, t in banks.sources.items()}
+        split = host_bank_split(feat)
+        # Only the main tower is paged; any bank layer a model appended past it (qwen4_exp's
+        # MTP draft experts) is full width and stays resident, so it is outside the corpus.
+        paged_layers = len(banks.sources[split.fetched[0]])
+        for per_layer in banks.sources.values():
+            paged_layers = min(paged_layers,
+                               sum(1 for t in per_layer if t.size(0) == host_slots))
+        handle = enable_cpu_tier3(
+            cache.cpu_executor, banks.sources, ftw_dir, split,
+            num_layers=paged_layers, num_experts=cache.num_experts,
+            map_layers=cache.num_layers,
+            host_slots=host_slots,
+            readers=int(os.environ.get("FREETOKEN_TIER3_READERS", "16")),
+            min_step_experts=config.max_running_req * config.model_config.num_experts_per_tok,
+        )
+        cache.host_slot_for_id = handle.host_slot_for_id
+        cache.host_tier = handle
+        cache.residency_route_tau = float(getattr(config, "moe_residency_routing", 0.0) or 0.0)
+        if cache.residency_route_tau:
+            cache.residency_route_stats = torch.zeros(2, dtype=torch.int64, device=self.device)
+        cache.host_slot_dev = handle.host_slot_for_id.to(self.device)
+        # Prefill needs a full expert-id-indexed layer, which the pool cannot give; stage it.
+        from freetoken.tier3.nvme_store import NvmeExpertStore
+        from freetoken.tier3.prefill import PrefillStager
+
+        store = NvmeExpertStore(ftw_dir, split.fetched,
+                                readers=int(os.environ.get("FREETOKEN_TIER3_READERS", "16")),
+                                verify_aligned=False)
+        prewarm_on = os.environ.get("FREETOKEN_TIER3_PREWARM", "1").strip().lower() not in (
+            "0", "false")
+        # A prewarmed pool stays exactly host_slots full, so a layer never has more than
+        # num_experts - host_slots experts to stage.
+        stage_rows = (cache.num_experts - host_slots) if prewarm_on else cache.num_experts
+        cache._tier3_stager = PrefillStager(store, banks.sources, handle.host_slot_for_id,
+                                            cache.num_experts, self.device,
+                                            stage_rows=max(8, stage_rows))
+        if prewarm_on:
+            import time as _time
+
+            from freetoken.tier3.wiring import prewarm_pool
+
+            t0 = _time.perf_counter()
+            # handle.num_layers, not paged_layers: the bank-width test above cannot tell the
+            # resident MTP draft layer from the paged tower when host_slots == num_experts,
+            # and prewarm indexes the corpus.
+            nbytes = prewarm_pool(cache.cpu_executor, banks.sources, store, handle,
+                                  num_layers=handle.num_layers, host_slots=host_slots)
+            dt = _time.perf_counter() - t0
+            cache.host_slot_dev.copy_(cache.host_slot_for_id)  # publish the prewarm
+            logger.info_rank0(
+                f"tier 3 prewarm: {nbytes / 2**30:.1f} GiB in {dt:.1f}s "
+                f"({nbytes / dt / 1e9:.1f} GB/s); pool starts {100 * host_slots / cache.num_experts:.0f}% full"
+            )
+        logger.info_rank0(
+            f"tier 3 armed: {host_slots} host slots/layer over {handle.num_layers} paged layers "
+            f"({cache.num_layers - handle.num_layers} resident), {len(split.fetched)} banks "
+            f"({split.fetched_bytes_per_expert / 2**20:.2f} MiB/expert), corpus {ftw_dir}"
+        )
 
     def _resolve_hybrid_fetch(self, config: EngineConfig, cache) -> None:
         """Resolve --moe-hybrid-max-fetch -1 (auto) into a bandwidth-matched fetch fraction.
@@ -1052,6 +1136,9 @@ class Engine:
         # Expert-prefetch fence (invariant I3): no forward may run a demand ensure while
         # a speculative expert copy is in flight on the side stream -- a demand HIT on a
         # half-copied slot would read garbage. Enqueue-only; no-op when nothing is in flight.
+        cache = getattr(self, "moe_offload_cache", None)
+        if cache is not None and getattr(cache, "host_slot_dev", None) is not None:
+            cache.refresh_host_map()   # one 96 KiB H2D per step; see refresh_host_map
         prefetcher = getattr(self.spec_executor, "prefetcher", None)
         if prefetcher is not None:
             prefetcher.join()
@@ -1185,6 +1272,50 @@ def _ensure_expandable_segments() -> None:
     logger.info_rank0("Enabled expandable_segments (override via PYTORCH_ALLOC_CONF)")
 
 
+def _tier3_prefetch_optin() -> bool:
+    """``FREETOKEN_TIER3_PREFETCH=1``: allow --moe-prefetch with the NVMe tier.
+
+    Measurement escape hatch, not a supported mode -- see the refusal in ``_adjust_config`` for
+    the lifetime hole it leaves open. Named so it cannot be mistaken for a tuning knob.
+    """
+    return os.environ.get("FREETOKEN_TIER3_PREFETCH", "").strip() in ("1", "true", "True")
+
+
+def _apply_gpu_mem_cap(device: torch.device) -> None:
+    """``FREETOKEN_GPU_MEM_CAP_MB``: hard-cap this process's VRAM, so a configuration that does
+    not fit a smaller card fails HERE instead of appearing to work on a larger one.
+
+    This exists because ``--gpu-reserve-mb`` does not do it. The reserve is a term in the
+    *budget solver* -- it shrinks what ``--moe-cache-auto`` hands to the KV and expert pools --
+    and nothing stops transient allocations from growing past it. Measured consequence: the
+    16 GB/64 GB tier-3 profile idles at 14.7 GiB with the pools correctly sized for the
+    emulated card, then peaks at 16.2-22.0 GiB during a 250K prefill depending on the prefill
+    chunk size. Every "it runs on the emulated 16 GB card" result taken that way certifies the
+    pools and says nothing about the peak.
+
+    Set this to the target card's size in MiB (e.g. 16384) and an over-budget run raises a CUDA
+    OOM at the allocation that would have overflowed the real card. Unlike the reserve it is an
+    absolute figure in *allocation* space, so the two are independent and compose: keep using
+    the reserve to steer pool sizing, add this to make the result falsifiable.
+    """
+    mb = int(os.getenv("FREETOKEN_GPU_MEM_CAP_MB", "0") or "0")
+    if mb <= 0:
+        return
+    total = torch.cuda.get_device_properties(device).total_memory
+    cap = mb * (1 << 20)
+    if cap >= total:
+        logger.warning_rank0(
+            f"FREETOKEN_GPU_MEM_CAP_MB={mb} is >= the device's {total >> 20} MiB; ignoring"
+        )
+        return
+    # Fraction of TOTAL, which is what torch caps against -- not of free memory.
+    torch.cuda.set_per_process_memory_fraction(cap / total, device)
+    logger.info_rank0(
+        f"GPU memory hard-capped to {mb} MiB of {total >> 20} MiB "
+        f"(FREETOKEN_GPU_MEM_CAP_MB): allocations past it raise OOM, emulating a smaller card"
+    )
+
+
 def _resolve_cache_type(has_linear_attention: bool, requested: str) -> str:
     # Hybrid GDN models default to the HybridRadixCache (snapshots GDN state at chunk
     # boundaries -> cross-request prefix reuse). An explicit ``--cache-type naive`` opts out
@@ -1312,6 +1443,27 @@ def _cpu_moe_executor_viable(model_config) -> bool:
     return fmt == "mxfp4" or fmt in _WFMT_IDS
 
 
+def _tier3_request(config) -> tuple[str, int] | None:
+    """(ftw_dir, host_slots) when NVMe expert streaming is requested, else None.
+
+    Env-gated for now: ``FREETOKEN_TIER3_FTW`` points at a per-layer FTW conversion of the
+    served checkpoint and ``FREETOKEN_TIER3_HOST_SLOTS`` sets the per-layer pool width.
+    """
+    d = os.environ.get("FREETOKEN_TIER3_FTW", "").strip()
+    n = int(os.environ.get("FREETOKEN_TIER3_HOST_SLOTS", "0") or "0")
+    if not d or n <= 0:
+        return None
+    if not os.path.isdir(d):
+        raise ValueError(f"FREETOKEN_TIER3_FTW={d!r} is not a directory")
+    if config.moe_backend not in ("hybrid", "cpu"):
+        raise ValueError(
+            f"tier 3 needs --moe-backend hybrid (or cpu), got {config.moe_backend!r}: the NVMe "
+            f"fetch runs on the CPU executor's coordinator, which is the only place a decode "
+            f"can legally stall (see freetoken/tier3/FINDINGS.md)"
+        )
+    return d, n
+
+
 def _pin_budget_bytes(reserved: int = 0) -> int | None:
     """Bytes this process can still safely cudaHostRegister, or None when the platform does not cap pinning (plain Linux).
 
@@ -1385,28 +1537,56 @@ def _adjust_config(config: EngineConfig):
     is_moe = getattr(model_config, "is_moe", False)
     expert_quant = getattr(model_config, "expert_quant", "none")
 
+    # ----- --moe-residency-routing: a low-RAM-only feature ------------------------------------
+    tau = float(getattr(config, "moe_residency_routing", 0.0) or 0.0)
+    if tau:
+        if not 0.0 < tau <= 1.0:
+            raise ValueError(
+                f"--moe-residency-routing must be in (0, 1], got {tau}"
+            )
+        if _tier3_request(config) is None:
+            # With every expert resident there is nothing to substitute: the kernel would run
+            # per layer, find no host miss and return, costing a launch for nothing. Refusing
+            # is also the honest signal that this trades quality for a constraint you do not
+            # have.
+            raise ValueError(
+                "--moe-residency-routing needs the NVMe expert tier (FREETOKEN_TIER3_FTW): it "
+                "substitutes experts that are not in the host pool, and without the tier every "
+                "expert is resident. Drop the flag, or enable the tier."
+            )
+        logger.warning_rank0(
+            f"--moe-residency-routing {tau}: routed experts missing from the host pool will be "
+            "substituted with near-tied resident ones. THIS CHANGES MODEL OUTPUTS; validate on "
+            "your own quality suite."
+        )
+
     # ----- KV storage dtype (--kv-cache-dtype) -> config.kv_dtype, before any pool sizing -----
     # (solve_num_pages / --moe-cache-auto / validate_rebuild all price the slab from it.)
     kv_choice = getattr(config, "kv_cache_dtype", "auto") or "auto"
     compute_dtype = getattr(config, "dtype", None)
-    if kv_choice == "fp8":
+    if kv_choice in ("fp8", "nvfp4"):
         from freetoken.kvcache import resolve_pool_class
-        from freetoken.kvcache.qsa_pool import QSAKVCache
+        from freetoken.kvcache.qsa_pool import NVFP4_KV_DTYPE, QSAKVCache
 
         if resolve_pool_class(model_config) is not QSAKVCache:
             raise ValueError(
-                "--kv-cache-dtype fp8 is implemented for the QSA KV pool (Qwen3.8-Flash-Next) "
-                "only; this model's KV cache stores the compute dtype"
+                f"--kv-cache-dtype {kv_choice} is implemented for the QSA KV pool "
+                "(Qwen3.8-Flash-Next) only; this model's KV cache stores the compute dtype"
             )
         from freetoken.kernel.triton.e4m3_compat import e4m3_native
 
+        # NVFP4 needs e4m3 too: the per-16 block scales are stored in it.
         if not e4m3_native():
-            raise ValueError("--kv-cache-dtype fp8 needs native e4m3 support (sm_89 or newer)")
-        override("kv_dtype", torch.float8_e4m3fn)
+            raise ValueError(
+                f"--kv-cache-dtype {kv_choice} needs native e4m3 support (sm_89 or newer)"
+            )
+        override("kv_dtype", NVFP4_KV_DTYPE if kv_choice == "nvfp4" else torch.float8_e4m3fn)
     elif kv_choice in ("auto", "bf16"):
         override("kv_dtype", compute_dtype)
     else:
-        raise ValueError(f"--kv-cache-dtype {kv_choice!r}: expected auto, bf16 or fp8")
+        raise ValueError(
+            f"--kv-cache-dtype {kv_choice!r}: expected auto, bf16, fp8 or nvfp4"
+        )
 
     # ----- --dense-quant fp8: load-time FP8 of the bf16 dense linears (qwen4_exp) -----
     dense_choice = getattr(config, "dense_quant", "auto") or "auto"
@@ -1699,6 +1879,26 @@ def _adjust_config(config: EngineConfig):
             raise ValueError(
                 "--moe-prefetch requires --moe-backend offload or hybrid (the prefetcher "
                 f"admits into the offload slot cache), got {config.moe_backend!r}"
+            )
+        if _tier3_request(config) is not None and not _tier3_prefetch_optin():
+            # The ADDRESSING is fixed: prefetch_admit now translates the expert id to its host
+            # slot and drops candidates with no host row, exactly as the demand path does. What
+            # is NOT fixed is the lifetime. A prefetch gather is issued at layer T-N and joined
+            # at layer T (N=2 by default), so it spans layers; the demand path protects its own
+            # gathers by publishing their host slots in that layer's routing pack for the C++
+            # resolver to exclude, and that exclusion lasts one layer. Nothing stops the
+            # resolver for an intervening layer from recycling a host slot a prefetch is still
+            # reading -- which lands another expert's bytes in the GPU slot silently.
+            #
+            # So this stays refused by default. FREETOKEN_TIER3_PREFETCH=1 opts in for
+            # measurement (a rare wrong expert does not move tok/s), so the gain can be sized
+            # before anyone builds the multi-layer exclusion it would need to ship.
+            raise ValueError(
+                f"--moe-prefetch {config.moe_prefetch} is not supported with the NVMe expert "
+                "tier (FREETOKEN_TIER3_FTW): a prefetch gather spans layers, and tier 3's "
+                "host-slot exclusion only covers the layer that published it, so the resolver "
+                "can recycle a slot mid-gather. Use --moe-prefetch off, or set "
+                "FREETOKEN_TIER3_PREFETCH=1 to opt in for MEASUREMENT ONLY (numerically unsafe)."
             )
         if config.moe_prefetch == "mtp" and not config.spec_enabled:
             logger.warning_rank0(
