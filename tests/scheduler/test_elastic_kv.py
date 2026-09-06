@@ -120,3 +120,53 @@ def test_elastic_grow_caps_and_shrinks_after_idle(monkeypatch):
     s4 = _stub_scheduler(monkeypatch)
     s4._elastic_backoff_until = time.monotonic() + 100
     assert s4._elastic_kv_maybe_resize(_msg(8, 130_000), 130_000) is False
+
+
+# ---- stepped shrink -------------------------------------------------------------------------
+#
+# Growing walks a 64K/128K/256K ladder, but shrinking only ever went all the way to the base and
+# only for a request that fits it. A server that grew for one long prompt and then sees a steady
+# diet of mid-length ones therefore kept the whole 256K pool -- on the NVMe-tier profile that is
+# ~590 expert slots held hostage, which is the decode rate.
+
+def test_plan_shrink_tokens_lands_on_the_grow_ladder():
+    from freetoken.scheduler.elastic_kv import plan_shrink_tokens
+
+    # a 90K request in a 256K pool: down to the 128K step, not to the base and not to 90K
+    assert plan_shrink_tokens(90_000, CAP, BASE, CAP) == 2 * BASE
+    assert plan_shrink_tokens(1000, CAP, BASE, CAP) == BASE
+    # already at (or below) the right step: nothing to do
+    assert plan_shrink_tokens(90_000, 2 * BASE, BASE, CAP) is None
+    assert plan_shrink_tokens(200_000, CAP, BASE, CAP) is None
+    assert plan_shrink_tokens(1000, BASE, BASE, CAP) is None
+    # every answer is a step the grow path can also produce, so an oscillating workload
+    # does not rebuild on every request
+    for needed in (10, 60_000, 70_000, 130_000, 200_000):
+        got = plan_shrink_tokens(needed, CAP, BASE, CAP)
+        assert got is None or got == plan_target_tokens(needed, BASE, CAP)
+
+
+def test_elastic_shrinks_by_steps_for_a_midsize_request(monkeypatch):
+    s = _stub_scheduler(monkeypatch, num_pages=4096, base_pages=1024, moe=6500)  # 256K pool
+    s._elastic_last_activity = time.monotonic() - 1000
+    assert s._elastic_kv_maybe_resize(_msg(20, 90_000), 90_000) is True
+    rb = s._pending_rebuild
+    assert rb.num_pages == 131072 // 64, "should step down to 128K, not stay at 256K"
+    assert rb.moe_cache_size > 6500, "the reclaimed KV bytes must come back as expert slots"
+
+
+def test_stepped_shrink_still_needs_the_idle_window(monkeypatch):
+    s = _stub_scheduler(monkeypatch, num_pages=4096, base_pages=1024, moe=6500)
+    assert s._elastic_kv_maybe_resize(_msg(21, 90_000), 90_000) is False
+    assert s._pending_rebuild is None
+
+
+def test_stepped_shrink_can_be_turned_off(monkeypatch):
+    import freetoken.scheduler.scheduler as sched_mod
+
+    monkeypatch.setattr(sched_mod, "_ELASTIC_STEPPED", False)
+    s = _stub_scheduler(monkeypatch, num_pages=4096, base_pages=1024, moe=6500)
+    s._elastic_last_activity = time.monotonic() - 1000
+    assert s._elastic_kv_maybe_resize(_msg(22, 90_000), 90_000) is False, "old policy: base only"
+    assert s._elastic_kv_maybe_resize(_msg(23, 20), 20) is True
+    assert s._pending_rebuild.num_pages == 1024

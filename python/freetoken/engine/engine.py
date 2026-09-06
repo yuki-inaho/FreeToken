@@ -778,8 +778,23 @@ class Engine:
         cache.host_slot_for_id = handle.host_slot_for_id
         cache.host_tier = handle
         cache.residency_route_tau = float(getattr(config, "moe_residency_routing", 0.0) or 0.0)
-        if cache.residency_route_tau:
-            cache.residency_route_stats = torch.zeros(2, dtype=torch.int64, device=self.device)
+        cache.residency_route_max_subs = int(
+            getattr(config, "moe_residency_routing_max_subs", 1) or 1)
+        cache.residency_route_total = float(
+            getattr(config, "moe_residency_routing_total", 0.0) or 0.0)
+        cache.residency_route_norm = None
+        cache.residency_route_ycal = None
+        cache.residency_route_eps = float(
+            getattr(config, "moe_residency_routing_eps", 0.0) or 0.0)
+        cache.residency_route_eps_total = float(
+            getattr(config, "moe_residency_routing_total_eps", 0.0)
+            or getattr(config, "moe_residency_routing_eps_total", 0.0) or 0.0)
+        cache.residency_route_drop_renorm = bool(
+            getattr(config, "moe_residency_routing_drop_renorm", False))
+        if cache.residency_route_eps > 0.0:
+            self._load_subst_table(config, cache, ftw_dir)
+        if cache.residency_route_tau or cache.residency_route_norm is not None:
+            cache.residency_route_stats = torch.zeros(8, dtype=torch.int64, device=self.device)
         cache.host_slot_dev = handle.host_slot_for_id.to(self.device)
         # Prefill needs a full expert-id-indexed layer, which the pool cannot give; stage it.
         from freetoken.tier3.nvme_store import NvmeExpertStore
@@ -817,6 +832,65 @@ class Engine:
             f"tier 3 armed: {host_slots} host slots/layer over {handle.num_layers} paged layers "
             f"({cache.num_layers - handle.num_layers} resident), {len(split.fetched)} banks "
             f"({split.fetched_bytes_per_expert / 2**20:.2f} MiB/expert), corpus {ftw_dir}"
+        )
+
+    def _load_subst_table(self, config: EngineConfig, cache, ftw_dir: str) -> None:
+        """Attach the measured expert table, or leave the feature off and say why.
+
+        Only the per-expert output norms and the calibration are needed at runtime: the shortlist
+        the artifact also carries is what MEASURED that substitution is never worth doing, and
+        the policy that came out of it does not substitute.
+        """
+        from freetoken.moe.subst_table import default_paths, load_table
+
+        spec = (getattr(config, "moe_residency_routing_table", "auto") or "auto").strip()
+        if spec == "off":
+            return
+        explicit = spec not in ("auto", "")
+        paths = [spec] if explicit else default_paths(config.model_path, ftw_dir)
+        for path in paths:
+            if not os.path.isfile(path):
+                if explicit:
+                    raise ValueError(
+                        f"--moe-residency-routing-table {path!r} does not exist; build it with "
+                        f"'ft moe subst --model {config.model_path} --dumps <route dumps> "
+                        f"--out {path}', or pass 'off'"
+                    )
+                continue
+            # the PAGED tower is what the table has to cover: a model may append resident bank
+            # layers past it (qwen4_exp's MTP draft experts), and those are never host-missing
+            paged = int(getattr(cache.host_tier, "num_layers", cache.num_layers))
+            table = load_table(
+                path, model=config.model_path, num_layers=paged,
+                num_experts=cache.num_experts,
+                top_k=config.model_config.num_experts_per_tok, device=self.device,
+            )
+            if table is None:
+                continue
+            norm = table["norm"]
+            if norm.shape[0] < cache.num_layers:
+                # a model may append resident bank layers past the paged tower (the MTP draft
+                # experts). They are never host-missing so the kernel returns before reading
+                # this, but the table must still be in range if that ever changes.
+                pad = norm.new_full((cache.num_layers - norm.shape[0], norm.shape[1]),
+                                    float(norm.max()))
+                norm = torch.cat([norm, pad], dim=0)
+            cache.residency_route_norm = norm.contiguous()
+            # a python list, not a device tensor: the kernel takes this layer's calibration as a
+            # scalar, and indexing a device tensor per layer per step would sync the host
+            ycal = table["y_cal"].tolist()
+            cache.residency_route_ycal = ycal + [ycal[-1]] * (cache.num_layers - len(ycal))
+            logger.info_rank0(
+                f"expert substitution table: {path} "
+                f"({norm.shape[0]} layers, eps {cache.residency_route_eps}); routed experts "
+                "missing from the host pool will be DROPPED when the drop moves at most that "
+                "fraction of the MoE block output. THIS CHANGES MODEL OUTPUTS."
+            )
+            return
+        logger.warning_rank0(
+            "--moe-residency-routing-eps is set but no usable expert substitution table was "
+            f"found (looked in {paths}); falling back to the logit-gated substitution. Build one "
+            "with 'ft moe subst'."
         )
 
     def _resolve_hybrid_fetch(self, config: EngineConfig, cache) -> None:
@@ -1537,8 +1611,27 @@ def _adjust_config(config: EngineConfig):
     is_moe = getattr(model_config, "is_moe", False)
     expert_quant = getattr(model_config, "expert_quant", "none")
 
-    # ----- --moe-residency-routing: a low-RAM-only feature ------------------------------------
+    # ----- --moe-residency-routing / the measured table: low-RAM-only features ----------------
     tau = float(getattr(config, "moe_residency_routing", 0.0) or 0.0)
+    eps = float(getattr(config, "moe_residency_routing_eps", 0.0) or 0.0)
+    if eps:
+        if not 0.0 < eps <= 1.0:
+            raise ValueError(f"--moe-residency-routing-eps must be in (0, 1], got {eps}")
+        eps_total = float(getattr(config, "moe_residency_routing_eps_total", 0.0) or 0.0)
+        if eps_total and not 0.0 < eps_total <= 1.0:
+            raise ValueError(
+                f"--moe-residency-routing-eps-total must be in (0, 1], got {eps_total}")
+        if _tier3_request(config) is None:
+            raise ValueError(
+                "--moe-residency-routing-eps needs the NVMe expert tier "
+                "(FREETOKEN_TIER3_FTW): it drops experts that are not in the host pool, and "
+                "without the tier every expert is resident. Drop the flag, or enable the tier."
+            )
+        logger.warning_rank0(
+            f"--moe-residency-routing-eps {eps}: routed experts missing from the host pool will "
+            "be DROPPED when the drop moves at most that fraction of the MoE block output. THIS "
+            "CHANGES MODEL OUTPUTS; validate on your own quality suite."
+        )
     if tau:
         if not 0.0 < tau <= 1.0:
             raise ValueError(
@@ -1554,10 +1647,22 @@ def _adjust_config(config: EngineConfig):
                 "substitutes experts that are not in the host pool, and without the tier every "
                 "expert is resident. Drop the flag, or enable the tier."
             )
+        max_subs = int(getattr(config, "moe_residency_routing_max_subs", 1) or 1)
+        top_k = int(getattr(model_config, "num_experts_per_tok", 0) or 0)
+        if max_subs < 1 or (top_k and max_subs > top_k):
+            raise ValueError(
+                f"--moe-residency-routing-max-subs must be in [1, {top_k or 'top_k'}], "
+                f"got {max_subs}"
+            )
+        total = float(getattr(config, "moe_residency_routing_total", 0.0) or 0.0)
+        if total and not 0.0 < total <= 1.0:
+            raise ValueError(
+                f"--moe-residency-routing-total must be in (0, 1], got {total}"
+            )
         logger.warning_rank0(
-            f"--moe-residency-routing {tau}: routed experts missing from the host pool will be "
-            "substituted with near-tied resident ones. THIS CHANGES MODEL OUTPUTS; validate on "
-            "your own quality suite."
+            f"--moe-residency-routing {tau} (max_subs {max_subs}, total {total or tau}): routed "
+            "experts missing from the host pool will be substituted with near-tied resident "
+            "ones. THIS CHANGES MODEL OUTPUTS; validate on your own quality suite."
         )
 
     # ----- KV storage dtype (--kv-cache-dtype) -> config.kv_dtype, before any pool sizing -----

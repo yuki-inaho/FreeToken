@@ -1,0 +1,3 @@
+"dataset_name": "astronomy"
+"include": "_mmlu_chat_template_yaml"
+"task": "mmlu_chat_astronomy"

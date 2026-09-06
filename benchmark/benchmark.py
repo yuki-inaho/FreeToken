@@ -12,6 +12,7 @@ Suites (``--suite``):
     concurrency   fixed 16-request workload at C in {1,2,4,8} (server must allow it;
                   boot with FREETOKEN_MAX_RUNNING_REQUESTS=8)
     smoke         short versions of everything, for validating accounting before long runs
+    mixed         code/English/Japanese x context x greedy/sampled, scored separately
 
 The driver never starts or stops servers; ``run_all.sh`` sequences boots and suites.
 Timing conventions (documented in the report): TTFT and decode wall are measured
@@ -60,25 +61,58 @@ def _post(url: str, payload: dict, timeout: float = 30.0) -> dict:
         return json.loads(r.read().decode())
 
 
+def _engine_from_timings(t: dict | None) -> dict | None:
+    """Normalize llama.cpp's `timings` onto the engine-stats schema this suite reports.
+
+    `predicted_n` counts emitted tokens, not decode steps; with speculation a step emits
+    several, so steps are derived as emitted - accepted (exact when every accepted draft
+    rides a verify step).
+    """
+    if not t:
+        return None
+    emitted = t.get("predicted_n") or 0
+    accepted = t.get("draft_n_accepted") or 0
+    return {
+        "prefill_s": round(t["prompt_ms"] / 1000.0, 4) if t.get("prompt_ms") else None,
+        "decode_s": round(t["predicted_ms"] / 1000.0, 4) if t.get("predicted_ms") else None,
+        "decode_steps": max(emitted - accepted, 0) or None,
+        "spec_steps": None,
+        "draft_tokens": t.get("draft_n") or 0,
+        "accepted_tokens": accepted,
+        "cache_n": t.get("cache_n"),
+    }
+
+
 def stream_chat(base: str, model: str, messages: list[dict], max_tokens: int,
                 temperature: float = 0.0, ignore_eos: bool = True,
-                timeout: float = 900.0) -> dict[str, Any]:
-    """One streamed chat completion; returns client timings + usage + output hash."""
+                timeout: float = 900.0, extra_body: dict | None = None,
+                capture_output: bool = False) -> dict[str, Any]:
+    """One streamed chat completion; returns client timings + usage + output hash.
+
+    Engine-side counters come from whichever extension the server offers:
+    FreeToken's ``usage.freetoken`` or llama.cpp's ``timings`` block on the final
+    delta. Both are normalized to the same schema so one harness compares them.
+    """
     payload = {
         "model": model, "messages": messages, "temperature": temperature,
         "max_tokens": max_tokens, "ignore_eos": ignore_eos,
         "stream": True, "stream_options": {"include_usage": True},
     }
+    if extra_body:
+        payload.update(extra_body)
     req = urllib.request.Request(f"{base}/chat/completions", data=json.dumps(payload).encode(),
                                  headers={"Content-Type": "application/json"})
     t_send = time.monotonic()
     t_first = t_last = None
     usage = None
+    timings = None
     finish_reason = None
     n_events = 0
     out_sha = hashlib.sha256()
     out_len = 0
     head = []
+    captured_choices = [] if capture_output else None
+    captured_text = [] if capture_output else None
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         for raw in resp:
             line = raw.decode().strip()
@@ -100,17 +134,23 @@ def stream_chat(base: str, model: str, messages: list[dict], max_tokens: int,
                     out_len += len(piece)
                     if len(head) < 6:
                         head.append(piece)
+                    if captured_text is not None:
+                        captured_text.append(piece)
+                if captured_choices is not None:
+                    captured_choices.append(ch)
                 if ch.get("finish_reason"):
                     finish_reason = ch["finish_reason"]
             if ev.get("usage"):
                 usage = ev["usage"]
+            if ev.get("timings"):
+                timings = ev["timings"]
     t_done = time.monotonic()
     if usage is None:
         raise RuntimeError("stream ended without a usage block")
     comp = usage.get("completion_tokens", 0)
     ttft = (t_first - t_send) if t_first else None
     decode_wall = (t_last - t_first) if (t_first and t_last and t_last > t_first) else None
-    return {
+    result = {
         "t_send_wall": time.time() - (t_done - t_send),
         "ttft_s": round(ttft, 4) if ttft else None,
         "decode_wall_s": round(decode_wall, 4) if decode_wall else None,
@@ -122,13 +162,25 @@ def stream_chat(base: str, model: str, messages: list[dict], max_tokens: int,
         "cached_tokens": (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0),
         "server_response_s": usage.get("response_time"),
         "server_tps": usage.get("response_token/s"),
-        "engine": usage.get("freetoken"),
+        "engine": usage.get("freetoken") or _engine_from_timings(timings),
+        "timings": timings,
         "finish_reason": finish_reason,
         "stream_events": n_events,
         "output_sha256": out_sha.hexdigest(),
         "output_chars": out_len,
         "output_head": "".join(head)[:160],
     }
+    if captured_choices is not None:
+        # Keep the existing hash/text selection (content or reasoning per delta),
+        # while also retaining both channels and every raw choice delta losslessly.
+        result["_captured_output"] = {
+            "text": "".join(captured_text),
+            "content": "".join((ch.get("delta") or {}).get("content") or "" for ch in captured_choices),
+            "reasoning_content": "".join((ch.get("delta") or {}).get("reasoning_content") or ""
+                                         for ch in captured_choices),
+            "deltas": captured_choices,
+        }
+    return result
 
 
 # ------------------------------------------------------------------ server info
@@ -149,7 +201,7 @@ def server_info(base: str) -> dict[str, Any]:
                 info["server_cmdline"] = f.read().replace("\0", " ").strip()
             with open(f"/proc/{pid[0]}/environ", "rb") as f:
                 env = f.read().decode(errors="replace").split("\0")
-            info["server_env"] = sorted(e for e in env if e.startswith("FREETOKEN_"))
+            info["server_env"] = sorted(e for e in env if e.startswith(("FREETOKEN_", "PYTHONPATH=")))
     except Exception as e:
         info["server_cmdline_error"] = str(e)
     return info
@@ -199,6 +251,8 @@ class Runner:
                     except Exception:
                         pass
         self.variant = args.variant
+        self.server = args.server
+        self.capture_output = getattr(args, "capture_output", False)
         self.model = args.model
         if self.model in (None, "auto"):
             self.model = _get(f"{self.base}/models")["data"][0]["id"]
@@ -210,31 +264,68 @@ class Runner:
         # by a constant (template edge merges), later builds for that target compensate.
         self.target_bias: dict[int, int] = {}
         self.stats_url = f"{self.base}/stats"
+        try:
+            self.server_instance = _get(self.base.rsplit("/v1", 1)[0] + "/health").get("instance_id")
+        except Exception:
+            self.server_instance = None
+
+    def _body(self, *, cache: bool) -> dict | None:
+        """Server-specific request fields.
+
+        llama.cpp reuses a slot's prompt prefix unless told otherwise, which would silently
+        turn a cold run warm; the cache suite's warm modes need the opposite. FreeToken
+        ignores the unknown field (its request models allow extras), so one code path serves
+        both servers.
+        """
+        return {"cache_prompt": cache} if self.server == "llamacpp" else None
 
     # ---------------- record helpers
+    def _store_output(self, key: str, result: dict | None) -> None:
+        if not result or "_captured_output" not in result:
+            return
+        capture = result.pop("_captured_output")
+        directory = os.path.join(self.out, "outputs")
+        os.makedirs(directory, exist_ok=True)
+        # Hash the full key to avoid sanitized-path collisions; a unique suffix
+        # preserves orphaned captures if a run stops before appending its JSONL row.
+        name = f"{hashlib.sha256(key.encode()).hexdigest()}-{uuid.uuid4().hex}.json"
+        relative = os.path.join("outputs", name)
+        artifact = {"schema_version": 1, "record_key": key,
+                    "output_sha256": result["output_sha256"], "output_chars": result["output_chars"],
+                    **capture}
+        with open(os.path.join(self.out, relative), "x", encoding="utf-8") as f:
+            json.dump(artifact, f, ensure_ascii=False)
+            f.write("\n")
+        result["output_artifact"] = relative
+
     def _append(self, rec: dict) -> None:
+        self._store_output(rec["key"], rec.get("result"))
+        for index, result in enumerate(rec.get("requests") or []):
+            self._store_output(f"{rec['key']}/request/{index}", result)
         with open(self.runs_path, "a") as f:
             f.write(json.dumps(rec) + "\n")
         self.done.add(rec["key"])
 
-    def _prompt(self, family: str, target: int, seed: int, nonce: str):
+    def _prompt(self, family: str, target: int, seed: int, nonce: str, **kwargs):
         bias = self.target_bias.get(target, 0)
-        return self.fitter.build(family, target - bias, seed, nonce)
+        return self.fitter.build(family, target - bias, seed, nonce, **kwargs)
 
     def _learn_bias(self, target: int, expected: int, actual: int) -> None:
-        err = actual - expected
-        if err:
-            self.target_bias[target] = self.target_bias.get(target, 0) + err
+        # ``expected`` already reflects the previous correction. The difference
+        # is the server's template offset itself, not an increment to that offset.
+        self.target_bias[target] = actual - expected
 
     def measure(self, key: str, family: str, target: int, out_tokens: int, seed: int,
                 temperature: float = 0.0, extra: dict | None = None,
-                telemetry: bool = True) -> dict | None:
+                telemetry: bool = True, sampling: dict | None = None,
+                task: str | None = None, nonce: str | None = None,
+                server_log: str | None = None) -> dict | None:
         if key in self.done:
             print(f"skip (done): {key}", flush=True)
             return None
-        nonce = f"{key}-{uuid.uuid4().hex[:8]}"
+        nonce = nonce or f"{key}-{uuid.uuid4().hex[:8]}"
         t_build = time.monotonic()
-        prompt = self._prompt(family, target, seed, nonce)
+        prompt = self._prompt(family, target, seed, nonce, **({"task": task} if task else {}))
         build_s = time.monotonic() - t_build
         sampler = None
         if telemetry:
@@ -242,11 +333,14 @@ class Runner:
             sampler = TelemetrySampler(tp, stats_url=self.stats_url).start()
             sampler.mark("send")
         geo_before = geometry(self.base)
+        log_offset = os.path.getsize(server_log) if server_log else None
         t0 = time.time()
         try:
             res = stream_chat(self.base, self.model, prompt.messages(), out_tokens,
                               temperature=temperature,
-                              timeout=max(900.0, target / 800 + out_tokens / 20))
+                              extra_body={**(self._body(cache=False) or {}), **(sampling or {})},
+                              timeout=max(900.0, target / 800 + out_tokens / 20),
+                              capture_output=self.capture_output)
         except Exception as e:
             res = {"error": f"{type(e).__name__}: {e}"}
         if sampler:
@@ -261,7 +355,13 @@ class Runner:
             "prompt": prompt.record(), "prompt_build_s": round(build_s, 2),
             "result": res, "telemetry": tele, "extra": extra or {},
             "geometry_before": geo_before, "geometry_after": geometry(self.base),
+            "server_instance": self.server_instance,
         }
+        if sampling is not None:
+            rec["sampling"] = {"temperature": temperature, **sampling}
+        if server_log:
+            from .mixed import read_moe_windows
+            rec["moe_windows"] = read_moe_windows(server_log, log_offset)
         if "prompt_tokens" in res and res.get("prompt_tokens"):
             self._learn_bias(target, prompt.expected_prompt_tokens, res["prompt_tokens"])
         self._append(rec)
@@ -311,7 +411,9 @@ class Runner:
         geo_before = geometry(self.base)
         try:
             res = stream_chat(self.base, self.model, [{"role": "user", "content": text}],
-                              out_tokens, timeout=900)
+                              out_tokens, timeout=900,
+                              extra_body=self._body(cache=mode != "cold"),
+                              capture_output=self.capture_output)
         except Exception as e:
             res = {"error": f"{type(e).__name__}: {e}"}
         tele = sampler.stop()
@@ -407,7 +509,9 @@ class Runner:
                     t0 = time.monotonic()
                     try:
                         results[j] = stream_chat(self.base, self.model, prompts[j].messages(),
-                                                 out_tokens, timeout=1800)
+                                                 out_tokens, timeout=1800,
+                                                 extra_body=self._body(cache=False),
+                                                 capture_output=self.capture_output)
                     except Exception as e:
                         results[j] = {"error": f"{type(e).__name__}: {e}"}
                     times[j] = (t0, time.monotonic())
@@ -526,7 +630,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--suite", required=True,
                     choices=["primary", "context", "prefill", "cache", "mtp", "concurrency",
-                             "smoke", "warmup"])
+                             "smoke", "warmup", "mixed"])
     ap.add_argument("--base", default=DEFAULT_BASE)
     ap.add_argument("--model", default="auto")
     ap.add_argument("--model-path", default=os.environ.get(
@@ -538,12 +642,25 @@ def main() -> None:
     ap.add_argument("--runs", type=int, default=None)
     ap.add_argument("--levels", default="1,2,4,8")
     ap.add_argument("--no-warmup", action="store_true")
+    ap.add_argument("--capture-output", action="store_true",
+                    help="save complete successful measured outputs and stream deltas under OUT/outputs; default off")
+    ap.add_argument("--contexts", default="4096,32768,131072,253952",
+                    help="comma-separated input token counts for --suite mixed")
+    ap.add_argument("--kinds", default="code,english,japanese", help="mixed content families")
+    ap.add_argument("--sampling-modes", default="greedy,sampled", help="mixed sampling modes")
+    ap.add_argument("--output-tokens", type=int, default=4096, help="mixed generation length")
+    ap.add_argument("--boot-id", default="1", help="mixed repetition/boot identity")
+    ap.add_argument("--server-log", help="read existing MoE diagnostic windows; no extra engine sync")
+    ap.add_argument("--server", default="freetoken", choices=["freetoken", "llamacpp"],
+                    help="which engine is being measured; selects server-specific request "
+                         "fields (llama.cpp needs cache_prompt=false for cold-prefix runs)")
     args = ap.parse_args()
 
     runner = Runner(args)
     print(f"model={runner.model} base={args.base} variant={args.variant} "
           f"template_overhead={runner.overhead}", flush=True)
-    meta_path = os.path.join(args.out, f"meta-{args.suite}-{args.variant}.json")
+    boot_suffix = f"-boot{args.boot_id}" if args.suite == "mixed" else ""
+    meta_path = os.path.join(args.out, f"meta-{args.suite}-{args.variant}{boot_suffix}.json")
     with open(meta_path, "w") as f:
         json.dump(collect_metadata(args, runner), f, indent=1)
     print(f"metadata -> {meta_path}", flush=True)
@@ -566,6 +683,9 @@ def main() -> None:
         runner.suite_concurrency(tuple(int(x) for x in args.levels.split(",")))
     elif args.suite == "smoke":
         runner.suite_smoke()
+    elif args.suite == "mixed":
+        from .mixed import run_mixed
+        run_mixed(runner, args)
     print("suite complete", flush=True)
 
 

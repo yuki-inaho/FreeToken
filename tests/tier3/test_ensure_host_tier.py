@@ -158,3 +158,73 @@ def test_tier_off_is_byte_identical_to_before():
         assert torch.equal(on.slot_for_id, off.slot_for_id)
         n = int(off.num_indices.item())
         assert torch.equal(on.src_indices[:n], off.src_indices[:n])
+
+
+# ---- dropped routes (`-1` in topk_ids) ------------------------------------------------------
+#
+# The table-driven residency policy can DROP a routed expert instead of substituting one, by
+# writing -1 into topk_ids and 0 into the weight. `-1` was already the "no expert" value
+# everywhere on this path except the ensure step, which is the one place that turns an expert id
+# into a slot: Phase 3's gather is masked by lane occupancy, not by the id, so `-1` read
+# slot_for_id[base - 1] -- the previous layer's last expert, or out of bounds at layer 0.
+
+@cuda
+@pytest.mark.parametrize("seed", [0, 3])
+def test_dropped_routes_are_never_fetched_or_activated(seed):
+    gpu, ref = _cache("cuda"), _cache("cpu")
+    resident = _resident_map(seed)
+    _attach_host_map(gpu, resident)
+    _attach_host_map(ref, resident)
+
+    rng = torch.Generator().manual_seed(seed + 500)
+    saw_drop = 0
+    for _ in range(48):
+        ids = torch.randperm(NUM_EXPERTS, generator=rng)[:TOP_K].to(torch.int32)
+        # drop one or two routes, as the policy would
+        n_drop = 1 + int(torch.randint(0, 2, (1,), generator=rng).item())
+        dropped = sorted(torch.randperm(TOP_K, generator=rng)[:n_drop].tolist())
+        kept = [int(ids[j]) for j in range(TOP_K) if j not in dropped]
+        for j in dropped:
+            ids[j] = -1
+        saw_drop += n_drop
+
+        g, c = ids.clone().cuda(), ids.clone()
+        gpu.ensure_experts_hybrid(0, g)
+        ref.ensure_experts_hybrid(0, c)
+
+        # the mirror must agree, which is the property the whole tier-3 path is tested on
+        assert torch.equal(g.cpu(), c), "slot rewrite diverged on a dropped route"
+        assert torch.equal(gpu.slot_for_id.cpu(), ref.slot_for_id.cpu())
+        assert torch.equal(gpu.id_of_slot.cpu(), ref.id_of_slot.cpu())
+        assert torch.equal(gpu.usage.cpu(), ref.usage.cpu())
+
+        # a dropped lane stays -1: no slot, so no GEMV
+        for j in dropped:
+            assert int(g[j].item()) == -1, "a dropped route was given a slot"
+        # and it never became active, so it can never be selected for a PCIe gather
+        act = gpu.active_mask.cpu()
+        assert int(act[NUM_EXPERTS - 1]) == (1 if (NUM_EXPERTS - 1) in kept else 0), (
+            "the LAST expert was marked active by a -1 route (negative index wrap)")
+        n = int(gpu.num_indices.item())
+        for row in gpu.src_indices[:n].cpu().tolist():
+            assert 0 <= row < HOST_SLOTS, row
+    assert saw_drop > 0
+
+
+@cuda
+def test_ensure_is_unchanged_when_no_route_is_dropped():
+    """The regression guard on the Phase-3 edit: with no -1 present the rewrite must be exactly
+    what it was, or every measurement taken before the drop policy existed is invalidated."""
+    gpu, ref = _cache("cuda"), _cache("cpu")
+    resident = _resident_map(2)
+    _attach_host_map(gpu, resident)
+    _attach_host_map(ref, resident)
+    rng = torch.Generator().manual_seed(909)
+    for _ in range(64):
+        ids = torch.randperm(NUM_EXPERTS, generator=rng)[:TOP_K].to(torch.int32)
+        g, c = ids.clone().cuda(), ids.clone()
+        gpu.ensure_experts_hybrid(0, g)
+        ref.ensure_experts_hybrid(0, c)
+        assert torch.equal(g.cpu(), c)
+        assert torch.equal(gpu.slot_for_id.cpu(), ref.slot_for_id.cpu())
+        assert torch.equal(gpu.usage.cpu(), ref.usage.cpu())

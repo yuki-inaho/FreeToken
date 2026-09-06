@@ -90,6 +90,9 @@ class Req:
     stat_spec_steps: int = 0
     stat_draft_tokens: int = 0
     stat_accepted_tokens: int = 0
+    # Opt-in host-side positional counts; allocated only when
+    # FREETOKEN_SPEC_POSITION_STATS=1 and a verify round drains.
+    stat_spec_positions: dict | None = None
     stat_prefill_s: float | None = None
     stat_first_token_t: float | None = None
 

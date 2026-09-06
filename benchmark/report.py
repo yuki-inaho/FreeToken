@@ -4,7 +4,7 @@ Usage: python -m benchmark.report <results-dir> [--plots-dir <dir>]
 
 Reads every record (after ``validate.py`` has stamped ``valid``/``flags``), writes:
     <dir>/summary.csv          one flattened row per measured request
-    <dir>/summary_agg.csv      per-(suite, variant, context) aggregates
+    <dir>/summary_agg.csv      per-(suite, variant, context) aggregates; mixed also splits content/sampling
     <dir>/report.md            the full report (12 sections + headline)
     <plots>/*.png              scaling and utilization graphs (linear axes, zero-based)
 """
@@ -110,15 +110,23 @@ def derived(r):
 
 # ------------------------------------------------------------------ CSV
 def write_csvs(recs, out_dir):
+    from .mixed import eligible as mixed_eligible
+
     rows = []
     for r in recs:
         if r.get("suite") == "concurrency":
             continue
+        sampling = r.get("sampling") or {}
+        mixed = r.get("suite") == "mixed"
         row = {"key": r["key"], "suite": r.get("suite"), "variant": r.get("variant"),
                "family": r.get("family"), "target_input_tokens": r.get("target_input_tokens"),
                "requested_output_tokens": r.get("requested_output_tokens"),
                "mode": (r.get("extra") or {}).get("mode", ""),
-               "valid": r.get("valid", True), "flags": ";".join(r.get("flags", [])),
+               "sampling_mode": (r.get("extra") or {}).get("sampling_mode", ""),
+               "temperature": sampling.get("temperature", r.get("temperature")),
+               "top_k": sampling.get("top_k"), "top_p": sampling.get("top_p"),
+               "valid": mixed_eligible(r) if mixed else r.get("valid", True),
+               "flags": ";".join(r.get("flags", [])),
                "prompt_sha256": (r.get("prompt") or {}).get("sha256", "")}
         row.update(derived(r))
         rows.append(row)
@@ -132,12 +140,18 @@ def write_csvs(recs, out_dir):
     agg = defaultdict(list)
     for r in recs:
         if r.get("suite") != "concurrency" and r.get("valid") is not False and "error" not in _res(r):
+            mixed = r.get("suite") == "mixed"
+            if mixed and not mixed_eligible(r):
+                continue
             agg[(r.get("suite"), r.get("variant"), r.get("target_input_tokens"),
-                 (r.get("extra") or {}).get("mode", ""))].append(r)
+                 (r.get("extra") or {}).get("mode", ""),
+                 r.get("family") if mixed else None,
+                 (r.get("extra") or {}).get("sampling_mode") if mixed else None)].append(r)
     arows = []
-    for (suite, variant, ctx, mode), rs in sorted(agg.items(), key=lambda kv: str(kv[0])):
+    for (suite, variant, ctx, mode, family, sampling_mode), rs in sorted(agg.items(), key=lambda kv: str(kv[0])):
         ds = [derived(r) for r in rs]
-        row = {"suite": suite, "variant": variant, "ctx": ctx, "mode": mode, "n": len(rs)}
+        row = {"suite": suite, "variant": variant, "ctx": ctx, "mode": mode,
+               "family": family, "sampling_mode": sampling_mode, "n": len(rs)}
         for m in ("decode_tps", "ttft_s", "tpot_ms", "raw_prefill_tps", "effective_prefill_tps",
                   "tokens_per_step", "accept_rate", "gpu_util_mean", "gpu_power_w_mean"):
             st = stats([d.get(m) for d in ds])
@@ -268,6 +282,19 @@ def _plot_bars(pairs, ylabel, title, path):
 
 # ------------------------------------------------------------------ report
 def render_report(recs, meta, out_dir, plots_dir):
+    mixed_count = sum(r.get("suite") == "mixed" for r in recs)
+    # Mixed results have their own sampling-aware scoring and matrix validation. Do
+    # not let them select the legacy variant, inflate its peak or supply findings.
+    recs = [r for r in recs if r.get("suite") != "mixed"]
+    mixed_link = (f"{mixed_count} mixed-suite records are scored separately in the "
+                  "[mixed decode report](mixed-report.md), with content families and "
+                  "greedy/sampled settings kept separate. Matrix completeness and throughput "
+                  "are reported there; quality and regression gates are assessed separately.")
+    if mixed_count and not recs:
+        with open(os.path.join(out_dir, "report.md"), "w") as f:
+            f.write("# FreeToken benchmark report\n\n" + mixed_link
+                    + "\n\nNo legacy primary-suite runs were recorded; no legacy headline is reported.\n")
+        return None
     lines: list[str] = []
     add = lines.append
     variants = sorted({r.get("variant") for r in recs if r.get("variant")})
@@ -305,6 +332,9 @@ def render_report(recs, meta, out_dir, plots_dir):
         f"`runs.jsonl`, per-run telemetry in `telemetry/`, machine-readable summaries in "
         f"`summary.csv` / `summary_agg.csv`._")
     add("")
+    if mixed_count:
+        add(mixed_link)
+        add("")
     add("## 1. Executive summary")
     add("")
     if headline:
@@ -754,6 +784,10 @@ def main() -> None:
         n: ((m.get("server") or {}).get("server_cmdline") or "")[-260:] for n, m in metas.items()
     }
     write_csvs(recs, args.out_dir)
+    if any(r.get("suite") == "mixed" for r in recs):
+        from .mixed import write_report as write_mixed_report
+
+        print(f"mixed report -> {write_mixed_report(args.out_dir)}")
     headline = render_report(recs, meta, args.out_dir, plots)
     print(f"report -> {os.path.join(args.out_dir, 'report.md')}")
     if headline:

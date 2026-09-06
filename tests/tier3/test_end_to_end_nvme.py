@@ -216,3 +216,56 @@ def test_the_executor_owns_the_residency_map(tmp_path):
     ex.decode(LAYER, hidden, w, ids)
     torch.cuda.synchronize()
     assert tier3_stats(ex)["nvme_fetches"] > 0
+
+
+@cuda
+def test_a_routed_hit_is_never_evicted_by_a_miss_in_the_same_step(tmp_path):
+    """Resolving a layer used to be one pass over the routed ids, so a miss at position i could
+    evict the slot of a HIT at position j > i: the hit's LRU stamp was still its old one when
+    the victim search ran.
+
+    Two consequences. The loop re-read that expert from disk when it reached it -- a read the
+    step had already paid for. And the slot it freed is one the GPU may be gathering from over
+    UVA right now (the routing pack's exclusion list, which was meant to cover exactly this, is
+    never populated, so the resolver always runs with n_excl == 0).
+
+    Stamping and claiming every resident routed expert BEFORE choosing any victim fixes both,
+    and the extra fetch is what makes it observable from here.
+    """
+    dev = torch.device("cuda")
+    slots = 12
+    gu, dn = _weights(seed=77)
+    ftw = _write_ftw(tmp_path, gu, dn)
+    sources, _keep = _pool_banks(slots)
+    ex = _executor(_cache(sources, E), 1, dev)
+    split = host_bank_split({"gate_up": 2 * I * H * 2, "down": H * I * 2})
+    handle = enable_cpu_tier3(ex, sources, ftw, split, num_layers=L, num_experts=E,
+                              host_slots=slots, readers=4)
+
+    hidden = torch.randn(1, H).to(dev, torch.bfloat16)
+    w = torch.full((1, TOP_K), 0.5, device=dev, dtype=torch.float32)
+
+    def step(expert_ids):
+        ex.decode(LAYER, hidden, w,
+                  torch.tensor([expert_ids], device=dev, dtype=torch.int32))
+        torch.cuda.synchronize()
+
+    # Fill the pool exactly, oldest first: experts 0-2 end up the least recently used.
+    for base in range(0, slots, TOP_K):
+        step([base, base + 1, base + 2])
+    assert int(handle.host_slot_for_id[LAYER].ge(0).sum()) == slots
+    assert handle.host_slot_for_id[LAYER][0].item() >= 0, "expert 0 must be resident and LRU"
+
+    # Two misses and one resident expert, the resident one LAST in the routed order: the misses
+    # need victims and expert 0 is the least recently used slot they would pick.
+    before = tier3_stats(ex)["nvme_fetches"]
+    step([20, 21, 0])
+    fetched = tier3_stats(ex)["nvme_fetches"] - before
+
+    assert fetched == 2, (
+        f"expected the two genuine misses only, got {fetched} -- a routed hit was evicted "
+        "and re-read within its own step"
+    )
+    assert handle.host_slot_for_id[LAYER][0].item() >= 0, "the routed hit was evicted"
+    for e in (20, 21, 0):
+        assert handle.host_slot_for_id[LAYER][e].item() >= 0, f"expert {e} not resident after"

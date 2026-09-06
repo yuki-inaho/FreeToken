@@ -18,9 +18,14 @@ store and ring store are bit-identical).
 """
 from __future__ import annotations
 
+import os
+
 import torch
 import triton
 import triton.language as tl
+
+_PARALLEL_HEADS = os.getenv("FREETOKEN_QSA_PARALLEL_HEADS", "1") != "0"
+_DIRECT_PERMUTE = os.getenv("FREETOKEN_QSA_DIRECT_PERMUTE", "1") != "0"
 
 
 @triton.jit
@@ -53,6 +58,7 @@ def _qsa_index_write_kernel(
     KV_HEADS: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_KV: tl.constexpr,
     Q_HEADS: tl.constexpr, IDX_DIM: tl.constexpr, BLOCK_I: tl.constexpr,
     RING_CAPACITY: tl.constexpr, RATIO: tl.constexpr, ROTARY_HALF: tl.constexpr,
+    DIRECT_PERMUTE: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     live = row < num_rows
@@ -119,10 +125,12 @@ def _qsa_index_write_kernel(
     partner = tl.where(in_rot, partner, dims)
     kw = tl.load(k_norm_w_ptr + dims, mask=in_dim, other=0.0).to(tl.float32) + 1.0
     kw_p = tl.load(k_norm_w_ptr + partner, mask=in_dim, other=0.0).to(tl.float32) + 1.0
-    # the partner lanes of the pooled row: gather via a second masked reduction-free path --
-    # pooled lives in registers, so rebuild the partner permutation with a tiny exchange:
-    # NeoX halves swap = (dims + ROTARY_HALF) % (2*ROTARY_HALF) within the rotary span.
-    pooled_partner = tl.sum(tl.where(dims[None, :] == partner[:, None], pooled[None, :], 0.0), axis=1)
+    # Pooled values already live in registers: gather the NeoX partner directly, without
+    # materializing the former [BLOCK_I, BLOCK_I] equality matrix and reduction.
+    if DIRECT_PERMUTE:
+        pooled_partner = tl.gather(pooled, partner, axis=0)
+    else:
+        pooled_partner = tl.sum(tl.where(dims[None, :] == partner[:, None], pooled[None, :], 0.0), axis=1)
     cbase = cos_sin_ptr + first_position.to(tl.int64) * stride_cos_sin_row
     cos = tl.load(cbase + pair, mask=live & in_rot, other=1.0)
     sin = tl.load(cbase + ROTARY_HALF + pair, mask=live & in_rot, other=0.0)
@@ -197,6 +205,7 @@ def qsa_index_write_fused(
         KV_HEADS=kv_heads, HEAD_DIM=head_dim, BLOCK_KV=triton.next_power_of_2(head_dim),
         Q_HEADS=q_heads, IDX_DIM=idx_dim, BLOCK_I=triton.next_power_of_2(idx_dim),
         RING_CAPACITY=ring.shape[1], RATIO=ratio, ROTARY_HALF=rotary_dim // 2,
+        DIRECT_PERMUTE=_DIRECT_PERMUTE,
         num_warps=4,
     )
 
@@ -207,9 +216,12 @@ def _qk_norm_rope_kernel(
     stride_q_row, stride_k_row, stride_cos_sin_row, num_rows,
     Q_HEADS: tl.constexpr, KV_HEADS: tl.constexpr, HEAD_DIM: tl.constexpr,
     BLOCK_D: tl.constexpr, ROTARY_HALF: tl.constexpr,
+    PARALLEL_HEADS: tl.constexpr,
 ):
-    """Attention-side per-head (1+w) RMSNorm + partial NeoX rope of q [T, Q_HEADS, D] and
-    k [T, KV_HEADS, D], IN PLACE, one program per token row (replaces q_norm + k_norm + rope)."""
+    """In-place per-head (1+w) RMSNorm + NeoX rope; parallel heads keep one head per CTA.
+
+    The ablation path runs all heads in one program per token, preserving its original math.
+    """
     row = tl.program_id(0).to(tl.int64)
     live = row < num_rows
     dims = tl.arange(0, BLOCK_D)
@@ -227,18 +239,22 @@ def _qk_norm_rope_kernel(
     kw = tl.load(kw_ptr + dims, mask=in_dim, other=0.0).to(tl.float32) + 1.0
     kw_p = tl.load(kw_ptr + partner, mask=in_dim, other=0.0).to(tl.float32) + 1.0
     m = live & in_dim
-    for h in tl.static_range(Q_HEADS):
-        base = q_ptr + row * stride_q_row + h * HEAD_DIM
-        x = tl.load(base + dims, mask=m, other=0.0).to(tl.float32)
-        xp = tl.load(base + partner, mask=m, other=0.0).to(tl.float32)
-        y = _norm_rope_row(x, qw, qw_p, xp, cos, sin, dims, eps, HEAD_DIM, ROTARY_HALF)
-        tl.store(base + dims, y.to(q_ptr.dtype.element_ty), mask=m)
-    for h in tl.static_range(KV_HEADS):
-        base = k_ptr + row * stride_k_row + h * HEAD_DIM
-        x = tl.load(base + dims, mask=m, other=0.0).to(tl.float32)
-        xp = tl.load(base + partner, mask=m, other=0.0).to(tl.float32)
-        y = _norm_rope_row(x, kw, kw_p, xp, cos, sin, dims, eps, HEAD_DIM, ROTARY_HALF)
-        tl.store(base + dims, y.to(k_ptr.dtype.element_ty), mask=m)
+    for i in tl.static_range(1 if PARALLEL_HEADS else Q_HEADS):
+        h = tl.program_id(1) if PARALLEL_HEADS else i
+        if not PARALLEL_HEADS or h < Q_HEADS:
+            base = q_ptr + row * stride_q_row + h * HEAD_DIM
+            x = tl.load(base + dims, mask=m, other=0.0).to(tl.float32)
+            xp = tl.load(base + partner, mask=m, other=0.0).to(tl.float32)
+            y = _norm_rope_row(x, qw, qw_p, xp, cos, sin, dims, eps, HEAD_DIM, ROTARY_HALF)
+            tl.store(base + dims, y.to(q_ptr.dtype.element_ty), mask=m)
+    for i in tl.static_range(1 if PARALLEL_HEADS else KV_HEADS):
+        h = tl.program_id(1) - Q_HEADS if PARALLEL_HEADS else i
+        if not PARALLEL_HEADS or h >= 0:
+            base = k_ptr + row * stride_k_row + h * HEAD_DIM
+            x = tl.load(base + dims, mask=m, other=0.0).to(tl.float32)
+            xp = tl.load(base + partner, mask=m, other=0.0).to(tl.float32)
+            y = _norm_rope_row(x, kw, kw_p, xp, cos, sin, dims, eps, HEAD_DIM, ROTARY_HALF)
+            tl.store(base + dims, y.to(k_ptr.dtype.element_ty), mask=m)
 
 
 def qsa_qk_norm_rope_fused(q, k, positions, cos_sin, q_norm_weight, k_norm_weight, eps) -> None:
@@ -250,11 +266,12 @@ def qsa_qk_norm_rope_fused(q, k, positions, cos_sin, q_norm_weight, k_norm_weigh
     assert cos_sin.is_contiguous() and cos_sin.shape[1] % 2 == 0 and cos_sin.shape[1] <= d
     if T == 0:
         return
-    _qk_norm_rope_kernel[(T,)](
+    _qk_norm_rope_kernel[(T, hq + hk if _PARALLEL_HEADS else 1)](
         q, k, positions, cos_sin, q_norm_weight, k_norm_weight, float(eps),
         q.stride(0), k.stride(0), cos_sin.stride(0), T,
         Q_HEADS=hq, KV_HEADS=hk, HEAD_DIM=d, BLOCK_D=triton.next_power_of_2(d),
         ROTARY_HALF=cos_sin.shape[1] // 2, num_warps=4,
+        PARALLEL_HEADS=_PARALLEL_HEADS,
     )
 
 

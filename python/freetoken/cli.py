@@ -17,6 +17,7 @@ Commands:
   launch      Configure and launch an agent against a FreeToken server
   checkpoint  Convert an HF safetensors checkpoint to FTW
   bench       Run a micro-benchmark (e.g. "bench bw" = CPU vs PCIe bandwidth)
+  moe         MoE offline artifacts (e.g. "moe subst" = the expert substitution table)
 
 Use "ft <command> --help" for command-specific options.
 Use "ft --version" to print the FreeToken version.""",
@@ -90,6 +91,36 @@ def _run_bench(argv: list[str]) -> int:
     return 2
 
 
+def _print_moe_help(file: TextIO) -> None:
+    print(
+        """usage: ft moe <subcommand> [args]
+
+Subcommands:
+  subst           Build the expert substitution table from a checkpoint + route dumps
+  subst-report    Summarise a built table
+
+Use "ft moe <subcommand> --help" for subcommand-specific options.""",
+        file=file,
+    )
+
+
+def _run_moe(argv: list[str]) -> int:
+    if not argv:
+        _print_moe_help(sys.stderr)
+        return 2
+    sub = argv[0]
+    if sub in {"-h", "--help"}:
+        _print_moe_help(sys.stdout)
+        return 0
+    if sub in {"subst", "subst-report"}:
+        from freetoken.moe.subst_main import main
+
+        return main([sub, *argv[1:]], prog=f"ft moe {sub}")
+    print(f"unknown ft moe subcommand: {sub}", file=sys.stderr)
+    _print_moe_help(sys.stderr)
+    return 2
+
+
 COMMANDS = {
     "serve": "_run_serve",
     "shell": "_run_shell",
@@ -98,6 +129,7 @@ COMMANDS = {
     "launch": "_run_launch",
     "checkpoint": "_run_checkpoint",
     "bench": "_run_bench",
+    "moe": "_run_moe",
 }
 
 

@@ -24,6 +24,8 @@ _SMALL_CONV = os.getenv("FREETOKEN_GDN_SMALL_CONV", "1") != "0"
 # Decode: the GDN in_proj_qkvz GEMV carries in_proj_ba as a second segment of the same launch
 # (fp8_pertensor_linear.rows_gemv_direct_pair). FREETOKEN_ROWS_GEMV_PAIR=0 restores the separate launches.
 _ROWS_GEMV_PAIR = os.getenv("FREETOKEN_ROWS_GEMV_PAIR", "1") != "0"
+# Keep the output gate's token stride instead of copying the qkvz slice to flatten heads.
+_STRIDED_NORM = os.getenv("FREETOKEN_GDN_STRIDED_NORM", "1") != "0"
 
 
 _GATE_ACTIVATIONS = ("silu", "swish", "sigmoid")
@@ -51,12 +53,13 @@ class _GatedRMSNorm(BaseOP):
         self.eps = eps
         self.activation = activation
 
-    def forward(self, x: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, z: torch.Tensor, group_size=None) -> torch.Tensor:
         from freetoken.kernel.fla import rms_norm_gated
 
         return rms_norm_gated(
             x=x, weight=self.weight, bias=None, z=z, eps=self.eps,
             is_rms_norm=True, norm_before_gate=True, activation=self.activation,
+            group_size=group_size,
         )
 
 
@@ -305,9 +308,18 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
             else:
                 core_out = result
 
-        core_out = core_out.reshape(-1, self.head_v_dim)
-        z = z.reshape(-1, self.head_v_dim)
-        out = self.norm.forward(core_out, z).reshape(total, -1)
+        if _STRIDED_NORM and batch.is_decode and total <= 4:
+            # z has [token, head, dim] strides [qkvz_width, head_dim, 1]. Flattening
+            # token/head copies it when T > 1; grouping [T, value_dim] leaves it a view.
+            out = self.norm.forward(
+                core_out.reshape(total, self.value_dim),
+                z.reshape(total, self.value_dim),
+                group_size=self.head_v_dim,
+            )
+        else:
+            core_out = core_out.reshape(-1, self.head_v_dim)
+            z = z.reshape(-1, self.head_v_dim)
+            out = self.norm.forward(core_out, z).reshape(total, -1)
         return self.out_proj.forward(out)
 
 

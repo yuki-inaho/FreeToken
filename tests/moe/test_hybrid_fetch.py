@@ -86,7 +86,10 @@ def test_profile_lookup_prefers_the_gpu_uuid_file(tmp_path, monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-def test_hybrid_fraction_gpu_matches_cpu_reference():
+def test_hybrid_fraction_gpu_matches_cpu_reference(monkeypatch):
+    # Keep the original per-call balance contract covered independently of the
+    # amortized admission policy, which intentionally lifts a rounded zero cap.
+    monkeypatch.setattr("freetoken.moe.offload_kernels._HYBRID_ADMISSION_CREDIT", False)
     torch.manual_seed(0)
     num_experts, cache_size, top_k, frac = 32, 40, 8, 0.415
 
@@ -137,3 +140,175 @@ def test_hybrid_fixed_cap_unchanged():
     cache.ensure_experts_hybrid(0, ids)
     assert int(cache.num_missing_full.item()) == 8
     assert int(cache.num_indices.item()) == 1
+
+
+_ROOMY_FRACTION = 39.67 / (39.67 + 90.55)
+_ROOMY_Q16 = round(_ROOMY_FRACTION * Q)
+_DEVICES = ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="needs CUDA"))]
+
+
+def _admission_cache(device, *, frac=_ROOMY_FRACTION, max_fetch=32):
+    cache = OffloadMoeCache(
+        num_layers=2, num_experts=32, cache_size=40,
+        device=torch.device(device), quant_format="bf16", decode_target="hybrid",
+        hybrid_max_fetch=max_fetch, hybrid_fetch_fraction=frac,
+    )
+    # One resident route lets hit-only calls exercise paused credit.
+    cache.slot_for_id[0, 0] = 0
+    cache.id_of_slot[0] = 0
+    return cache
+
+
+def _visit(cache, raw, layer=0):
+    ids = torch.tensor(raw, dtype=torch.int32, device=cache.device)
+    cpu = cache.ensure_experts_hybrid(layer, ids).clone()
+    return int(cache.num_indices.item()), ids, cpu
+
+
+@pytest.mark.parametrize("device", _DEVICES)
+@pytest.mark.parametrize("rows", [1, 4])
+@pytest.mark.parametrize("intermittent", [False, True])
+def test_recurring_singleton_admits_with_bounded_credit(device, rows, intermittent):
+    cache = _admission_cache(device)
+    fetched = []
+    for step in range(6):
+        count, ids, cpu = _visit(cache, [[0, 30]] * rows)
+        fetched.append(count)
+        credit = int(cache.hybrid_admission_credit[0].item())
+        assert 0 <= credit < Q
+        if step < 4:
+            assert (cpu[:, 1] == 30).all()
+            # Repeated token rows do not multiply distinct-expert credit.
+            assert credit == step * _ROOMY_Q16
+        else:
+            assert (cpu == -1).all()
+            assert (ids >= 0).all()
+        if intermittent:
+            _visit(cache, [[0]])
+            assert int(cache.hybrid_admission_credit[0].item()) == credit
+    assert fetched == [0, 0, 0, 0, 1, 0]
+    assert cache.hybrid_admission_credit[1].item() == 0
+
+
+@pytest.mark.parametrize("device", _DEVICES)
+def test_credit_cannot_admit_unseen_transient_misses(device):
+    cache = _admission_cache(device)
+    for _ in range(4):
+        _visit(cache, [[30]])
+    credit = int(cache.hybrid_admission_credit[0].item())
+    for expert in range(1, 20):
+        assert _visit(cache, [[expert]])[0] == 0
+        assert cache.hybrid_admission_credit[0].item() == credit
+    # A fresh lower-id candidate cannot consume the credit of the recurring one.
+    count, ids, _ = _visit(cache, [[20, 30]])
+    assert count == 1
+    assert ids[0, 0] == -1 and ids[0, 1] >= 0
+
+
+@pytest.mark.parametrize("device", _DEVICES)
+@pytest.mark.parametrize("misses", [2, 3])
+def test_small_recurring_miss_set_eventually_becomes_fully_resident(device, misses):
+    cache = _admission_cache(device)
+    raw = [list(range(32 - misses, 32))] * 4
+    counts = [_visit(cache, raw)[0] for _ in range(7)]
+    assert counts == [int(misses == 3), 0, 1, 0, 0, 1, 0]
+    assert (cache.slot_for_id[0, 32 - misses:] >= 0).all()
+
+
+@pytest.mark.parametrize("device", _DEVICES)
+def test_positive_balanced_fetch_resets_credit(device):
+    cache = _admission_cache(device)
+    for _ in range(4):
+        _visit(cache, [[30]])
+    assert cache.hybrid_admission_credit[0].item() > 0
+    # Three distinct misses already get one fetch under the original policy.
+    assert _visit(cache, [[29, 30, 31]])[0] == 1
+    assert cache.hybrid_admission_credit[0].item() == 0
+
+
+@pytest.mark.parametrize("device", _DEVICES)
+@pytest.mark.parametrize("mode", ["ablation", "fixed_zero", "fixed_one", "tier3"])
+def test_admission_preserves_disabled_fixed_and_tier3_paths(device, mode, monkeypatch):
+    if mode == "ablation":
+        monkeypatch.setattr("freetoken.moe.offload_kernels._HYBRID_ADMISSION_CREDIT", False)
+    fixed = mode.startswith("fixed")
+    cache = _admission_cache(device, frac=0.0 if fixed else _ROOMY_FRACTION,
+                             max_fetch=1 if mode == "fixed_one" else 0)
+    if mode == "tier3":
+        cache.host_slot_for_id = torch.arange(32, dtype=torch.int32).repeat(2, 1)
+        if device == "cuda":
+            cache.host_slot_dev = cache.host_slot_for_id.to(device)
+    counts = [_visit(cache, [[30]])[0] for _ in range(12)]
+    assert counts == ([1] + [0] * 11 if mode == "fixed_one" else [0] * 12)
+    assert cache.hybrid_admission_credit.count_nonzero().item() == 0
+
+
+@pytest.mark.parametrize("device", _DEVICES)
+def test_admission_credit_reset_lifecycle(device, monkeypatch):
+    cache = _admission_cache(device)
+    for _ in range(3):
+        _visit(cache, [[30]])
+    before = cache.hybrid_admission_credit.clone()
+    cache.reset_stats()
+    assert torch.equal(cache.hybrid_admission_credit, before)
+    if device == "cpu":
+        # The generic slot-cache reset only has a CUDA kernel; isolate the
+        # lifecycle of the new, device-independent credit in the CPU case.
+        monkeypatch.setattr("freetoken.moe.offload_kernels.reset_cache", lambda c: None)
+    cache.reset()
+    assert cache.hybrid_admission_credit.count_nonzero().item() == 0
+    assert (cache.expert_recency == -1).all()
+    cache.hybrid_admission_credit.fill_(12345)
+    # Tiny registered sources are sufficient to exercise a real cache rebuild.
+    cache.set_bank_sources({
+        name: [torch.zeros((32, 16), dtype=torch.bfloat16, device=cache.device) for _ in range(2)]
+        for name in cache.bank_schema
+    })
+    cache.rebuild(48)
+    assert cache.hybrid_admission_credit.count_nonzero().item() == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("recency", [False, True])
+def test_admission_cpu_gpu_parity_during_churn(recency, monkeypatch):
+    monkeypatch.setattr("freetoken.moe.offload_kernels._HYBRID_FETCH_BY_RECENCY", recency)
+    gpu, ref = _admission_cache("cuda"), _admission_cache("cpu")
+    gpu.collect_stats = ref.collect_stats = True
+    gen = torch.Generator().manual_seed(8)
+    calls = [(0, [[0, 30]] * 4), (1, [[31]])] * 6
+    calls += [(i % 2, [torch.randperm(32, generator=gen)[:(i % 7 + 1)].tolist()]) for i in range(80)]
+    calls += [(0, [[29, 30]])] * 12
+    for layer, raw in calls:
+        gf, gi, gc = _visit(gpu, raw, layer)
+        rf, ri, rc = _visit(ref, raw, layer)
+        assert gf == rf
+        assert torch.equal(gi.cpu(), ri)
+        assert torch.equal(gc.cpu(), rc)
+        for name in ("slot_for_id", "id_of_slot", "usage", "expert_recency", "hybrid_admission_credit",
+                     "stat_missing", "stat_fetched", "stat_active", "stat_calls"):
+            assert torch.equal(getattr(gpu, name).cpu(), getattr(ref, name)), name
+        assert ((gpu.hybrid_admission_credit >= 0) & (gpu.hybrid_admission_credit < Q)).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_admission_credit_advances_under_captured_replay():
+    cache = _admission_cache("cuda")
+    raw = torch.tensor([[0, 30]] * 4, dtype=torch.int32, device="cuda")
+    ids = torch.empty_like(raw)
+    # Warm compilation before capture, then start the captured sequence cold.
+    ids.copy_(raw)
+    cache.ensure_experts_hybrid(0, ids)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        ids.copy_(raw)
+        cache.ensure_experts_hybrid(0, ids)
+    cache.reset()
+    cache.slot_for_id[0, 0] = 0
+    cache.id_of_slot[0] = 0
+    counts = []
+    for _ in range(6):
+        graph.replay()
+        counts.append(int(cache.num_indices.item()))
+    assert counts == [0, 0, 0, 0, 1, 0]

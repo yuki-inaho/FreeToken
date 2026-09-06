@@ -24,6 +24,9 @@ TopK = Tuple[torch.Tensor, torch.Tensor]
 # default. Set FREETOKEN_HYBRID_OVERLAP=0 to force the serial path (CPU sync before the
 # GPU work) -- a measurement-only escape hatch to A/B the overlap benefit.
 _HYBRID_OVERLAP = os.getenv("FREETOKEN_HYBRID_OVERLAP", "1") != "0"
+# Enqueue the independent shared expert after the CPU overflow task has been submitted.
+# The shared input is consumed before routed kernels can overwrite it. No extra stream.
+_HYBRID_SHARED_OVERLAP = os.getenv("FREETOKEN_HYBRID_SHARED_OVERLAP", "1") != "0"
 # Hybrid decode (NVFP4 experts): run the demand PCIe gather on a side stream while the GEMV
 # over the already-resident routes runs, then finish the fetched routes after the join. Set
 # FREETOKEN_HYBRID_COPY_OVERLAP=0 to keep the gather serialized ahead of the GEMV (A/B knob;
@@ -233,6 +236,20 @@ class OffloadMoELayer(MoELayer):
         self.layer_id = layer_id
         self.offload_cache: OffloadMoeCache | None = None
 
+    def can_overlap_shared(self) -> bool:
+        """Whether this forward can defer a shared expert until after CPU submission."""
+        cache = self.offload_cache
+        return (
+            _HYBRID_SHARED_OVERLAP
+            and _HYBRID_OVERLAP
+            and self.tp_size == 1
+            and cache is not None
+            and cache.decode_target == "hybrid"
+            and cache.quant_format == "nvfp4"
+            and not cache.is_cpu_layer(self.layer_id)
+            and not get_global_ctx().batch.is_prefill
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -245,6 +262,14 @@ class OffloadMoELayer(MoELayer):
         with ``epilogue.result`` set; every other path ignores it and returns the routed
         output (``result`` None), so the caller applies the separate ops."""
         ctx = get_global_ctx()
+        if epilogue is not None and epilogue.shared_fn is not None and not self.can_overlap_shared():
+            # Unsupported paths can overwrite hidden_states; consume the original input
+            # before they run, even when they ignore the fused-combine epilogue.
+            epilogue.materialize_shared()
+            if epilogue.gate is None and epilogue.gate_weight is not None:
+                from freetoken.kernel.triton.moe_shared_gate import shared_gate_sigmoid
+
+                epilogue.gate = shared_gate_sigmoid(hidden_states, epilogue.gate_weight)
         if ctx.batch.is_prefill:
             final_hidden_states = self.prefill_forward(hidden_states, router_logits)
         else:
@@ -289,14 +314,21 @@ class OffloadMoELayer(MoELayer):
         return self._decode_routed(hidden_states, topk_weights, topk_ids, epilogue)
 
     def _maybe_residency_route(self, router_logits, topk_ids, topk_weights) -> None:
-        """Swap a routed expert that is not in host RAM for a near-tied one that is.
+        """Act on a routed expert whose weights are not in host RAM.
+
+        Two policies live here. With the measured table (``ft moe subst``) the expert is DROPPED,
+        gated on the fraction of the MoE block output that removes; without it, the older policy
+        substitutes the highest-logit resident expert gated on displaced routing weight.
 
         Off unless the NVMe tier is active AND --moe-residency-routing set a tau: with every
         expert resident there is nothing to substitute and this would be a pure cost. See
         kernel/triton/moe_residency_route.py -- it changes model outputs, deliberately.
         """
         cache = self.offload_cache
-        if cache is None or cache.host_tier is None or not cache.residency_route_tau:
+        if cache is None or cache.host_tier is None:
+            return
+        measured = getattr(cache, "residency_route_norm", None) is not None
+        if not measured and not cache.residency_route_tau:
             return
         if router_logits is None or not topk_ids.is_cuda:
             return
@@ -307,6 +339,14 @@ class OffloadMoELayer(MoELayer):
             router_logits, topk_ids, topk_weights, _host_map_addr(cache),
             self.layer_id, cache.num_experts, cache.residency_route_tau,
             stats=cache.residency_route_stats,
+            max_subs=getattr(cache, "residency_route_max_subs", 1),
+            tau_total=getattr(cache, "residency_route_total", 0.0),
+            norm=getattr(cache, "residency_route_norm", None),
+            y_cal=(cache.residency_route_ycal[self.layer_id]
+                   if getattr(cache, "residency_route_ycal", None) else 1.0),
+            eps=getattr(cache, "residency_route_eps", 0.0),
+            eps_total=getattr(cache, "residency_route_eps_total", 0.0),
+            drop_renorm=getattr(cache, "residency_route_drop_renorm", False),
         )
 
     def prefill_forward(
@@ -410,7 +450,7 @@ class OffloadMoELayer(MoELayer):
             routes = None
             cpu_ids = cache.ensure_experts_hybrid(self.layer_id, topk_ids, weights=topk_weights)
         gate_arg = None
-        if epilogue is not None and epilogue.shared is not None and epilogue.gate is None:
+        if epilogue is not None and epilogue.has_shared and epilogue.gate is None:
             gw = epilogue.gate_weight
             if gw is not None and executor.can_fuse_gate() and nvfp4:
                 epilogue.gate = torch.empty(hidden_states.shape[0], dtype=torch.float32, device=hidden_states.device)
@@ -423,6 +463,10 @@ class OffloadMoELayer(MoELayer):
             self.layer_id, hidden_states, topk_weights, cpu_ids, gate=gate_arg,
             routing_pack=getattr(cache, "routing_pack", None),
         )
+        if epilogue is not None:
+            # CPU overflow now runs independently. Keep shared GEMVs ahead of the routed
+            # kernels, which may reuse hidden_states as output storage on fallback paths.
+            epilogue.materialize_shared()
 
         # Measurement knob: FREETOKEN_HYBRID_OVERLAP=0 syncs the CPU pool *before* the
         # PCIe fetch + GPU GEMM, serializing the two so an A/B isolates the overlap win.

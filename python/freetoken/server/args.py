@@ -245,6 +245,74 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-residency-routing-max-subs",
+        type=int,
+        default=ServerArgs.moe_residency_routing_max_subs,
+        help=(
+            "How many of a row's host-missing experts one layer may substitute (default 1). "
+            "The NVMe cost is one read per DISTINCT expert per (layer, step), so a row that "
+            "keeps one of its two misses still pays for it -- which is why v1's 88.7%% "
+            "substitution coverage only halved the reads. Each swap is still gated on tau, and "
+            "--moe-residency-routing-total bounds their sum, so the per-token perturbation "
+            "budget does not grow with this."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-residency-routing-total",
+        type=float,
+        default=ServerArgs.moe_residency_routing_total,
+        help=(
+            "Bound on the SUM of one row's substitution displacements (0 = use tau). Only "
+            "meaningful with --moe-residency-routing-max-subs > 1."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-residency-routing-table",
+        type=str,
+        default=ServerArgs.moe_residency_routing_table,
+        help=(
+            "Expert substitution table from 'ft moe subst': auto (look beside the FTW corpus "
+            "and in the cache dir), off, or an explicit path. With a table AND "
+            "--moe-residency-routing-eps the engine DROPS a routed expert that is not in host "
+            "RAM, gated on the fraction of the MoE block output the drop moves. Measuring every "
+            "expert against every other showed no expert stands in for another (best cosine "
+            "+0.02..+0.19), so substituting a near-tied one perturbs more than removing the "
+            "route: this replaces that policy rather than tuning it."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-residency-routing-eps",
+        type=float,
+        default=ServerArgs.moe_residency_routing_eps,
+        help=(
+            "Per-action bound on ||dy||/||y||, the fraction of the MoE block output one drop is "
+            "allowed to move (0 = the measured policy is off). Unlike tau this is denominated "
+            "in what the residual stream actually sees."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-residency-routing-eps-total",
+        type=float,
+        default=ServerArgs.moe_residency_routing_eps_total,
+        help="Bound on one row's actions in quadrature (0 = use --moe-residency-routing-eps).",
+    )
+
+    parser.add_argument(
+        "--moe-residency-routing-drop-renorm",
+        action="store_true",
+        default=ServerArgs.moe_residency_routing_drop_renorm,
+        help=(
+            "Renormalise the surviving routes after a drop instead of zeroing the dropped "
+            "weight. Zeroing is L2-optimal (y - w_j E_j is already the best approximation of y "
+            "in the span of the rest), so this is for the A/B, not for use."
+        ),
+    )
+
+    parser.add_argument(
         "--kv-cache-dtype",
         type=str,
         default=ServerArgs.kv_cache_dtype,

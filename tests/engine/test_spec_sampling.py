@@ -34,7 +34,7 @@ def _reference(p, q, d, u):
     return k, p[k]
 
 
-@pytest.mark.parametrize("k", [1, 2, 4])
+@pytest.mark.parametrize("k", [1, 2, 3, 4])
 @pytest.mark.parametrize("seed", [0, 1, 2])
 def test_chain_accept_matches_sequential_reference(k, seed):
     gen = torch.Generator(device=DEV).manual_seed(seed)
@@ -76,16 +76,17 @@ def test_emitted_marginal_equals_target():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-@pytest.mark.parametrize("n", [1, 2, 3])
-def test_fused_gdn_commit_matches_torch(n):
+@pytest.mark.parametrize("n", [1, 2, 3, 4, 5])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+def test_fused_gdn_commit_matches_torch(n, dtype):
     """commit_gdn_states (one launch) == index_select + index_copy_ of the accepted row."""
     from freetoken.kernel.triton.spec_commit import commit_gdn_states
 
     torch.manual_seed(n)
-    L, K1, HV, KD, VD, SLOTS = 3, 3, 4, 16, 16, 5
+    L, K1, HV, KD, VD, SLOTS = 3, 5, 4, 16, 16, 5
     dev = torch.device("cuda")
-    gdn_states = torch.randn(L, 1, K1, HV, KD, VD, device=dev, dtype=torch.float32)
-    pool_ref = torch.randn(L, SLOTS, HV, KD, VD, device=dev, dtype=torch.float32)
+    gdn_states = torch.randn(L, 1, K1, HV, KD, VD, device=dev, dtype=dtype)
+    pool_ref = torch.randn(L, SLOTS, HV, KD, VD, device=dev, dtype=dtype)
     pool_fused = pool_ref.clone()
     num_inputs = torch.tensor([n], device=dev, dtype=torch.int32)
     slot = torch.tensor([2], device=dev, dtype=torch.int32)

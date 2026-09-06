@@ -7,6 +7,12 @@ import torch
 from .common import requires_cuda
 
 DEV = "cuda"
+# Cross the compression/ring boundary at the long input and output edges. The
+# logical positions are large; physical K/V and compressed-cache slots stay small.
+HIGH_POSITION_CASES = [
+    pytest.param(4, 253950, id="high-253952"),
+    pytest.param(4, 258045, id="high-258047"),
+]
 
 
 def _rope_cache(max_pos, rotary_dim, base=10000.0):
@@ -18,25 +24,30 @@ def _rope_cache(max_pos, rotary_dim, base=10000.0):
 
 
 @requires_cuda
-@pytest.mark.parametrize("T,start", [(1, 7), (3, 5), (4, 12), (4, 21)])
-def test_fused_index_write_matches_separate_kernels(T, start):
+@pytest.mark.parametrize("T,start", [(1, 7), (3, 5), (4, 12), (4, 21), *HIGH_POSITION_CASES])
+def test_fused_index_write_matches_separate_kernels(T, start, monkeypatch):
+    import freetoken.kernel.triton.qsa.fused_decode as fused
     from freetoken.kernel.triton.qsa import (
         qsa_compress_groups, qsa_index_norm_rope, qsa_index_write_fused, qsa_store_kv_fp8,
         qsa_store_rows,
     )
 
+    monkeypatch.setattr(fused, "_DIRECT_PERMUTE", True)
     torch.manual_seed(T * 31 + start)
     kv_heads, head_dim, idx_dim, q_heads, ratio, cap, rotary = 2, 256, 128, 4, 4, 8, 64
     slots, ring_slots_n, cmp_rows_n = 512, 3, 256
     k = torch.randn(T, kv_heads * head_dim, device=DEV, dtype=torch.bfloat16)
     v = torch.randn(T, kv_heads * head_dim, device=DEV, dtype=torch.bfloat16)
-    out_loc = torch.arange(start, start + T, device=DEV, dtype=torch.int32)
-    positions = out_loc.clone()  # position == slot for one request from 0
+    # Paged K/V slots need not equal logical RoPE positions. Retain the same
+    # compression/ring phase without allocating a context-sized K/V slab.
+    slot_start = start if start + T <= slots else 64 + start % cap
+    out_loc = torch.arange(slot_start, slot_start + T, device=DEV, dtype=torch.int32)
+    positions = torch.arange(start, start + T, device=DEV, dtype=torch.int32)
     raw_k = torch.randn(T, idx_dim, device=DEV, dtype=torch.bfloat16)
     idx_q = torch.randn(T, q_heads * idx_dim, device=DEV, dtype=torch.bfloat16)
     kw = torch.randn(idx_dim, device=DEV, dtype=torch.bfloat16) * 0.1
     qw = torch.randn(idx_dim, device=DEV, dtype=torch.bfloat16) * 0.1
-    cos_sin = _rope_cache(1024, rotary)
+    cos_sin = _rope_cache(max(1024, start + T), rotary)
     token_to_req = torch.zeros(T, device=DEV, dtype=torch.int32)
     cu_seqlens = torch.tensor([0, T], device=DEV, dtype=torch.int32)
     ring_slots = torch.tensor([1, 0, 2], device=DEV, dtype=torch.int32)  # request 0 -> ring slot 1
@@ -59,6 +70,8 @@ def test_fused_index_write_matches_separate_kernels(T, start):
     a = fresh()
     torch.manual_seed(99)
     b = fresh()
+    torch.manual_seed(99)
+    c = fresh()
     assert torch.equal(a[4], b[4])  # same ring contents
     # --- separate kernels
     kc, vc, ks, vs, ring, cmp, qo = a
@@ -71,13 +84,18 @@ def test_fused_index_write_matches_separate_kernels(T, start):
     qsa_index_norm_rope(idx_q.view(-1, idx_dim), positions, cos_sin, qw, 1e-6, qo.view(-1, idx_dim), heads=q_heads)
     # --- fused
     kc2, vc2, ks2, vs2, ring2, cmp2, qo2 = b
-    qsa_index_write_fused(
-        k=k, v=v, out_loc=out_loc, k_cache=kc2, v_cache=vc2, k_scale=ks2, v_scale=vs2,
-        raw_k=raw_k, idx_q=idx_q, q_out=qo2, ring=ring2, ring_slots=ring_slots,
-        token_to_req=token_to_req, cu_seqlens=cu_seqlens, positions=positions,
-        cmp_cache=cmp2, cmp_rows=cmp_rows, ring_rows=ring_rows, cos_sin=cos_sin,
-        k_norm_weight=kw, q_norm_weight=qw, eps=1e-6, ratio=ratio,
-    )
+
+    def run_fused(buffers):
+        kc, vc, ks, vs, ring, cmp, qo = buffers
+        qsa_index_write_fused(
+            k=k, v=v, out_loc=out_loc, k_cache=kc, v_cache=vc, k_scale=ks, v_scale=vs,
+            raw_k=raw_k, idx_q=idx_q, q_out=qo, ring=ring, ring_slots=ring_slots,
+            token_to_req=token_to_req, cu_seqlens=cu_seqlens, positions=positions,
+            cmp_cache=cmp, cmp_rows=cmp_rows, ring_rows=ring_rows, cos_sin=cos_sin,
+            k_norm_weight=kw, q_norm_weight=qw, eps=1e-6, ratio=ratio,
+        )
+
+    run_fused(b)
     torch.cuda.synchronize()
     assert torch.equal(kc.view(torch.uint8), kc2.view(torch.uint8)) and torch.equal(vc.view(torch.uint8), vc2.view(torch.uint8))
     assert torch.equal(ks, ks2) and torch.equal(vs, vs2)
@@ -91,6 +109,31 @@ def test_fused_index_write_matches_separate_kernels(T, start):
     # the closing rows landed in the slab, the others only in the scratch row
     if bool(closing.any()):
         assert (cmp2[out_loc[closing] // ratio].float().abs().sum(1) > 0).all()
+
+    # The direct lane permutation must match the former matrix/reduction exactly.
+    monkeypatch.setattr(fused, "_DIRECT_PERMUTE", False)
+    kc3, vc3, ks3, vs3, ring3, cmp3, qo3 = c
+    run_fused(c)
+    torch.cuda.synchronize()
+    graphs = []
+    for direct, buffers in ((False, c), (True, b)):
+        monkeypatch.setattr(fused, "_DIRECT_PERMUTE", direct)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run_fused(buffers)
+        graphs.append(graph)
+    for _ in range(5):
+        k.normal_()
+        v.normal_()
+        raw_k.normal_()
+        idx_q.normal_()
+        for graph in graphs:
+            graph.replay()
+        for old, new in ((kc3.view(torch.uint8), kc2.view(torch.uint8)),
+                         (vc3.view(torch.uint8), vc2.view(torch.uint8)),
+                         (ks3, ks2), (vs3, vs2), (ring3, ring2),
+                         (cmp3[live_rows], cmp2[live_rows]), (qo3, qo2)):
+            torch.testing.assert_close(new, old, rtol=0, atol=0)
 
 
 @requires_cuda
@@ -146,3 +189,36 @@ def test_plan_index_writes_kernel_matches_torch_plan():
         keep = rows >= ends - cap
         ring_ref = torch.where(keep, slots * cap + po % cap, torch.full_like(slots, -1)).int()
         assert torch.equal(cmp, cmp_ref) and torch.equal(ring, ring_ref), (start, T)
+
+
+@requires_cuda
+@pytest.mark.parametrize("T,start", [(1, 100), (2, 100), (3, 100), (4, 100), *HIGH_POSITION_CASES])
+def test_parallel_qk_heads_match_serial_graph_replay(T, start, monkeypatch):
+    import freetoken.kernel.triton.qsa.fused_decode as fused
+
+    torch.manual_seed(T)
+    q = torch.randn(T, 24, 256, device=DEV, dtype=torch.bfloat16)
+    k = torch.randn(T, 2, 256, device=DEV, dtype=torch.bfloat16)
+    qw = torch.randn(256, device=DEV, dtype=torch.bfloat16) * 0.1
+    kw = torch.randn_like(qw) * 0.1
+    pos = torch.arange(start, start + T, device=DEV, dtype=torch.int32)
+    cos_sin = _rope_cache(max(1024, start + T), 64)
+    graphs, outputs = [], []
+    for parallel in (False, True):
+        monkeypatch.setattr(fused, "_PARALLEL_HEADS", parallel)
+        for _ in range(2):
+            fused.qsa_qk_norm_rope_fused(q.clone(), k.clone(), pos, cos_sin, qw, kw, 1e-6)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            qo, ko = q.clone(), k.clone()
+            fused.qsa_qk_norm_rope_fused(qo, ko, pos, cos_sin, qw, kw, 1e-6)
+        graphs.append(graph)
+        outputs.append((qo, ko))
+    for _ in range(5):
+        q.normal_()
+        k.normal_()
+        for graph in graphs:
+            graph.replay()
+        for old, new in zip(outputs[0], outputs[1]):
+            torch.testing.assert_close(new, old, rtol=0, atol=0)

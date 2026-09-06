@@ -64,8 +64,10 @@ def build_linear_mixer(config: ModelConfig, layer_id: int) -> BaseOP:
 class _RouteDumper:
     """FREETOKEN_ROUTE_DUMP harness seam (scripts/moe-prefetch-harness.py): per prefill
     forward, buffer every main-tower layer's router logits -- plus, under
-    FREETOKEN_ROUTE_DUMP_R=1, the pre-mlp-mix residual R and the mixed block input --
-    then flush one ``route_NNNNNN.pt`` per forward. Teacher-forced prefill computes the
+    FREETOKEN_ROUTE_DUMP_R=1, the pre-mlp-mix residual R and the mixed block input, or under
+    FREETOKEN_ROUTE_DUMP_X=1 the block input alone (~4x smaller, and all the expert
+    substitution table needs) -- then flush one ``route_NNNNNN.pt`` per forward.
+    Teacher-forced prefill computes the
     same activations/routing a decode over the same text would, so these dumps are the
     ground truth for offline expert-prefetch predictor evaluation. Eager prefill only,
     synchronous per-layer D2H: never set in normal serving."""
@@ -74,6 +76,14 @@ class _RouteDumper:
         self.dump_dir = dump_dir
         self.with_r = (
             os.getenv("FREETOKEN_ROUTE_DUMP_R", "0").strip().lower()
+            not in {"", "0", "false", "no", "off"}
+        )
+        # FREETOKEN_ROUTE_DUMP_X: the block input WITHOUT the residual R. Building the expert
+        # substitution table needs the experts' own input and nothing else, and R is
+        # hc_count (4) times wider than block_input -- dropping it cuts the corpus ~4x for the
+        # same number of tokens. FREETOKEN_ROUTE_DUMP_R=1 still dumps both, unchanged.
+        self.with_x = self.with_r or (
+            os.getenv("FREETOKEN_ROUTE_DUMP_X", "0").strip().lower()
             not in {"", "0", "false", "no", "off"}
         )
         # Forwards larger than this are skipped whole -- notably the boot-time 8192-token
@@ -94,6 +104,7 @@ class _RouteDumper:
         entry = {"logits": router_logits.detach().to("cpu", torch.bfloat16)}
         if self.with_r:
             entry["r"] = hidden.detach().to("cpu", torch.bfloat16)
+        if self.with_x:
             entry["block_input"] = block_input.detach().to("cpu", torch.bfloat16)
         self._buf[layer_id] = entry
 

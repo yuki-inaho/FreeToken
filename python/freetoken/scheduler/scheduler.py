@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
@@ -50,6 +51,16 @@ from freetoken.moe.offload_cache import moe_stats_log_interval
 
 _MOE_STATS_LOG = moe_stats_log_interval()
 
+# Diagnostic counters use values already copied for the scheduler drain. No device reads,
+# extra events, or per-step logging; disabled by default for ordinary serving.
+_SPEC_POSITION_STATS = os.getenv("FREETOKEN_SPEC_POSITION_STATS", "0") == "1"
+
+# Shrink the elastic KV pool to the smallest ladder step a request needs, rather than only all
+# the way to the base for a request that fits it. 0 restores the shrink-to-base-only policy.
+_ELASTIC_STEPPED = os.environ.get("FREETOKEN_KV_ELASTIC_STEPPED", "1").strip().lower() not in (
+    "0", "false", "off",
+)
+
 
 def _gib(n_bytes: int) -> str:
     return f"{n_bytes / (1 << 30):.2f} GiB"
@@ -66,6 +77,58 @@ class ForwardInput(NamedTuple):
 ForwardData: TypeAlias = "Tuple[ForwardInput, ForwardOutput]"
 
 
+def _record_spec_position_stats(
+    req: "Req", *, verified_depth: int, staged_depth: int, num_emitted: int, kept: int
+) -> None:
+    """Count a drained verify using host integers, after terminal-token truncation.
+
+    Array index zero is draft position 1. ``proposed`` counts drafts actually submitted
+    to verification, excluding staged drafts clipped by the output budget. ``accepted``
+    is prefix acceptance before EOS/stop/length truncation; ``useful_accepted`` counts
+    accepted draft tokens retained by the scheduler (including a retained terminal token).
+    The correction/bonus token is at index ``num_emitted - 1``, so an early terminal token
+    in the accepted prefix retains ``min(num_emitted - 1, kept)`` accepted drafts.
+    """
+    stats = getattr(req, "stat_spec_positions", None)
+    if stats is None:
+        stats = req.stat_spec_positions = {
+            "rounds": 0,
+            "proposed": [],
+            "accepted": [],
+            "useful_accepted": [],
+            "verified_depth_histogram": {},
+            "staged_depth_histogram": {},
+            "budget_clipped_rounds": 0,
+            "budget_clipped_drafts": 0,
+            "truncated_rounds": 0,
+            "truncated_tokens": 0,
+            "truncated_accepted_tokens": 0,
+        }
+    accepted = num_emitted - 1
+    useful = min(accepted, kept)
+    stats["rounds"] += 1
+    for key, limit in (
+        ("proposed", verified_depth), ("accepted", accepted), ("useful_accepted", useful)
+    ):
+        counts = stats[key]
+        counts.extend([0] * (staged_depth - len(counts)))
+        for i in range(limit):
+            counts[i] += 1
+    for key, depth in (
+        ("verified_depth_histogram", verified_depth), ("staged_depth_histogram", staged_depth)
+    ):
+        histogram = stats[key]
+        depth_key = str(depth)  # stable keys through JSON/msgpack round trips
+        histogram[depth_key] = histogram.get(depth_key, 0) + 1
+    if verified_depth < staged_depth:
+        stats["budget_clipped_rounds"] += 1
+        stats["budget_clipped_drafts"] += staged_depth - verified_depth
+    if kept < num_emitted:
+        stats["truncated_rounds"] += 1
+        stats["truncated_tokens"] += num_emitted - kept
+        stats["truncated_accepted_tokens"] += accepted - useful
+
+
 def _engine_stats(req: "Req", now: float) -> dict:
     """Per-request engine telemetry for the finishing reply (usage["freetoken"]).
 
@@ -76,7 +139,7 @@ def _engine_stats(req: "Req", now: float) -> dict:
     """
     first = getattr(req, "stat_first_token_t", None)
     prefill_s = getattr(req, "stat_prefill_s", None)
-    return {
+    stats = {
         "prefill_s": None if prefill_s is None else round(prefill_s, 4),
         "decode_s": None if first is None else round(now - first, 4),
         "decode_steps": getattr(req, "stat_decode_steps", 0),
@@ -84,6 +147,10 @@ def _engine_stats(req: "Req", now: float) -> dict:
         "draft_tokens": getattr(req, "stat_draft_tokens", 0),
         "accepted_tokens": getattr(req, "stat_accepted_tokens", 0),
     }
+    positions = getattr(req, "stat_spec_positions", None)
+    if positions is not None:
+        stats["spec_positions"] = positions
+    return stats
 
 
 class Scheduler(SchedulerIOMixin):
@@ -418,7 +485,11 @@ class Scheduler(SchedulerIOMixin):
                     req.stat_decode_steps = getattr(req, "stat_decode_steps", 0) + 1
                 # EOS / stop-string -> "stop", output budget exhausted -> "length";
                 # EOS and stop strings win over length.
-                hit_length = not req.can_decode
+                # In overlap mode the NEXT forward may already have advanced device_len
+                # to the limit. Only the drained host prefix determines whether this
+                # reply is final, otherwise the penultimate token ends the request and
+                # the already-computed last token is discarded as a post-finish reply.
+                hit_length = req.input_ids.numel() >= req.max_device_len
                 hit_eos = (
                     not req.sampling_params.ignore_eos and next_token in self.eos_token_ids
                 )
@@ -581,6 +652,15 @@ class Scheduler(SchedulerIOMixin):
             )
             if finished:
                 break
+        if _SPEC_POSITION_STATS and batch.spec is not None:
+            verified_depth = batch.spec.num_input_tokens - 1
+            _record_spec_position_stats(
+                req,
+                verified_depth=verified_depth,
+                staged_depth=batch.spec.num_staged_drafts or verified_depth,
+                num_emitted=n,
+                kept=kept,
+            )
         # One message for the whole run: the detokenizer's batch decode requires at most one
         # DetokenizeMsg per uid per batch, and next_token must stay the run's LAST token so
         # the finished/eos handling keyed on it applies to the token that triggered it.
@@ -895,7 +975,12 @@ class Scheduler(SchedulerIOMixin):
             self._elastic_attempted.add(msg.uid)
             return True
         from freetoken.kvcache.cache_status import compute_cache_unit_bytes
-        from freetoken.scheduler.elastic_kv import needed_tokens, plan_moe_for_pages, plan_target_tokens
+        from freetoken.scheduler.elastic_kv import (
+            needed_tokens,
+            plan_moe_for_pages,
+            plan_shrink_tokens,
+            plan_target_tokens,
+        )
 
         cfg = self.config
         page = cfg.page_size
@@ -912,11 +997,19 @@ class Scheduler(SchedulerIOMixin):
             reason = "grow"
         elif (
             cur_pages > base_pages
-            and needed <= base_tokens
             and time.monotonic() - self._elastic_last_activity >= cfg.kv_elastic_idle_s
         ):
-            target_pages = base_pages
-            reason = "shrink"
+            # Stepped: give back everything above the smallest ladder step this request needs,
+            # not only the whole way down for a request that fits the base.
+            # FREETOKEN_KV_ELASTIC_STEPPED=0 restores the shrink-to-base-only behaviour.
+            shrink_to = (
+                plan_shrink_tokens(needed, cur_tokens, base_tokens, cap)
+                if _ELASTIC_STEPPED
+                else (base_tokens if needed <= base_tokens else None)
+            )
+            if shrink_to is not None:
+                target_pages = (shrink_to + page - 1) // page
+                reason = "shrink"
         if target_pages is None:
             return False
         unit = compute_cache_unit_bytes(self.engine)
@@ -1100,13 +1193,29 @@ class Scheduler(SchedulerIOMixin):
         if rr is not None:
             # Without this the feature is unobservable: "no quality change" and "the kernel
             # never fired" look identical from the outside.
-            subs, seen = (int(x) for x in rr.tolist())
-            prev_rr = getattr(self, "_rr_prev", (0, 0))
-            self._rr_prev = (subs, seen)
+            vals = [int(x) for x in rr.tolist()]
+            vals += [0] * (8 - len(vals))  # tolerate the older [2]- and [4]-wide tensors
+            subs, seen, rows, capped, drops, spent_q20 = vals[:6]
+            prev_rr = getattr(self, "_rr_prev", (0,) * 6)
+            self._rr_prev = (subs, seen, rows, capped, drops, spent_q20)
             d_sub, d_seen = subs - prev_rr[0], seen - prev_rr[1]
+            d_rows, d_capped = rows - prev_rr[2], capped - prev_rr[3]
+            d_drop, d_spent = drops - prev_rr[4], (spent_q20 - prev_rr[5]) / 1048576.0
+            d_act = d_sub + d_drop
             extra = (f" rroute_subs/step={d_sub / steps:.2f}"
+                     f" rroute_drops/step={d_drop / steps:.2f}"
                      f" rroute_missing/step={d_seen / steps:.2f}"
-                     f" rroute_cover={d_sub / max(1, d_seen):.3f}")
+                     f" rroute_cover={d_act / max(1, d_seen):.3f}"
+                     # rows that still hold a miss after acting: what raising max_subs (or the
+                     # budget) can still reach
+                     f" rroute_rows/step={d_rows / steps:.2f}"
+                     f" rroute_capped/step={d_capped / steps:.2f}")
+            if d_spent > 0:
+                # the perturbation the policy actually spent, as a fraction of the MoE block
+                # output -- the quantity the budget is denominated in, so the quality/throughput
+                # trade is legible without a separate measurement
+                extra += (f" rroute_pert/step={d_spent / steps:.4f}"
+                          f" rroute_pert/act={d_spent / max(1, d_act):.4f}")
         logger.info_rank0(
             f"[tier3] host_hit_rate={rate:.4f}"
             f" nvme_reads/step={d_fetch / steps:.2f}"
@@ -1323,21 +1432,42 @@ class Scheduler(SchedulerIOMixin):
         req = batch.reqs[0]
         if req.spec_state == "off":
             return
+        # Verifying k drafts reads k+1 rows but can emit k+1 candidates, followed by
+        # another complete draft chain. Reserve that entire worst-case tail BEFORE
+        # begin_verify changes the request's lengths or any CUDA graph is launched.
+        # The page/token tables may be padded beyond the model's actual context limit;
+        # those padding columns are not additional positions the model can consume.
+        # DSpark stages its whole block even when it verifies fewer draft tokens.
+        draft_capacity = getattr(self.engine.spec_executor, "block", self.spec_k)
+        context_limit = min(self.engine.max_seq_len, self.token_pool.shape[1])
         if req.spec_state == "warmup":
-            batch.spec_warmup = req
+            # complete_one advances device_len before warmup_draft writes its drafts.
+            # With only one output token left there cannot be another verify anyway.
+            if (req.remain_len > 1
+                    and req.device_len + 1 + draft_capacity <= context_limit):
+                batch.spec_warmup = req
+            else:
+                req.spec_state = "off"
+                self.engine.spec_executor.drop(req.uid)
             return
         # ready: stage a verify of up to spec_k drafts, clipped by the output budget. With
         # no room for even one draft this is the request's last token -- plain decode, and
         # the session ends (the plain step's position gets no MTP KV).
         # the executor staged req.spec_k_staged drafts for this step (adaptive k); the
         # budget may still clip the verify (a smaller captured set or eager serves it)
-        k_eff = min(req.spec_k_staged or self.spec_k, self.spec_k, req.max_device_len - req.device_len)
-        if k_eff >= 1:
+        k_staged = min(req.spec_k_staged or self.spec_k, self.spec_k)
+        k_eff = min(k_staged, req.max_device_len - req.device_len)
+        if (k_eff >= 1
+                and req.device_len + k_eff + 1 + draft_capacity <= context_limit):
             req.begin_verify(k_eff)
             batch.spec = SpecBatchInfo(
-                scratch=self.engine.spec_executor.scratch, num_input_tokens=k_eff + 1
+                scratch=self.engine.spec_executor.scratch, num_input_tokens=k_eff + 1,
+                num_staged_drafts=k_staged,
             )
         else:
+            # Ordinary decode finishes the last few context positions. Ending the
+            # speculative session keeps the committed GDN/PLE state and accepted token
+            # prefix intact; clamping draft writes could overwrite that accepted prefix.
             req.spec_state = "off"
             self.engine.spec_executor.drop(req.uid)
 

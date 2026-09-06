@@ -1,0 +1,65 @@
+group: mmlu_chat
+task:
+  - mmlu_chat_abstract_algebra
+  - mmlu_chat_anatomy
+  - mmlu_chat_astronomy
+  - mmlu_chat_business_ethics
+  - mmlu_chat_clinical_knowledge
+  - mmlu_chat_college_biology
+  - mmlu_chat_college_chemistry
+  - mmlu_chat_college_computer_science
+  - mmlu_chat_college_mathematics
+  - mmlu_chat_college_medicine
+  - mmlu_chat_college_physics
+  - mmlu_chat_computer_security
+  - mmlu_chat_conceptual_physics
+  - mmlu_chat_econometrics
+  - mmlu_chat_electrical_engineering
+  - mmlu_chat_elementary_mathematics
+  - mmlu_chat_formal_logic
+  - mmlu_chat_global_facts
+  - mmlu_chat_high_school_biology
+  - mmlu_chat_high_school_chemistry
+  - mmlu_chat_high_school_computer_science
+  - mmlu_chat_high_school_european_history
+  - mmlu_chat_high_school_geography
+  - mmlu_chat_high_school_government_and_politics
+  - mmlu_chat_high_school_macroeconomics
+  - mmlu_chat_high_school_mathematics
+  - mmlu_chat_high_school_microeconomics
+  - mmlu_chat_high_school_physics
+  - mmlu_chat_high_school_psychology
+  - mmlu_chat_high_school_statistics
+  - mmlu_chat_high_school_us_history
+  - mmlu_chat_high_school_world_history
+  - mmlu_chat_human_aging
+  - mmlu_chat_human_sexuality
+  - mmlu_chat_international_law
+  - mmlu_chat_jurisprudence
+  - mmlu_chat_logical_fallacies
+  - mmlu_chat_machine_learning
+  - mmlu_chat_management
+  - mmlu_chat_marketing
+  - mmlu_chat_medical_genetics
+  - mmlu_chat_miscellaneous
+  - mmlu_chat_moral_disputes
+  - mmlu_chat_moral_scenarios
+  - mmlu_chat_nutrition
+  - mmlu_chat_philosophy
+  - mmlu_chat_prehistory
+  - mmlu_chat_professional_accounting
+  - mmlu_chat_professional_law
+  - mmlu_chat_professional_medicine
+  - mmlu_chat_professional_psychology
+  - mmlu_chat_public_relations
+  - mmlu_chat_security_studies
+  - mmlu_chat_sociology
+  - mmlu_chat_us_foreign_policy
+  - mmlu_chat_virology
+  - mmlu_chat_world_religions
+aggregate_metric_list:
+  - metric: exact_match
+    aggregation: mean
+    weight_by_size: true
+metadata:
+  version: 1.0

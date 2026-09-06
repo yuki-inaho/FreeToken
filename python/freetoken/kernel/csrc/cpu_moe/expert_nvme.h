@@ -116,17 +116,30 @@ class ExpertTier3 {
     }
     const size_t n_locked = claimed_.size();  // exclusions are never publishable, only blocking
 
+    // Pass 1: every RESIDENT routed expert, stamped and claimed before any victim is chosen.
+    // Interleaving the two passes made the victim search depend on position in `ids`: a miss at
+    // index i could evict the slot of a hit at index j > i, whose stamp was still its old one.
+    // That slot is exactly what the GPU may be gathering from over UVA right now -- the routing
+    // pack's exclusion list (row 2) was meant to cover this but is never populated, so
+    // `n_excl` is always 0 here. Claiming all hits up front closes the window with the
+    // information the resolver already has, and incidentally stops the redundant re-read the
+    // evicted hit caused when the loop reached it.
+    for (int i = 0; i < n_ids; ++i) {
+      const int32_t e = ids[i];
+      if (e < 0 || e >= num_experts) continue;
+      const int32_t slot = host_slot_tbl[(size_t)layer_id * num_experts + e];
+      if (slot < 0) continue;
+      n_hit.fetch_add(1, std::memory_order_relaxed);
+      usage[(size_t)layer_id * host_slots + slot] = now;
+      if (!contains(claimed_, slot)) claimed_.push_back(slot);
+    }
+
+    // Pass 2: page in whatever is left.
     for (int i = 0; i < n_ids; ++i) {
       const int32_t e = ids[i];
       if (e < 0 || e >= num_experts) continue;
       const size_t key = (size_t)layer_id * num_experts + e;
-      int32_t slot = host_slot_tbl[key];
-      if (slot >= 0) {
-        n_hit.fetch_add(1, std::memory_order_relaxed);
-        usage[(size_t)layer_id * host_slots + slot] = now;
-        if (!contains(claimed_, slot)) claimed_.push_back(slot);
-        continue;
-      }
+      if (host_slot_tbl[key] >= 0) continue;  // counted as a hit in pass 1
       if (already_pending(e)) continue;  // the same expert twice in one step: fetch once
       const int32_t victim = claim(layer_id, now);
       if (victim < 0) {                  // see n_exhausted: undersized pool, results are wrong
@@ -274,12 +287,13 @@ class ExpertTier3 {
     const int total = (int)build_->size();
     {
       std::lock_guard<std::mutex> lk(mtx_);
-      next_job_.store(0, std::memory_order_relaxed);
       done_jobs_.store(0, std::memory_order_relaxed);
       total_.store(total, std::memory_order_relaxed);
       active_ = build_;
       gen_++;
-      gen_atomic_.store(gen_, std::memory_order_relaxed);
+      // Generation and next-index in ONE word, so a worker cannot claim an index from a batch
+      // it is not on (see work_on).
+      cursor_.store((uint64_t)gen_ << 32, std::memory_order_release);
     }
     cv_.notify_all();
     // The submitting (coordinator) thread pulls jobs too: at low miss counts that is often the
@@ -310,23 +324,34 @@ class ExpertTier3 {
 
   void work(uint64_t my_gen) { work_on(active_, my_gen); }
 
+  // Claim (generation, index) as ONE atomic word.
+  //
+  // Checking the generation and then fetch_add'ing a separate index is not enough: a reader
+  // descheduled between the two (16 unpinned readers against 24 spinning MoE workers on 24
+  // physical cores) wakes into the NEXT batch and takes index 0 of it while still holding the
+  // previous batch's pointer -- which by then is the buffer resolve() is push_back'ing into.
+  // It would read a torn job, and credit `done_jobs_` for a batch whose job 0 nobody ran, so
+  // the coordinator publishes slots whose bytes never landed. Rare, silent, wrong weights.
   void work_on(const std::vector<ReadJob>* batch, uint64_t my_gen) {
     if (batch == nullptr) return;
-    const int total = total_.load(std::memory_order_relaxed);
+    const uint32_t total = (uint32_t)total_.load(std::memory_order_relaxed);
+    uint64_t cur = cursor_.load(std::memory_order_acquire);
     for (;;) {
-      // Bail the moment a newer batch starts: our indices belong to `my_gen` only.
-      if (gen_relaxed() != my_gen) return;
-      const int i = next_job_.fetch_add(1, std::memory_order_relaxed);
-      if (i >= total) break;
+      if ((cur >> 32) != my_gen) return;  // a newer batch owns the cursor: nothing here is ours
+      const uint32_t i = (uint32_t)cur;
+      if (i >= total) return;
+      if (!cursor_.compare_exchange_weak(cur, cur + 1, std::memory_order_acq_rel,
+                                         std::memory_order_acquire)) {
+        continue;  // cur was refreshed by the failed CAS
+      }
       do_job((*batch)[i]);
-      if (done_jobs_.fetch_add(1, std::memory_order_acq_rel) + 1 == total) {
+      if ((uint32_t)(done_jobs_.fetch_add(1, std::memory_order_acq_rel) + 1) == total) {
         std::lock_guard<std::mutex> lk(done_mtx_);
         done_cv_.notify_all();
       }
+      cur = cursor_.load(std::memory_order_acquire);
     }
   }
-
-  uint64_t gen_relaxed() const { return gen_atomic_.load(std::memory_order_relaxed); }
 
   // One O_DIRECT fd per shard, SHARED by every reader thread. pread takes an explicit offset
   // and never touches the file position, so there is no shared-position lock to dodge -- and a
@@ -413,11 +438,10 @@ class ExpertTier3 {
   std::vector<ReadJob>* build_ = &jobs_buf_[0];
   const std::vector<ReadJob>* active_ = nullptr;
   std::atomic<int> total_{0};
-  std::atomic<uint64_t> gen_atomic_{0};
   std::vector<std::thread> readers_;
   std::mutex mtx_, done_mtx_;
   std::condition_variable cv_, done_cv_;
-  std::atomic<int> next_job_{0};
+  std::atomic<uint64_t> cursor_{0};  // (generation << 32) | next job index
   std::atomic<int> done_jobs_{0};
   uint64_t gen_ = 0;
   bool stop_ = false;

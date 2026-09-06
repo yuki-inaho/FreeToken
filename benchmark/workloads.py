@@ -203,9 +203,46 @@ def realistic_blocks(seed: int) -> Iterator[str]:
         i += 1
 
 
+def code_blocks(seed: int) -> Iterator[str]:
+    rng = _Rng(seed)
+    i = 0
+    while True:
+        yield _code_block(rng, i)
+        i += 1
+
+
+def english_blocks(seed: int) -> Iterator[str]:
+    rng = _Rng(seed)
+    i = 0
+    while True:
+        yield _prose_block(rng, i)
+        i += 1
+
+
+def japanese_blocks(seed: int) -> Iterator[str]:
+    rng = _Rng(seed)
+    seasons = ("春", "夏", "秋", "冬")
+    foods = ("山菜", "魚", "米", "野菜", "味噌", "果物")
+    places = ("港町", "山間の集落", "商店街", "農村", "海辺の市場")
+    i = 0
+    while True:
+        season, food, place = rng.pick(seasons), rng.pick(foods), rng.pick(places)
+        yield (f"第{i}章：{place}の{season}\n\n"
+               f"この地域では、{season}になると{food}を使った料理が食卓に並ぶ。"
+               "土地の気候や暮らしの変化に合わせて、調理法も少しずつ受け継がれてきた。"
+               f"記録には、{rng.r.randint(10, 90)}世帯が祭りの準備に参加したとある。"
+               "年長者が材料の保存方法を教え、若者たちは市場で聞いた話を紹介する。"
+               "行事を続ける工夫、食材を無駄にしない知恵、季節を楽しむ習慣について、"
+               "参加者は具体的な経験を語り合った。")
+        i += 1
+
+
 FAMILIES: dict[str, Callable[[int], Iterator[str]]] = {
     "synthetic": synthetic_blocks,
     "realistic": realistic_blocks,
+    "code": code_blocks,
+    "english": english_blocks,
+    "japanese": japanese_blocks,
 }
 
 # --------------------------------------------------------------------------------------------

@@ -32,10 +32,11 @@ def test_ema_tracks_acceptance_fraction(monkeypatch):
     assert r.spec_ema == pytest.approx(0.75)
 
 
-def test_next_k_fixed_when_adaptation_off():
-    ex = _executor(k=2, k_max=2)
-    assert ex._next_k(_req(staged=2, ema=1.0)) == 2
-    assert ex._next_k(_req(staged=0, ema=0.0)) == 2
+@pytest.mark.parametrize("k", [1, 2, 3, 4])
+def test_next_k_fixed_when_adaptation_off(k):
+    ex = _executor(k=k, k_max=k)
+    assert ex._next_k(_req(staged=k, ema=1.0)) == k
+    assert ex._next_k(_req(staged=0, ema=0.0)) == k
 
 
 def test_next_k_steps_with_hysteresis(monkeypatch):
@@ -49,3 +50,9 @@ def test_next_k_steps_with_hysteresis(monkeypatch):
     assert ex._next_k(_req(staged=3, ema=0.54)) == 2      # below DOWN: step down
     assert ex._next_k(_req(staged=3, ema=0.99)) == 3      # capped at k_max
     assert ex._next_k(_req(staged=2, ema=0.10)) == 2      # floored at the base k
+
+
+@pytest.mark.parametrize("ema", [None, 0.1, 0.6, 0.99])
+def test_next_k_recovers_after_temporary_page_boundary_clip(ema):
+    ex = _executor(k=2, k_max=3)
+    assert ex._next_k(_req(staged=1, ema=ema)) >= 2

@@ -37,6 +37,17 @@ _SPEC_TIME = os.getenv("FREETOKEN_SPEC_TIME", "0") != "0"
 # split into the drain's copy_done wait, the drain's own host work, and the scheduler
 # remainder (loop + prepare + staging). Printed as medians every 200 steps.
 _SPEC_HOST_TIME = os.getenv("FREETOKEN_SPEC_HOST_TIME", "0") != "0"
+# Section-level breakdown of the host half of verify_step (which sections of Python /
+# eager-op dispatch the ~1.8 ms of `verify_host` is actually spent in). Costs ~100 ns per
+# mark, i.e. <0.2% of a step, and only when enabled.
+_SPEC_HOST_DETAIL = os.getenv("FREETOKEN_SPEC_HOST_DETAIL", "0") != "0"
+# =2 drains the CUDA launch queue before the section clock starts. Without it, a host that
+# runs ~12 ms ahead of the GPU blocks inside cudaLaunchKernel whenever the queue is full, and
+# that GPU wait is charged to whichever host section happened to launch -- so the sections
+# read as "expensive Python" when they are really "waiting for the GPU". With the queue
+# drained, the section times are the true host cost (the step itself gets slower, since the
+# host/GPU overlap is given up; use it only to attribute, never to quote step_wall).
+_SPEC_HOST_DETAIL_SYNC = os.getenv("FREETOKEN_SPEC_HOST_DETAIL", "0") == "2"
 # torch.profiler window over whole verify steps: FREETOKEN_SPEC_PROFILE="<skip>:<steps>"
 # starts the profiler at the top of step `skip` and stops it at the top of step
 # `skip+steps`, exporting a chrome trace (scripts/spec-trace-report.py consumes it) to
@@ -248,6 +259,9 @@ class SpecBatchInfo:
 
     scratch: SpecStateScratch
     num_input_tokens: int  # k+1
+    # Schedule-time draft depth before the output budget clips the verify. The executor
+    # overwrites req.spec_k_staged with the NEXT round's depth before this round drains.
+    num_staged_drafts: int | None = None
 
 
 class SpecGraphs:
@@ -615,12 +629,20 @@ class SpecExecutor:
         self._ht_wall: list[float] = []
         self._ht_last_exit: float | None = None
         self._ht_last_entry: float | None = None
+        self._ht_detail: dict[str, list[float]] = {}
+        self._hd_last: float = 0.0
         # CUDA graphs for the verify/draft cycle (the launch overhead of an eager 48-layer
         # verify step dwarfs its compute), one set per draft count in [k, k_max]. Falls back
         # to eager on capture failure.
         self.graph_sets: dict[int, SpecGraphs] = {}
         if os.getenv("FREETOKEN_SPEC_GRAPH", "1") != "0":
             self.capture_graphs()
+
+    def _hd(self, name: str) -> None:
+        """Charge the time since the previous mark to `name` (FREETOKEN_SPEC_HOST_DETAIL)."""
+        now = time.perf_counter()
+        self._ht_detail.setdefault(name, []).append(now - self._hd_last)
+        self._hd_last = now
 
     def capture_graphs(self) -> None:
         """(Re)capture the verify/draft graph sets for every draft count in [k, k_max]."""
@@ -659,7 +681,9 @@ class SpecExecutor:
         rate (spec_ema, updated by the scheduler's drain) crosses the thresholds."""
         if self.k_max <= self.k:
             return self.k
-        cur = req.spec_k_staged or self.k
+        # Page-boundary clipping can temporarily stage fewer drafts than the base k.
+        # Recover the configured depth as soon as the next allocated page permits it.
+        cur = max(self.k, req.spec_k_staged or self.k)
         ema = req.spec_ema
         if ema is None:
             return cur
@@ -668,6 +692,19 @@ class SpecExecutor:
         if ema < _ADAPT_DOWN and cur > self.k:
             return cur - 1
         return cur
+
+    def _draft_k_with_page_room(self, input_end: int, k: int) -> int:
+        """Bound draft KV writes to pages allocated for this forward's input rows.
+
+        Draft 1 comes from the ordinary MTP pass. Chaining drafts 2..k writes up
+        to position input_end+k-2 on full acceptance, but allocate_paged owns only
+        the pages covering [0, input_end). A shallower next verify crosses the
+        boundary normally and allocates its own page; no speculative page lease or
+        change to the accepted prefix is needed.
+        """
+        page_size = self.engine.config.page_size
+        page_end = ((input_end + page_size - 1) // page_size) * page_size
+        return min(k, page_end - input_end + 1)
 
     def drop(self, uid: int) -> None:
         self._premix_carry.pop(uid, None)
@@ -832,7 +869,10 @@ class SpecExecutor:
         req = batch.reqs[0]
         carry = self._premix_carry.pop(req.uid, None)
         assert carry is not None, "warmup requires the prefill premix carry"
-        req.spec_k_staged = self.k  # the warmup stages the base draft count
+        # complete_one already advanced device_len, while page allocation covered
+        # the pre-complete input span. Never chain into an unallocated next page.
+        k_warmup = self._draft_k_with_page_room(req.device_len - 1, self.k)
+        req.spec_k_staged = k_warmup
         req.spec_ema = None
         premix_row = self._premix(batch)[:1]
         # positions: L-1 (prompt's last row, next token = this step's input) and L (this
@@ -852,13 +892,13 @@ class SpecExecutor:
         self.token_pool[req.table_idx].index_copy_(
             0, torch.tensor([req.device_len], device=self.device), draft.view(1)
         )
-        if self.k >= 2:
+        if k_warmup >= 2:
             # Chain warmup drafts 2..k the same way the steady-state tail does: each chain
             # row's premix is the previous pass's own 4-stream output (eager here -- warmup
             # runs once per request).
             d = draft
             src = self.scratch.r1_rows[1:2]
-            for j in range(1, self.k):
+            for j in range(1, k_warmup):
                 r1_tmp = torch.empty_like(src)
                 shadow_j = self._shadow_batch(
                     [(req.table_idx, pos_in + j, pos_in + j + 1)]
@@ -911,7 +951,10 @@ class SpecExecutor:
         if _SPEC_PROFILE is not None or _SPEC_NSYS is not None:
             self._profile_tick()
         if _SPEC_HOST_TIME:
+            if _SPEC_HOST_DETAIL_SYNC:
+                torch.cuda.synchronize()
             self._ht_last_entry = time.perf_counter()
+            self._hd_last = self._ht_last_entry
             if self._ht_last_exit is not None:
                 gap = self._ht_last_entry - self._ht_last_exit
                 if self._ht_verify:
@@ -928,7 +971,7 @@ class SpecExecutor:
         # Drafts to stage for the NEXT verify (adaptive: from the acceptance EMA the
         # scheduler updated through the previous drain); recorded on the request so the
         # scheduler stages exactly that many rows.
-        k_next = self._next_k(req)
+        k_next = self._draft_k_with_page_room(req.device_len, self._next_k(req))
         req.spec_k_staged = k_next
         if _SPEC_TIME:
             evts = [torch.cuda.Event(enable_timing=True) for _ in range(4)]
@@ -942,10 +985,14 @@ class SpecExecutor:
             prep = getattr(self.model, "prepare_host_tables_for_replay", None)
             if prep is not None:
                 prep(batch)
+            if _SPEC_HOST_DETAIL:
+                self._hd("stage")
             g.graph_a.replay()
             logits = g.logits
         else:
             logits = self.model.forward()  # [k1, vocab] -- decode phase computes every row
+        if _SPEC_HOST_DETAIL:
+            self._hd("graphA_launch")
         draft_ids = batch.input_ids[1:k1]
         if params.is_argmax:
             cand = torch.argmax(logits, dim=-1).to(torch.int32)  # greedy target per row
@@ -967,6 +1014,8 @@ class SpecExecutor:
             cand[: k1 - 1] = draft_ids
             cand.scatter_(0, n_acc.reshape(1).to(torch.int64), correction)
 
+        if _SPEC_HOST_DETAIL:
+            self._hd("accept")
         # All candidates go to the pool: cand[i] is the token at position c+1+i. Beyond the
         # accepted run they are placeholders that the next steps' scatters overwrite before
         # any gather reads them (single speculative request).
@@ -983,6 +1032,8 @@ class SpecExecutor:
             ple_layer_ids=self.ple_layer_ids,
         )
 
+        if _SPEC_HOST_DETAIL:
+            self._hd("commit")
         # The emitted run is final here (nothing below touches cand or n), so enqueue the
         # D2H copies now: copy_done then fires before the draft pass and the scheduler's
         # drain (detokenize, bookkeeping, next-step staging) overlaps with graph B instead
@@ -996,6 +1047,8 @@ class SpecExecutor:
             # join (forward_batch) and before this step's run() rewrites plan-2.
             self.prefetcher.used_check()
 
+        if _SPEC_HOST_DETAIL:
+            self._hd("d2h")
         if _SPEC_TIME:
             evts[1].record()
         # Draft pass: chain the MTP layer over all k1 rows (row i: R at position c+i, next
@@ -1012,6 +1065,8 @@ class SpecExecutor:
                 r1_out=self.scratch.r1_rows,
             )
             dlogits = self._draft_lm_head().forward(hidden)
+        if _SPEC_HOST_DETAIL:
+            self._hd("graphB")
         if _SPEC_TIME:
             evts[2].record()
         if k_next >= 2:
@@ -1065,6 +1120,8 @@ class SpecExecutor:
                         ).to(g.md_c.block_table.dtype)
                     )
                     g.md_c.ring_slots.fill_(req.table_idx)
+                if _SPEC_HOST_DETAIL:
+                    self._hd("chain_plan")
                 d = next_draft
                 for j in range(1, k_next):
                     g.chain_tok.copy_(d)
@@ -1088,6 +1145,8 @@ class SpecExecutor:
                     pool_row.index_copy_(
                         0, torch.clamp(new_device_len + j, max=row_cap), d
                     )
+                if _SPEC_HOST_DETAIL:
+                    self._hd("chain_loop")
             else:
                 # No chain graph (eager/debug mode): same-pass drafts from consecutive
                 # dlogits rows -- still sound (each token is drawn from exactly the
@@ -1142,6 +1201,8 @@ class SpecExecutor:
                     flush=True,
                 )
 
+        if _SPEC_HOST_DETAIL:
+            self._hd("tail")
         if _SPEC_HOST_TIME:
             self._ht_last_exit = time.perf_counter()
             self._ht_verify.append(self._ht_last_exit - self._ht_last_entry)
@@ -1162,6 +1223,19 @@ class SpecExecutor:
                     ),
                     flush=True,
                 )
+                if self._ht_detail:
+                    print(
+                        "[spec-host detail us] "
+                        + "  ".join(
+                            f"{k}={_st.median(v[-200:]) * 1e6:.0f}"
+                            for k, v in sorted(
+                                self._ht_detail.items(),
+                                key=lambda kv: -_st.median(kv[1][-200:]),
+                            )
+                            if v
+                        ),
+                        flush=True,
+                    )
 
         return SpecForwardOutput(
             candidates_gpu=cand,

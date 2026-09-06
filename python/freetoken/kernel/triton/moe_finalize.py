@@ -11,6 +11,7 @@ also skips the two intermediate bf16 roundings:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Callable
 
 import torch
 import triton
@@ -114,8 +115,26 @@ class MoeCombineEpilogue:
     hc: int
     result: torch.Tensor | None = None
     gate_weight: torch.Tensor | None = None   # [H] shared-gate weight, for a fused producer
+    shared_fn: Callable[[], torch.Tensor] | None = None
+
+    @property
+    def has_shared(self) -> bool:
+        return self.shared is not None or self.shared_fn is not None
+
+    def materialize_shared(self) -> torch.Tensor | None:
+        """Enqueue the deferred shared expert once, while its input is still intact.
+
+        Hybrid decode calls this after CPU submission, before the routed expert kernels.
+        The callback runs during graph capture; its kernels then replay with the graph.
+        """
+        if self.shared_fn is not None:
+            assert self.shared is None, "shared expert was supplied twice"
+            self.shared = self.shared_fn()
+            self.shared_fn = None
+        return self.shared
 
     def apply(self, ic3: torch.Tensor, route_ids: torch.Tensor | None, addend: torch.Tensor | None) -> torch.Tensor:
+        assert self.shared_fn is None, "shared expert must run before routed kernels"
         assert self.shared is None or self.gate is not None, "shared gate not produced"
         self.result = moe_finalize_combine(
             ic3, route_ids, addend, self.shared, self.gate, self.residual, self.inject, self.hc

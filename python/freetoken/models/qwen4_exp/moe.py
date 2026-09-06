@@ -70,14 +70,24 @@ class Qwen4ExpMoE(Qwen3_5MoE):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         router_logits = self.gate.forward(hidden_states)
-        shared = self.shared_expert.forward(hidden_states)
         gate_w = self.shared_expert_gate.weight.view(-1)
         ep = None
         if _FUSED_FINALIZE and inject is not None and hidden_states.is_cuda and residual.stride(1) == 1:
             # the gate sigmoid is produced by the expert path (fused into the hybrid pre-quant
             # launch when possible; else computed there before the experts touch hidden)
-            ep = MoeCombineEpilogue(shared, None, residual, inject, hc_layer.hc_count, gate_weight=gate_w)
+            can_overlap = getattr(self.experts, "can_overlap_shared", None)
+            if can_overlap is not None and can_overlap():
+                shared = None
+                shared_fn = lambda: self.shared_expert.forward(hidden_states)
+            else:
+                shared = self.shared_expert.forward(hidden_states)
+                shared_fn = None
+            ep = MoeCombineEpilogue(
+                shared, None, residual, inject, hc_layer.hc_count,
+                gate_weight=gate_w, shared_fn=shared_fn,
+            )
         else:
+            shared = self.shared_expert.forward(hidden_states)
             gate = shared_gate_sigmoid(hidden_states, gate_w)
         routed = self.experts.forward(hidden_states=hidden_states, router_logits=router_logits, epilogue=ep)
         if ep is not None and ep.result is not None:
@@ -86,6 +96,7 @@ class Qwen4ExpMoE(Qwen3_5MoE):
             # fallback path took no epilogue: the gate must still come from the pre-expert
             # hidden state (the routed experts may have written hidden_states in place)
             gate = ep.gate if ep.gate is not None else shared_gate_sigmoid(hidden_states, gate_w)
+            shared = ep.materialize_shared()
         y = shared_gate_mul_add(routed, shared, gate).view(num_tokens, hidden_dim)
         return hc_layer.combine(residual, y, inject)
 

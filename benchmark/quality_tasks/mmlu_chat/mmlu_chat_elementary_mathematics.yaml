@@ -1,0 +1,3 @@
+"dataset_name": "elementary_mathematics"
+"include": "_mmlu_chat_template_yaml"
+"task": "mmlu_chat_elementary_mathematics"

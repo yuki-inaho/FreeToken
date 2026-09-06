@@ -2,7 +2,7 @@
 # Copyright (c) 2024, Tri Dao.
 # Based on the Triton LayerNorm tutorial: https://triton-lang.org/main/getting-started/tutorials/05-layer-norm.html
 #
-# Vendored from sglang (``python/sglang/srt/layers/attention/fla/layernorm_gated.py``). The kernel is verbatim;
+# Vendored from sglang (``python/sglang/srt/layers/attention/fla/layernorm_gated.py``);
 # the sglang.srt.server_args / sglang.srt.utils deps are replaced with triton/local
 # equivalents and the CPU/NPU branches are dropped (FreeToken is NVIDIA-only). Only the
 # forward path is kept. Public entry: ``rms_norm_gated`` -- fused RMSNorm(x) * silu(z) in
@@ -47,6 +47,7 @@ def _layer_norm_fwd_1pass_kernel(
     NORM_BEFORE_GATE: tl.constexpr,
     IS_RMS_NORM: tl.constexpr,
     ACTIVATION: tl.constexpr,
+    W_SHARED: tl.constexpr,
 ):
     # Map the program id to the starting row of X and Y it should compute.
     row_start = tl.program_id(0) * ROWS_PER_BLOCK
@@ -103,12 +104,12 @@ def _layer_norm_fwd_1pass_kernel(
     tl.store(Rstd + rstd_offsets, rstd, mask=rstd_mask)
 
     # Load weights and biases (broadcast across rows)
-    w_offsets = cols + group * N
+    w_offsets = cols if W_SHARED else cols + group * N
     w_mask = cols < N
     w = tl.load(W + w_offsets, mask=w_mask, other=0.0).to(tl.float32)
 
     if HAS_BIAS:
-        b = tl.load(B + w_offsets, mask=w_mask, other=0.0).to(tl.float32)
+        b = tl.load(B + cols + group * N, mask=w_mask, other=0.0).to(tl.float32)
 
     # Normalize and apply linear transformation
     if not IS_RMS_NORM:
@@ -165,7 +166,10 @@ def _layer_norm_fwd(
     if z is not None:
         assert z.stride(-1) == 1
         assert z.shape == (M, N)
-    assert weight.shape == (N,)
+    # A per-head affine can be shared across groups without repeating the weight or
+    # flattening a strided [token, heads * dim] gate into a copied [token * heads, dim].
+    assert weight.shape in ((N,), (group_size,))
+    weight_shared = weight.shape == (group_size,)
     assert weight.stride(-1) == 1
     if bias is not None:
         assert bias.stride(-1) == 1
@@ -216,6 +220,7 @@ def _layer_norm_fwd(
             IS_RMS_NORM=is_rms_norm,
             num_warps=num_warps,
             ACTIVATION=activation,
+            W_SHARED=weight_shared,
         )
     return out, mean, rstd
 
@@ -232,7 +237,10 @@ def rms_norm_gated(
     is_rms_norm=False,
     activation: str = "swish",
 ):
-    """If z is not None, we do norm(x) * silu(z) if norm_before_gate, else norm(x * silu(z))"""
+    """Gated norm; group_size may use a shared [group_size] weight or a full-width weight.
+
+    If z is not None, apply norm(x) * act(z) when norm_before_gate, else norm(x * act(z)).
+    """
 
     x_shape_og = x.shape
     # reshape input data into 2D tensor

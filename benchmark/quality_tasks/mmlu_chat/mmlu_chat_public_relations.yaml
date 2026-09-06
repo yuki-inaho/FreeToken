@@ -1,0 +1,3 @@
+"dataset_name": "public_relations"
+"include": "_mmlu_chat_template_yaml"
+"task": "mmlu_chat_public_relations"

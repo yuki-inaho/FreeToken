@@ -324,3 +324,117 @@ def test_routing_pack_carries_ids_and_weights():
     ids = cache.routing_pack[0, :n]
     assert ((ids == -1) | ((ids >= 0) & (ids < E))).all()
     _assert_close(out, _ref_moe(sources, 0, hidden, w, raw))
+
+
+@cuda
+@pytest.mark.parametrize("overlap", [False, True])
+def test_dropped_route_contributes_exactly_zero(overlap, monkeypatch):
+    """A route the residency policy DROPPED (`id = -1`, `weight = 0`) must be exactly absent.
+
+    The whole point of dropping rather than substituting is that it costs nothing: no NVMe read,
+    no PCIe gather, no GEMV. That is only sound if the dropped lane also contributes nothing
+    numerically, on both the GPU and the CPU branch -- and the ensure step's id-to-slot gather
+    is the one place a -1 used to read a neighbouring expert's slot instead.
+    """
+    import freetoken.layers.moe as moe_mod
+    from freetoken.layers.moe import OffloadMoELayer
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    monkeypatch.setattr(moe_mod, "_HYBRID_COPY_OVERLAP", overlap)
+    device = torch.device("cuda")
+    cache, sources = _cache(device, frac=0.5)
+    ex = CpuMoeExecutor(cache, top_k=TOPK, activation="silu", apply_router_weight_on_input=False,
+                        num_threads=4, max_tokens=4, device=device)
+    cache.set_cpu_executor(ex)
+    layer = OffloadMoELayer.__new__(OffloadMoELayer)
+    layer.offload_cache = cache
+    layer.activation = "silu"
+    layer.apply_router_weight_on_input = False
+    layer.top_k = TOPK
+
+    torch.manual_seed(21)
+    for step in range(6):
+        layer.layer_id = step % L
+        hidden = torch.randn(3, H, dtype=torch.bfloat16, device=device) / 4
+        w = torch.rand(3, TOPK, dtype=torch.float32, device=device)
+        raw = torch.randint(0, E, (3, TOPK), dtype=torch.int32, device=device)
+
+        # drop one lane per token, as the policy would
+        drop = torch.randint(0, TOPK, (3,), device=device)
+        lane = torch.arange(TOPK, device=device)[None, :] == drop[:, None]
+        w_zero = torch.where(lane, torch.zeros_like(w), w)
+        ids_drop = torch.where(lane, torch.full_like(raw, -1), raw)
+
+        # the reference keeps the original ids but zeroes their weight: the same arithmetic a
+        # correct drop must produce, and computable by a helper that cannot take a -1 id
+        ref = _ref_moe(sources, layer.layer_id, hidden, w_zero, raw)
+        out = layer._decode_hybrid(cache, hidden, w_zero, ids_drop.clone())
+        torch.cuda.synchronize()
+        _assert_close(out, ref)
+
+
+@cuda
+@pytest.mark.parametrize("rows", [1, 3, 4])
+@pytest.mark.parametrize("copy_overlap", [False, True])
+def test_deferred_shared_is_bit_identical_and_graph_safe(rows, copy_overlap, monkeypatch):
+    """Moving real shared GEMMs after CPU submit preserves gates, routes, and graph replay."""
+    import torch.nn.functional as F
+    import freetoken.layers.moe as moe_mod
+    from freetoken.kernel.triton.moe_finalize import MoeCombineEpilogue
+
+    monkeypatch.setattr(moe_mod, "_HYBRID_COPY_OVERLAP", copy_overlap)
+    device = torch.device("cuda")
+    layer, cache, _ = _hybrid_layer(device)
+    layer.layer_id = 0
+    hc = 4
+    torch.manual_seed(31 + rows)
+    hidden = torch.randn(rows, H, dtype=torch.bfloat16, device=device) / 4
+    weights = torch.rand(rows, TOPK, device=device)
+    ids = torch.empty(rows, TOPK, dtype=torch.int32, device=device)
+    gate_weight = (torch.randn(H, device=device) * 0.05).to(torch.bfloat16)
+    residual = torch.randn(rows, hc * H, dtype=torch.bfloat16, device=device)
+    inject = torch.randn(rows, hc, dtype=torch.bfloat16, device=device)
+    shared_gu = torch.randn(2 * I, H, dtype=torch.bfloat16, device=device) / 16
+    shared_down = torch.randn(H, I, dtype=torch.bfloat16, device=device) / 16
+
+    def shared():
+        gate, up = F.linear(hidden, shared_gu).chunk(2, dim=-1)
+        return F.linear(F.silu(gate) * up, shared_down)
+
+    def forward(deferred):
+        ep = MoeCombineEpilogue(
+            None if deferred else shared(), None, residual, inject, hc,
+            gate_weight=gate_weight, shared_fn=shared if deferred else None,
+        )
+        return layer._decode_hybrid(cache, hidden, weights, ids, ep)
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        ids.zero_()
+        forward(True)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            graph_out = forward(True)
+        torch.cuda.synchronize()
+        for _ in range(3):
+            hidden.copy_(torch.randn_like(hidden) / 4)
+            weights.copy_(torch.rand_like(weights))
+            raw = torch.randint(0, E, ids.shape, dtype=torch.int32, device=device)
+            outputs = []
+            for mode in ("eager", "deferred", "graph"):
+                # Restore identical LRU state: changing the CPU/GPU split would change
+                # activation quantization and invalidate a bitwise scheduling comparison.
+                cache.reset()
+                ids.copy_(raw)
+                if mode == "graph":
+                    graph.replay()
+                    out = graph_out
+                else:
+                    out = forward(mode == "deferred")
+                torch.cuda.synchronize()
+                outputs.append(out.clone())
+            assert torch.equal(outputs[0], outputs[1])
+            assert torch.equal(outputs[0], outputs[2])
+    torch.cuda.current_stream().wait_stream(stream)

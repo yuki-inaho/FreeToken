@@ -499,6 +499,16 @@ def _fixup_counter_buf(device: torch.device, n: int) -> torch.Tensor:
     return st[0][st[1]]
 
 
+# Offline tuning seam (see docs/decode-megakernel-evaluation.md). Empty in production: the
+# heuristics below decide, and the only hot-path cost is one truthiness test on an empty dict
+# plus a module-global read for num_warps. A shape sweep sets BLOCK_N / BLOCK_K / SPLIT_K here
+# and _ROWS_WARPS below, so candidates run through this exact wrapper -- including every fused
+# epilogue and the split-K fixup -- instead of hand-rebuilt kernel launches, which is how an
+# earlier sweep silently measured nothing at all.
+_ROWS_TUNE: dict = {}
+_ROWS_WARPS = 1
+
+
 def _gemv_rows(a: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor | None,
                out_dtype: torch.dtype, epilogue=None, act=None):
     """M<=4 split-K rows GEMV (W8A16, exact activations). ``a`` [M, K] bf16; ``weight``
@@ -519,10 +529,14 @@ def _gemv_rows(a: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor
     # 256-wide K chunks give the deep fp8 shapes a few % more bandwidth (in_proj_qkvz
     # 28.4 -> 27.5 us, qkv_proj 23.4 -> 22.5, RTX 5090 sweep); the small/bf16 ones prefer 128.
     BLOCK_K = 256 if (weight_scale is not None and K >= 2048 and N >= 1024) else 128
-    n_kb = triton.cdiv(K, BLOCK_K)
     BLOCK_N = 16
+    if _ROWS_TUNE:  # offline sweep only
+        BLOCK_K = _ROWS_TUNE.get("BLOCK_K", BLOCK_K)
+        BLOCK_N = _ROWS_TUNE.get("BLOCK_N", BLOCK_N)
+    n_kb = triton.cdiv(K, BLOCK_K)
     n_tiles = triton.cdiv(N, BLOCK_N)
-    split_k = max(1, min(1536 // n_tiles, n_kb))
+    split_k = max(1, min(_ROWS_TUNE.get("SPLIT_K", 1536 // n_tiles) if _ROWS_TUNE
+                         else 1536 // n_tiles, n_kb))
     split_k = 1 << (split_k.bit_length() - 1)  # pow2 -> stable reduction order
     kb_per = triton.cdiv(n_kb, split_k)
     compute = out_dtype if out_dtype in _TL_DTYPE else torch.bfloat16
@@ -550,7 +564,7 @@ def _gemv_rows(a: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor
                 0, 0, 1,
                 ROWS=M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
                 scale_ptr=buf if weight_scale is None else weight_scale, DIRECT=True,
-                HAS_SCALE=weight_scale is not None, OUT=_TL_DTYPE[compute], num_warps=1,
+                HAS_SCALE=weight_scale is not None, OUT=_TL_DTYPE[compute], num_warps=_ROWS_WARPS,
                 out_ptr=buf, LORA=2 * nq, HIDDEN=hd, HCN=nk, EPI=4, **act_kw,
             )
         else:
@@ -559,7 +573,7 @@ def _gemv_rows(a: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor
                 a, weight, part, N, K, n_kb, kb_per,
                 a.stride(0), a.stride(1), weight.stride(0), weight.stride(1),
                 part.stride(0), part.stride(1), part.stride(2),
-                ROWS=M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, num_warps=1,
+                ROWS=M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, num_warps=_ROWS_WARPS,
                 scale_ptr=buf if weight_scale is None else weight_scale,
                 HAS_SCALE=weight_scale is not None, OUT=_TL_DTYPE[compute],
                 SPLIT_K=split_k, FIXUP=True, cnt_ptr=_fixup_counter_buf(a.device, n_tiles),
@@ -573,7 +587,7 @@ def _gemv_rows(a: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor
     if split_k > 1 and _ROWS_FIXUP and (kind != "hc_gate_mix" or epilogue[3] % BLOCK_N == 0):
         part = torch.empty((split_k, M, N), dtype=torch.float32, device=a.device)
         common = dict(
-            ROWS=M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, num_warps=1,
+            ROWS=M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, num_warps=_ROWS_WARPS,
             scale_ptr=scale_arg, HAS_SCALE=has_scale, OUT=_TL_DTYPE[compute],
             SPLIT_K=split_k, FIXUP=True, **act_kw,
         )
@@ -628,7 +642,7 @@ def _gemv_rows(a: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor
             a, weight, part, N, K, n_kb, kb_per,
             a.stride(0), a.stride(1), weight.stride(0), weight.stride(1),
             part.stride(0), part.stride(1), part.stride(2),
-            ROWS=M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, num_warps=1, **act_kw,
+            ROWS=M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, num_warps=_ROWS_WARPS, **act_kw,
         )
         kind = epilogue[0]
         if kind == "split":
@@ -673,7 +687,7 @@ def _gemv_rows(a: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor
             0, out.stride(0), out.stride(1),
             ROWS=M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
             scale_ptr=out if weight_scale is None else weight_scale, DIRECT=True,
-            HAS_SCALE=weight_scale is not None, OUT=_TL_DTYPE[compute], num_warps=1, **act_kw,
+            HAS_SCALE=weight_scale is not None, OUT=_TL_DTYPE[compute], num_warps=_ROWS_WARPS, **act_kw,
         )
         return out
     part = torch.empty((split_k, M, N), dtype=torch.float32, device=a.device)
@@ -681,7 +695,7 @@ def _gemv_rows(a: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor
         a, weight, part, N, K, n_kb, kb_per,
         a.stride(0), a.stride(1), weight.stride(0), weight.stride(1),
         part.stride(0), part.stride(1), part.stride(2),
-        ROWS=M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, num_warps=1, **act_kw,
+        ROWS=M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, num_warps=_ROWS_WARPS, **act_kw,
     )
     _splitk_rows_reduce_kernel[(triton.cdiv(N, 256), M)](
         part, part if weight_scale is None else weight_scale, out, N, split_k,
@@ -794,7 +808,7 @@ def rows_gemv_direct_pair(layer_a, x: torch.Tensor, epilogue_a, layer_b, split_b
             0, out.stride(0), out.stride(1),
             ROWS=M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
             scale_ptr=out if scale_a is None else scale_a, DIRECT=True,
-            HAS_SCALE=scale_a is not None, OUT=_TL_DTYPE[compute], num_warps=1, **seg2,
+            HAS_SCALE=scale_a is not None, OUT=_TL_DTYPE[compute], num_warps=_ROWS_WARPS, **seg2,
         )
         return out, (b1, b2 if n2 else None)
     if kind == "qsa_qkv":
@@ -808,7 +822,7 @@ def rows_gemv_direct_pair(layer_a, x: torch.Tensor, epilogue_a, layer_b, split_b
             0, 0, 1,
             ROWS=M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
             scale_ptr=buf if scale_a is None else scale_a, DIRECT=True,
-            HAS_SCALE=scale_a is not None, OUT=_TL_DTYPE[compute], num_warps=1,
+            HAS_SCALE=scale_a is not None, OUT=_TL_DTYPE[compute], num_warps=_ROWS_WARPS,
             out_ptr=buf, LORA=2 * nq, HIDDEN=hd, HCN=nk, EPI=4, **seg2,
         )
         q = buf[: M * nq].view(M, nq)
@@ -850,7 +864,7 @@ def _gemv(a: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
     _gemv_splitk_kernel[(n_tiles, split_k)](
         a, weight, part, N, K, n_kb, kb_per,
         a.stride(0), weight.stride(0), weight.stride(1), part.stride(0), part.stride(1),
-        BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, num_warps=1,
+        BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, num_warps=_ROWS_WARPS,
     )
     out = torch.empty(N, dtype=out_dtype, device=a.device)
     _splitk_reduce_kernel[(triton.cdiv(N, 256),)](

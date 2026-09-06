@@ -14,6 +14,10 @@ from flashlib.kernels.slot_cache import lru_ensure
 _HYBRID_FETCH_BY_RECENCY = (
     os.getenv("FREETOKEN_HYBRID_FETCH", "recency").strip().lower() != "lowest_id"
 )
+# Keep recurring one/two-expert misses from remaining on the CPU indefinitely
+# when the bandwidth-balanced integer fetch count rounds to zero. The ablation
+# restores the original split; explicit fixed caps and NVMe tiers are unaffected.
+_HYBRID_ADMISSION_CREDIT = os.getenv("FREETOKEN_HYBRID_ADMISSION_CREDIT", "1") != "0"
 
 
 def ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
@@ -62,7 +66,10 @@ def ensure_experts_hybrid(
     the CPU). ``fetch_fraction`` > 0 replaces the fixed cap with the bandwidth-matched
     split (fraction = pcie_bw / cpu_bw): fetch ~fraction of the step's misses, rounded to
     the integer that makes the PCIe fetch and the CPU overflow compute finish closest to
-    together. ``num_indices`` = capped fetch count (copy_missing); ``num_missing_full`` =
+    together. In the full-host-residency path, a rounded zero count earns Q16 credit
+    from previously seen misses, eventually admitting one without starving recurring
+    experts. ``FREETOKEN_HYBRID_ADMISSION_CREDIT=0`` disables that exception.
+    ``num_indices`` = capped fetch count (copy_missing); ``num_missing_full`` =
     pre-cap miss count (stats).
 
     ``cpu_ids`` (optional, same shape as ``expert_ids``) receives the CPU side of the
@@ -332,6 +339,7 @@ def _ensure_experts_hybrid_gpu(
         cache.num_indices,
         cache.num_missing_full,
         cache.expert_recency,
+        cache.hybrid_admission_credit,
         cache.stat_missing,
         cache.stat_fetched,
         cache.stat_active,
@@ -351,6 +359,10 @@ def _ensure_experts_hybrid_gpu(
         BLOCK_C=block_c,
         BLOCK_A=block_a,
         BY_RECENCY=_HYBRID_FETCH_BY_RECENCY,
+        ADMISSION_CREDIT=(
+            _HYBRID_ADMISSION_CREDIT and frac_q16 > 0
+            and getattr(cache, "host_slot_for_id", None) is None
+        ),
         EMIT_CPU_IDS=cpu_ids is not None,
         EMIT_CPU_W=cpu_w is not None and weights is not None,
         EMIT_SPLIT=hit_ids is not None,
@@ -401,7 +413,11 @@ def _ensure_experts_hybrid_cpu(
     most-recently-active misses (ties -> lower id); else the lowest ids."""
     seen = []
     for expert in expert_ids.view(-1).tolist():
-        if expert not in seen:
+        # -1 is a DROPPED route (see the GPU kernel's Phase 3). Filtering it here is what keeps
+        # the mirror honest at four sites at once: active_mask, the usage stamps, the miss set
+        # and the host-slot lookup would all index a python list/tensor with -1 and silently
+        # address the LAST expert.
+        if expert >= 0 and expert not in seen:
             seen.append(expert)
 
     cache.active_mask.zero_()
@@ -426,8 +442,10 @@ def _ensure_experts_hybrid_cpu(
         return e if host_row is None else host_row[e]
 
     fetchable = missing if host_row is None else [e for e in missing if host_row[e] >= 0]
-    if _HYBRID_FETCH_BY_RECENCY:
+    admission_credit = _HYBRID_ADMISSION_CREDIT and frac_q16 > 0 and host_row is None
+    if _HYBRID_FETCH_BY_RECENCY or admission_credit:
         rec = cache.expert_recency[layer_id].tolist()
+    if _HYBRID_FETCH_BY_RECENCY:
         fetchable.sort(key=lambda e: (-rec[e], e))
     else:
         fetchable.sort()
@@ -436,6 +454,19 @@ def _ensure_experts_hybrid_cpu(
         lo = (m * frac_q16) >> 16
         cost = lambda f: max(f * (q - frac_q16), (m - f) * frac_q16)  # noqa: E731
         max_fetch = lo if cost(lo) <= cost(lo + 1) else lo + 1
+    if admission_credit:
+        if max_fetch > 0:
+            cache.hybrid_admission_credit[layer_id] = 0
+        else:
+            recurring = [e for e in fetchable if rec[e] >= 0]
+            credit = int(cache.hybrid_admission_credit[layer_id].item()) + len(recurring) * frac_q16
+            if credit >= 1 << 16:
+                # The zero-fetch branch has misses * fraction < 1, so one
+                # admission suffices and the remainder stays in [0, 2**16).
+                max_fetch = 1
+                credit -= 1 << 16
+                fetchable = recurring
+            cache.hybrid_admission_credit[layer_id] = credit
     num_fetch = min(len(fetchable), int(max_fetch))
     cache.num_missing_full.fill_(len(missing))
     cache.num_indices.fill_(num_fetch)
@@ -466,7 +497,7 @@ def _ensure_experts_hybrid_cpu(
         if gpu_hs is not None:
             gpu_hs[idx] = _hslot(expert)  # exclusion list: this slot is under a live gather
 
-    if _HYBRID_FETCH_BY_RECENCY:
+    if _HYBRID_FETCH_BY_RECENCY or admission_credit:
         for expert in seen:
             cache.expert_recency[layer_id, expert] = step
 
@@ -491,7 +522,7 @@ def _ensure_experts_hybrid_cpu(
     fflat = None if fetched_ids is None else fetched_ids.view(-1)
     for i in range(flat.numel()):
         raw = int(flat[i].item())
-        slot = int(cache.slot_for_id[layer_id, raw].item())
+        slot = -1 if raw < 0 else int(cache.slot_for_id[layer_id, raw].item())
         flat[i] = slot
         if cflat is not None:
             cflat[i] = -1 if slot >= 0 else raw
@@ -624,6 +655,7 @@ def _ensure_experts_hybrid_kernel(
     num_indices_ptr,
     num_missing_full_ptr,
     expert_recency_ptr,
+    admission_credit_ptr,
     stat_missing_ptr,
     stat_fetched_ptr,
     stat_active_ptr,
@@ -643,6 +675,7 @@ def _ensure_experts_hybrid_kernel(
     BLOCK_C: tl.constexpr,
     BLOCK_A: tl.constexpr,
     BY_RECENCY: tl.constexpr,
+    ADMISSION_CREDIT: tl.constexpr,
     EMIT_CPU_IDS: tl.constexpr,
     EMIT_CPU_W: tl.constexpr,
     EMIT_SPLIT: tl.constexpr,
@@ -723,6 +756,22 @@ def _ensure_experts_hybrid_kernel(
             (lo + 1) * ((1 << 16) - fetch_frac_q16), (num_fetchable - lo - 1) * fetch_frac_q16
         )
         max_fetch = tl.where(cost_lo <= cost_hi, lo, lo + 1)
+    if BY_RECENCY or ADMISSION_CREDIT:
+        rec = tl.load(expert_recency_ptr + base + off_e, mask=e_mask, other=-1).to(tl.int64)
+    is_candidate = is_fetchable
+    if ADMISSION_CREDIT:
+        if max_fetch > 0:
+            tl.store(admission_credit_ptr + layer_id, 0)
+        else:
+            recurring = is_fetchable & (rec >= 0)
+            credit = tl.load(admission_credit_ptr + layer_id)
+            credit += tl.sum(recurring.to(tl.int32)) * fetch_frac_q16
+            admit = credit >= (1 << 16)
+            max_fetch = tl.where(admit, 1, max_fetch)
+            credit -= tl.where(admit, 1 << 16, 0)
+            tl.store(admission_credit_ptr + layer_id, credit)
+            # New transient misses do not earn credit and cannot consume it.
+            is_candidate = is_fetchable & ((~admit) | recurring)
     num_fetch = tl.minimum(num_fetchable, max_fetch)
     tl.store(num_missing_full_ptr, num_missing.to(tl.int64))
     tl.store(num_indices_ptr, num_fetch.to(tl.int64))
@@ -733,12 +782,11 @@ def _ensure_experts_hybrid_kernel(
     # score so argmax has no ties (rec deltas are multiples of num_experts; the id term
     # spans only [0, num_experts), so it can only break exact-recency ties).
     if BY_RECENCY:
-        rec = tl.load(expert_recency_ptr + base + off_e, mask=e_mask, other=-1).to(tl.int64)
         score = tl.where(
-            is_fetchable, rec * num_experts + (num_experts - 1 - off_e), -1152921504606846976
+            is_candidate, rec * num_experts + (num_experts - 1 - off_e), -1152921504606846976
         ).to(tl.int64)
     else:
-        missing_rank = tl.cumsum(is_fetchable.to(tl.int32)) - 1
+        missing_rank = tl.cumsum(is_candidate.to(tl.int32)) - 1
 
     # ---- Phase 2: evict victims by argmin(usage), only for the capped fetches ----
     fetched_e = tl.zeros((BLOCK_E,), dtype=tl.int1)
@@ -769,7 +817,7 @@ def _ensure_experts_hybrid_kernel(
                 e = tl.argmax(score, axis=0).to(tl.int32)
                 score = tl.where(off_e == e, -1152921504606846976, score)
             else:
-                e = tl.sum(tl.where((missing_rank == i) & is_fetchable, off_e, 0))
+                e = tl.sum(tl.where((missing_rank == i) & is_candidate, off_e, 0))
             tl.store(id_of_slot_ptr + victim, base + e)
             tl.store(slot_for_id_ptr + base + e, victim)
             tl.store(usage_ptr + victim, step)
@@ -791,7 +839,18 @@ def _ensure_experts_hybrid_kernel(
     # ---- Phase 3: rewrite expert_ids -> slot id (hit/fetched) or -1 (overflow -> CPU) ----
     # Phase 2's slot_for_id stores are ordered before this gather by the barrier.
     tl.debug_barrier()
-    s_vec = tl.load(slot_for_id_ptr + base + ids_vec, mask=a_mask, other=-1)
+    # A route may be -1: the residency-routing kernel writes that to DROP a routed expert whose
+    # weights are not in host RAM, and Phase 1 above already leaves such a route inactive (no
+    # `off_e` is negative, so it never matches). The gather must be told, though -- `a_mask` is
+    # about lane occupancy, not about the id -- or `slot_for_id[base - 1]` is read: the previous
+    # layer's last expert, or out of bounds at layer 0. If that slot happened to be >= 0 the
+    # dropped route would silently become a live GEMV against an arbitrary expert.
+    safe_ids = tl.maximum(ids_vec, 0)
+    s_vec = tl.where(
+        ids_vec >= 0,
+        tl.load(slot_for_id_ptr + base + safe_ids, mask=a_mask, other=-1),
+        -1,
+    )
     tl.store(expert_ids_ptr + off_a, s_vec, mask=a_mask)
     if EMIT_CPU_IDS:
         tl.store(cpu_ids_ptr + off_a, tl.where(s_vec >= 0, -1, ids_vec), mask=a_mask)
@@ -844,8 +903,8 @@ def _ensure_experts_hybrid_kernel(
         tl.store(stat_steps_layer_ptr + layer_id, tl.load(stat_steps_layer_ptr + layer_id) + 1)
 
     # Bump every active expert's recency to this step (LRU on the expert): an overflow miss
-    # computed on the CPU now ranks high if it recurs, so it gets fetched next time.
-    if BY_RECENCY:
+    # computed on the CPU ranks high on recurrence and can earn admission credit.
+    if BY_RECENCY or ADMISSION_CREDIT:
         step_vec = tl.zeros((BLOCK_E,), dtype=tl.int64) + step
         tl.store(expert_recency_ptr + base + off_e, step_vec, mask=is_active & e_mask)
 

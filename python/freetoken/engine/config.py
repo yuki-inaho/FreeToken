@@ -131,6 +131,23 @@ class EngineConfig:
     # expert that is not in host RAM with the best near-tied one that is, when the swap
     # displaces <= TAU of the token's routed weight. 0 disables. Changes model outputs.
     moe_residency_routing: float = 0.0
+    # How many of a row's missing experts one layer may substitute (1 = the shipped v1
+    # behaviour). A read is charged per DISTINCT expert per (layer, step), so a row that keeps
+    # one of its two misses still pays for it; raising this is what turns a high substitution
+    # COVERAGE into fewer reads. Every swap is still gated on tau individually.
+    moe_residency_routing_max_subs: int = 1
+    # Bound on the SUM of one row's displacements (0 = same as tau), so raising max_subs does
+    # not raise the per-token perturbation budget.
+    moe_residency_routing_total: float = 0.0
+    # The measured policy (``ft moe subst``): "auto" looks for the table beside the FTW corpus
+    # and in the cache dir, "off" disables it, anything else is an explicit path. With a table
+    # AND a non-zero eps the engine drops host-missing experts, gated on the fraction of the MoE
+    # block output the drop moves -- the quantity that actually bounds the damage, rather than
+    # the displaced routing weight the tau gate uses.
+    moe_residency_routing_table: str = "auto"
+    moe_residency_routing_eps: float = 0.0
+    moe_residency_routing_eps_total: float = 0.0
+    moe_residency_routing_drop_renorm: bool = False
     kv_cache_dtype: str = "auto"
     kv_dtype: torch.dtype | None = None
     # Resident dense-linear weight format (--dense-quant): "auto" | "bf16" keep the checkpoint's

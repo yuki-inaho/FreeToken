@@ -201,7 +201,19 @@ class OffloadMoeCache:
         # --moe-residency-routing: max routing weight one substitution may displace. 0 = off.
         # Only ever consulted when host_tier is set (see OffloadMoELayer._maybe_residency_route).
         self.residency_route_tau = 0.0
-        self.residency_route_stats = None  # [2] int64: substitutions, host-missing routes
+        self.residency_route_max_subs = 1
+        self.residency_route_total = 0.0
+        # The measured policy (ft moe subst): per-expert output norms [L, E] on device, the
+        # per-layer ||y||-estimator calibration as a python list, and the perturbation budget.
+        # With a norm table and eps > 0 the layer DROPS host-missing experts instead of
+        # substituting them; see kernel/triton/moe_residency_route.py.
+        self.residency_route_norm = None
+        self.residency_route_ycal = None
+        self.residency_route_eps = 0.0
+        self.residency_route_eps_total = 0.0
+        self.residency_route_drop_renorm = False
+        # [4] int64: substitutions, host-missing routes, rows substituted, rows that hit the cap
+        self.residency_route_stats = None
         # tier3.PrefillStager: prefill needs a full [num_experts, ...] layer at expert-id
         # positions, which a host_slots-wide pool cannot provide; the stager assembles one.
         self._tier3_stager = None
@@ -285,6 +297,12 @@ class OffloadMoeCache:
         # fetch (most-recently active first) and bumps it for every active expert.
         self.expert_recency = torch.full(
             (self.num_layers, self.num_experts), -1, dtype=torch.int64, device=self.device
+        )
+        # Q16 admission credit for recurring misses that the balanced hybrid split
+        # otherwise rounds down to zero forever. One independently bounded credit
+        # per layer; hit-only visits pause it and statistics resets preserve it.
+        self.hybrid_admission_credit = torch.zeros(
+            (self.num_layers,), dtype=torch.int32, device=self.device
         )
         # Host source banks (one [num_experts, ...] tensor per layer, so layers can
         # carry independent host attributes -- see layer_residency) and their GPU
@@ -617,6 +635,7 @@ class OffloadMoeCache:
         self.num_indices.zero_()
         self.num_missing_full.zero_()
         self.expert_recency.fill_(-1)
+        self.hybrid_admission_credit.zero_()
         self.stat_missing.zero_()
         self.stat_active.zero_()
         self.stat_calls.zero_()
@@ -1213,6 +1232,7 @@ class OffloadMoeCache:
         # Per-expert recency is not cache_size-shaped, so reset_cache leaves it alone; wipe
         # it here so a new sequence starts with cold hybrid fetch priorities.
         self.expert_recency.fill_(-1)
+        self.hybrid_admission_credit.zero_()
         if self.num_indices2 is not None:
             self.num_indices2.zero_()
 
