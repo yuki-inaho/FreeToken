@@ -49,6 +49,23 @@ uv venv && source .venv/bin/activate
 uv pip install -e ".[accel]"
 ```
 
+### One-shot deploy: RTX 5090 + 128 GB RAM
+
+On a fresh Linux box with an RTX 5090 (32 GB) and 128 GB of RAM, this builds FreeToken from
+this tree, downloads Qwen3.8-Flash-Next-NVFP4 (~126 GB) and serves it fully resident
+(256K context, MTP speculation):
+
+```bash
+git clone https://github.com/pentaCoxian/FreeToken.git && cd FreeToken
+./scripts/deploy-rtx5090-128g.sh --install-driver   # reboot if it installs a driver, then re-run
+./scripts/serve-interactive.sh --profile 1          # OpenAI API on http://127.0.0.1:1919/v1
+```
+
+Fully resident peaks at 119 GiB of host RAM. Add `--ple-nvme` to keep the 47.7 GiB PLE n-gram
+table on NVMe behind a 2 GiB row cache instead (73 GiB peak; decode ~7% slower, +0.7 s to first token on a 1K prompt; serve with
+`--profile 5`), or `--ple-nvme=/nvme/dir` to move the PLE files onto a faster drive first.
+`--service` also installs a systemd user service; `--help` lists every option.
+
 For More details:
 
 - [Install FreeToken](https://github.com/FlashML-org/FreeToken/blob/main/docs/install.md)

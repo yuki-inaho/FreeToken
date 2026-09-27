@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-readonly OPEN_WEBUI_HOME="${OPEN_WEBUI_HOME:-/home/nuko/.open-webui}"
+readonly OPEN_WEBUI_HOME="${OPEN_WEBUI_HOME:-$HOME/.open-webui}"
 readonly OPEN_WEBUI_VENV="${OPEN_WEBUI_VENV:-$OPEN_WEBUI_HOME/venv}"
 readonly OPEN_WEBUI_BIN="$OPEN_WEBUI_VENV/bin/open-webui"
 readonly OPEN_WEBUI_DATA_DIR="${OPEN_WEBUI_DATA_DIR:-$OPEN_WEBUI_HOME/data}"

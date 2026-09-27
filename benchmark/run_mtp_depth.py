@@ -112,7 +112,7 @@ def main():
     parser.add_argument("--port", type=int, default=1930)
     parser.add_argument("--quality-arms", default="", help="Comma-separated arms to run historical gates on")
     parser.add_argument("--quality-only", action="store_true")
-    parser.add_argument("--model-path", default="/media/nuko/New Volume/Qwen3.8-Flash-Next-NVFP4")
+    parser.add_argument("--model-path", default=os.path.expanduser("~/.freetoken/models/Qwen3.8-Flash-Next-NVFP4"))
     args = parser.parse_args()
     arms = args.arms.split(",")
     quality = set(filter(None, args.quality_arms.split(",")))

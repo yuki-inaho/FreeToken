@@ -41,7 +41,7 @@ What to expect (Linux, tables on their own NVMe, 64 readers):
   bottleneck; ``mmap`` is the default for a reason, but pread keeps the page tables small.
 - NTFS (native Windows, or /mnt/<drive> 9p/drvfs under WSL2) is an order of magnitude slower on
   both shapes; ext4/xfs on the same drive is what the serving box should use
-  (``FREETOKEN_ENGRAM_DIR``, see docs/models.md and LOCAL_SETUP.md).
+  (``FREETOKEN_ENGRAM_DIR``, see docs/models.md).
 
 How the numbers feed the Engram decisions in the plan:
 

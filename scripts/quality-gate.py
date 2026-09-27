@@ -1,6 +1,6 @@
 """GSM8K-150 (8-shot CoT, greedy) and MMLU-chat (N/subject) against a running server.
 
-Replicates the methodology BENCH.md records for the project's quality gates. It is NOT lm_eval,
+Replicates the project's quality-gate methodology. It is NOT lm_eval,
 so absolute scores need not match the recorded 88.67 / 87.37 exactly -- what it is for is the
 A/B: the identical harness against two server configurations, where the DELTA is the signal.
 Reads the HF dataset cache directly (pyarrow), so it needs no network and no `datasets`.

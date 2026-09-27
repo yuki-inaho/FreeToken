@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-readonly FT_VENV="${FREETOKEN_VENV:-/home/nuko/.freetoken/venv}"
+readonly FT_VENV="${FREETOKEN_VENV:-${FREETOKEN_HOME:-$HOME/.freetoken}/venv}"
 readonly PYTHON="${FREETOKEN_PYTHON:-$FT_VENV/bin/python}"
 readonly API_BASE="${FREETOKEN_API_BASE:-http://127.0.0.1:1919/v1}"
 readonly MODEL_NAME="${FREETOKEN_MODEL_NAME:-Qwen3.8-Flash-Next-NVFP4}"

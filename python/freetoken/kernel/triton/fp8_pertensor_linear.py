@@ -499,7 +499,7 @@ def _fixup_counter_buf(device: torch.device, n: int) -> torch.Tensor:
     return st[0][st[1]]
 
 
-# Offline tuning seam (see docs/decode-megakernel-evaluation.md). Empty in production: the
+# Offline tuning seam. Empty in production: the
 # heuristics below decide, and the only hot-path cost is one truthiness test on an empty dict
 # plus a module-global read for num_warps. A shape sweep sets BLOCK_N / BLOCK_K / SPLIT_K here
 # and _ROWS_WARPS below, so candidates run through this exact wrapper -- including every fused

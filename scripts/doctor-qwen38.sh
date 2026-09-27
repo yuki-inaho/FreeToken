@@ -2,9 +2,9 @@
 
 set -euo pipefail
 
-readonly FT_VENV="${FREETOKEN_VENV:-/home/nuko/.freetoken/venv}"
+readonly FT_VENV="${FREETOKEN_VENV:-${FREETOKEN_HOME:-$HOME/.freetoken}/venv}"
 readonly PYTHON="$FT_VENV/bin/python"
-readonly MODEL_PATH="${FREETOKEN_MODEL_PATH:-/media/nuko/New Volume/Qwen3.8-Flash-Next-NVFP4}"
+readonly MODEL_PATH="${FREETOKEN_MODEL_PATH:-${FREETOKEN_HOME:-$HOME/.freetoken}/models/Qwen3.8-Flash-Next-NVFP4}"
 readonly CUDA_HOME_DEFAULT="$FT_VENV/lib/python3.12/site-packages/nvidia/cu13"
 
 failed=0

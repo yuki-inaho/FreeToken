@@ -19,7 +19,7 @@ Timing conventions (documented in the report): TTFT and decode wall are measured
 client-side with a monotonic clock from the SSE stream; sustained decode tok/s =
 (completion_tokens - 1) / (t_last_token - t_first_token); the engine additionally reports
 in-engine prefill/decode wall time and speculative draft/accept counters in
-``usage.freetoken`` (added for this benchmark; see BENCH.md).
+``usage.freetoken`` (added for this benchmark).
 """
 
 from __future__ import annotations
@@ -634,7 +634,7 @@ def main() -> None:
     ap.add_argument("--base", default=DEFAULT_BASE)
     ap.add_argument("--model", default="auto")
     ap.add_argument("--model-path", default=os.environ.get(
-        "FREETOKEN_MODEL_PATH", "/media/nuko/New Volume/Qwen3.8-Flash-Next-NVFP4"))
+        "FREETOKEN_MODEL_PATH", os.path.expanduser("~/.freetoken/models/Qwen3.8-Flash-Next-NVFP4")))
     ap.add_argument("--out", required=True)
     ap.add_argument("--variant", default="custom",
                     help="configuration label baked into record keys (custom / mtp_on / "

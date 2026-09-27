@@ -2,9 +2,9 @@
 
 set -euo pipefail
 
-readonly FT_VENV="${FREETOKEN_VENV:-/home/nuko/.freetoken/venv}"
+readonly FT_VENV="${FREETOKEN_VENV:-${FREETOKEN_HOME:-$HOME/.freetoken}/venv}"
 readonly FT_BIN="${FREETOKEN_FT_BIN:-$FT_VENV/bin/ft}"
-readonly MODEL_PATH="${FREETOKEN_MODEL_PATH:-/media/nuko/New Volume/Qwen3.8-Flash-Next-NVFP4}"
+readonly MODEL_PATH="${FREETOKEN_MODEL_PATH:-${FREETOKEN_HOME:-$HOME/.freetoken}/models/Qwen3.8-Flash-Next-NVFP4}"
 readonly SERVER_HOST="${FREETOKEN_HOST:-127.0.0.1}"
 readonly SERVER_PORT="${FREETOKEN_PORT:-1919}"
 
@@ -90,8 +90,7 @@ args=(
   --gpu-reserve-mb "${FREETOKEN_GPU_RESERVE_MB:-0}"
   --linear-state-cache "${FREETOKEN_LINEAR_STATE_CACHE:-1}"
   # KV storage dtype: 'fp8' stores the QSA layers' K/V as e4m3 codes with a
-  # per-(token, head) scale; verification and quality gates in LOCAL_SETUP.md
-  # ("Context length").
+  # per-(token, head) scale.
   --kv-cache-dtype "${FREETOKEN_KV_CACHE_DTYPE:-fp8}"
   # Resident dense linears (GDN/attention/HC mixes/shared expert/lm_head) are bf16 in the
   # checkpoint: ~11.5 GB of weight reads per verify step, the 1.27 GB lm_head three times

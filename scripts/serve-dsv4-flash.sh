@@ -9,8 +9,7 @@
 # ~28% of each step's misses fetched over PCIe while the CPU computes the rest. Measured
 # warm decode: ~31 tok/s (code 32-33, Japanese 35), TTFT ~2.6 s on short prompts (prefill
 # streams every expert once), ~1,900 tok/s prefill at 8K; the hit rate is ~flat in cache
-# size (load-balanced routing), so ~31 tok/s is this card's ceiling. Details and the
-# DSpark measurements live in LOCAL_SETUP.md ("DeepSeek-V4-Flash-0731").
+# size (load-balanced routing), so ~31 tok/s is this card's ceiling.
 #
 # Download (167 GB; keep the inference/ and encoding/ subdirs, FreeToken reads both):
 #   hf download deepseek-ai/DeepSeek-V4-Flash-0731 \
@@ -18,9 +17,9 @@
 
 set -euo pipefail
 
-readonly FT_VENV="${FREETOKEN_VENV:-/home/nuko/.freetoken/venv}"
+readonly FT_VENV="${FREETOKEN_VENV:-${FREETOKEN_HOME:-$HOME/.freetoken}/venv}"
 readonly FT_BIN="${FREETOKEN_FT_BIN:-$FT_VENV/bin/ft}"
-readonly MODEL_PATH="${FREETOKEN_MODEL_PATH:-/media/nuko/New Volume/DeepSeek-V4-Flash-0731}"
+readonly MODEL_PATH="${FREETOKEN_MODEL_PATH:-${FREETOKEN_HOME:-$HOME/.freetoken}/models/DeepSeek-V4-Flash-0731}"
 readonly SERVER_HOST="${FREETOKEN_HOST:-127.0.0.1}"
 readonly SERVER_PORT="${FREETOKEN_PORT:-1919}"
 

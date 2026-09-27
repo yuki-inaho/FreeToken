@@ -6,7 +6,7 @@
 # host residency (352 of 512 experts per layer instead of 458), which residency-aware routing
 # then buys back: measured at 90K, +22 to +39 % decode (bench 58.1 -> 72.8, english 59.7 ->
 # 72.8, code 56.5 -> 75.0, japanese 49.6 -> 69.0 tok/s) with GSM8K-150 (8-shot CoT, greedy,
-# lm_eval) at 92.0 % strict / 93.3 % flexible against the 88.67 % BENCH.md record.
+# lm_eval) at 92.0 % strict / 93.3 % flexible against the 88.67 % baseline record.
 #
 # The alternate 64 GB-of-RAM shape: FREETOKEN_TIER3_HOST_SLOTS=458 FREETOKEN_MOE_RESIDENCY_ROUTING=0
 #
@@ -24,14 +24,14 @@
 # launcher below fails at startup if it does not.
 set -euo pipefail
 
-readonly FT_VENV="${FREETOKEN_VENV:-/home/nuko/.freetoken/venv}"
+readonly FT_VENV="${FREETOKEN_VENV:-${FREETOKEN_HOME:-$HOME/.freetoken}/venv}"
 readonly FT_BIN="${FREETOKEN_FT_BIN:-$FT_VENV/bin/ft}"
-readonly MODEL_PATH="${FREETOKEN_MODEL_PATH:-/media/nuko/New Volume/Qwen3.8-Flash-Next-NVFP4}"
+readonly MODEL_PATH="${FREETOKEN_MODEL_PATH:-${FREETOKEN_HOME:-$HOME/.freetoken}/models/Qwen3.8-Flash-Next-NVFP4}"
 # The corpus is served from ext4 (/mnt/ftw) when that copy exists: same drive, same ~5.7 GB/s at
-# QD>=4, but +17 % at QD1 -- and a decode-time miss is a QD1 read. The ntfs3 copy under the
-# checkpoint volume is the fallback.
+# QD>=4, but +17 % at QD1 -- and a decode-time miss is a QD1 read. The NTFS copy (linked by
+# scripts/setup-local.sh) is the fallback.
 ftw_default="/mnt/ftw/Qwen3.8-Flash-Next-FTW"
-[[ -f "$ftw_default/freetoken_weight.json" ]] || ftw_default="/media/nuko/New Volume/Qwen3.8-Flash-Next-FTW"
+[[ -f "$ftw_default/freetoken_weight.json" ]] || ftw_default="${FREETOKEN_HOME:-$HOME/.freetoken}/models/Qwen3.8-Flash-Next-FTW"
 readonly FTW_PATH="${FREETOKEN_TIER3_FTW:-$ftw_default}"
 
 [[ -d "$FTW_PATH" ]] || { echo "no FTW corpus at $FTW_PATH -- run ft checkpoint first" >&2; exit 1; }
@@ -120,7 +120,7 @@ args=(
   #
   # 8192 by default: under a real FREETOKEN_GPU_MEM_CAP_MB=16384 it completes a 250K prompt
   # (the 16.2 GiB figure is the caching allocator's high-water mark on a roomy card) while
-  # 32768 OOMs on a 90K one -- see PLAN-long-context.md 2e. --gpu-reserve-mb does NOT catch
+  # 32768 OOMs on a 90K one. --gpu-reserve-mb does NOT catch
   # this: it constrains the pool solver, not transient prefill activations, so a run on a 32 GiB
   # card proves nothing here. Raise it deliberately when you have the headroom: at 90K it bought
   # TTFT 42.1 -> 29.0 s.
@@ -160,8 +160,7 @@ args=(
   #   max-subs 4    bench 90.5  english 84.3  code 98.4  japanese 84.4   reads/step ~5
   #
   # GSM8K-150 (8-shot CoT, greedy) and MMLU-chat 570q are IDENTICAL on all three arms
-  # (147/150 and 504/570) -- see PLAN-residency-routing.md, including what that does and does
-  # not prove. 1 restores the one-substitution behaviour; 0 substitutions is
+  # (147/150 and 504/570); that is a quality gate, not a proof of equivalence. 1 restores the one-substitution behaviour; 0 substitutions is
   # FREETOKEN_MOE_RESIDENCY_ROUTING=0, which is the unmodified model.
   --moe-residency-routing-max-subs "${FREETOKEN_MOE_RESIDENCY_MAX_SUBS:-4}"
   # The MEASURED policy, which replaces the substitution above when it is switched on.
@@ -173,7 +172,7 @@ args=(
   # A dropped route also costs nothing at all: no NVMe read, no PCIe gather, no GEMV.
   # Build the table once:
   #   ft moe subst --model "$MODEL_PATH" --dumps <route dumps> --out "$FTW_PATH/expert_subst.safetensors"
-  # eps 0 keeps the substitution policy; raise it to switch over (see PLAN-residency-routing.md).
+  # eps 0 keeps the substitution policy; raise it to switch over.
   --moe-residency-routing-table "${FREETOKEN_MOE_SUBST_TABLE:-auto}"
   --moe-residency-routing-eps "${FREETOKEN_MOE_RESIDENCY_EPS:-0}"
   --expert-load auto

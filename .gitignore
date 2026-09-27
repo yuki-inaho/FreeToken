@@ -227,3 +227,9 @@ benchmarks/cross_framework
 
 # local e2e/bench artifacts (harnesses may run with repo cwd)
 /results/
+
+# Local checkouts and scratch data that are not part of this repo
+deep-swe/
+
+# Local archive of working notes and raw benchmark data (not part of the repo)
+_archive/

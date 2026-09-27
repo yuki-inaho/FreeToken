@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Pick a Qwen3.8-Flash-Next serving profile interactively, from what this machine actually has.
 #
-# The profiles below are measured, not guessed -- see python/freetoken/tier3/FINDINGS.md and the
-# two PLAN-*.md files beside it. Anything that trades quality for speed says so before it runs.
+# The profiles below are measured, not guessed -- see python/freetoken/tier3/FINDINGS.md.
+# Anything that trades quality for speed says so before it runs.
 #
 #   scripts/serve-interactive.sh              # ask
 #   scripts/serve-interactive.sh --profile 2  # skip the questions (scriptable)
@@ -38,6 +38,8 @@ p1_desc="Resident       32 GB VRAM, 111 GiB RAM. Everything in memory, 256K ctx,
 p2_desc="16 GB / 48 GB  NVMe tier, 256K ctx, residency routing ON (DEFAULT). ~73 tok/s varied."
 p3_desc="16 GB / 64 GB  NVMe tier, 256K ctx, routing OFF. More RAM, exact routing, ~91 tok/s."
 p4_desc="16 GB / 48 GB  as (2) but routing OFF -- the honest-numerics low-RAM option, ~58 tok/s."
+p5_desc="PLE on NVMe    32 GB VRAM, 73 GiB RAM peak (vs 119 for 1). As (1), but the 47.7 GiB PLE
+                 table is read from NVMe through a 2 GiB row cache: decode ~7% slower than (1)."
 
 if [ -z "$PROFILE" ]; then
   echo "Profiles:"
@@ -45,11 +47,15 @@ if [ -z "$PROFILE" ]; then
   echo "  2) $p2_desc"
   echo "  3) $p3_desc"
   echo "  4) $p4_desc"
+  echo "  5) $p5_desc"
   echo
   suggest=3
-  [ "$vram_mib" -ge 30000 ] && [ "$ram_gib" -ge 120 ] && suggest=1
+  # (1) peaks at 119 GiB of host RAM (measured under a cgroup cap), which a 128 GB box can hold
+  # only with nothing else running; below ~150 GiB the PLE-on-NVMe profile is the safer pick.
+  [ "$vram_mib" -ge 30000 ] && [ "$ram_gib" -ge 80 ] && suggest=5
+  [ "$vram_mib" -ge 30000 ] && [ "$ram_gib" -ge 150 ] && suggest=1
   [ "$vram_mib" -lt 30000 ] && [ "$ram_gib" -lt 56 ] && suggest=2
-  read -r -p "Profile [1-4] (suggested: $suggest): " PROFILE
+  read -r -p "Profile [1-5] (suggested: $suggest): " PROFILE
   PROFILE="${PROFILE:-$suggest}"
 fi
 
@@ -60,6 +66,10 @@ case "$PROFILE" in
      export FREETOKEN_TIER3_HOST_SLOTS=458 FREETOKEN_MOE_RESIDENCY_ROUTING=0 ;;
   4) script="serve-qwen38-tier3.sh"; needs_ftw=1
      export FREETOKEN_MOE_RESIDENCY_ROUTING=0 ;;
+  # Experts stay resident; only the PLE table moves to disk. The rows are read from the
+  # checkpoint's model-plefp8-*.safetensors (scripts/ple-to-nvme.sh relocates them to NVMe).
+  5) script="serve-qwen38.sh"; needs_ftw=0
+     export FREETOKEN_TIER3_PLE_GB="${FREETOKEN_TIER3_PLE_GB:-2}" ;;
   *) echo "no such profile: $PROFILE" >&2; exit 2 ;;
 esac
 
@@ -137,6 +147,6 @@ fi
 
 echo
 echo "Launching profile $PROFILE: $script"
-env | grep -E "^FREETOKEN_(TIER3_HOST_SLOTS|MOE_RESIDENCY_ROUTING|KV_CACHE_DTYPE|GPU_RESERVE_MB|GPU_MEM_CAP_MB)=" | sort | sed 's/^/  /' || true
+env | grep -E "^FREETOKEN_(TIER3_HOST_SLOTS|TIER3_PLE_GB|MOE_RESIDENCY_ROUTING|KV_CACHE_DTYPE|GPU_RESERVE_MB|GPU_MEM_CAP_MB)=" | sort | sed 's/^/  /' || true
 if [ "$DRY" = 1 ]; then echo "  (dry run) exec $REPO/scripts/$script"; exit 0; fi
 exec "$REPO/scripts/$script"

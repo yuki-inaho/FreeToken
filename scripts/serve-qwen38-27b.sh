@@ -7,9 +7,9 @@
 
 set -euo pipefail
 
-readonly FT_VENV="${FREETOKEN_VENV:-/home/nuko/.freetoken/venv}"
+readonly FT_VENV="${FREETOKEN_VENV:-${FREETOKEN_HOME:-$HOME/.freetoken}/venv}"
 readonly FT_BIN="${FREETOKEN_FT_BIN:-$FT_VENV/bin/ft}"
-readonly MODEL_PATH="${FREETOKEN_MODEL_PATH:-/media/nuko/New Volume/Qwen3.8-27B-Uncensored-NVFP4}"
+readonly MODEL_PATH="${FREETOKEN_MODEL_PATH:-${FREETOKEN_HOME:-$HOME/.freetoken}/models/Qwen3.8-27B-Uncensored-NVFP4}"
 readonly SERVER_HOST="${FREETOKEN_HOST:-127.0.0.1}"
 readonly SERVER_PORT="${FREETOKEN_PORT:-1919}"
 

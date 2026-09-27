@@ -2,7 +2,7 @@
 """Settle the Qwen3.8-Flash-Next MTP head's stream wiring against the real checkpoint.
 
 Inputs: the checkpoint and a pre-mixer residual dump captured by serving one natural-text
-prompt with ``FREETOKEN_MTP_DEBUG_DUMP=<dir>`` (see LOCAL_SETUP.md). The prompt must stay
+prompt with ``FREETOKEN_MTP_DEBUG_DUMP=<dir>``. The prompt must stay
 under ~2,000 tokens so QSA equals dense attention and the whole prefill lands in one chunk.
 
 For every candidate wiring (x position offset) the head runs teacher-forced over the prompt:
