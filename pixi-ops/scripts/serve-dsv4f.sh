@@ -7,7 +7,18 @@ set -euo pipefail
 
 : "${CONDA_PREFIX:?pixi 環境で実行してください: pixi run serve}"
 FT_BIN="${FREETOKEN_FT_BIN:-$CONDA_PREFIX/bin/ft}"
-MODEL_PATH="${FREETOKEN_MODEL_PATH:-${FREETOKEN_MODELS:-$HOME/Desktop/ft-models}/DeepSeek-V4-Flash-0731}"
+MODELS_DIR="${FREETOKEN_MODELS:-$HOME/Desktop/ft-models}"
+# 既定モデル: REAP(プルーニング)版を優先。フル V4-Flash-0731 は cgroup 139.4GiB では
+# 常駐バンク(133.2GiB)+諸経費が収まらず起動できないため (fault: 40/43層で停止)。
+if [ -z "${FREETOKEN_MODEL_PATH:-}" ]; then
+  for cand in "DeepSeek-V4-Flash-REAP-145B" "DeepSeek-V4-Flash-0731"; do
+    if [ -f "$MODELS_DIR/$cand/inference/config.json" ]; then
+      FREETOKEN_MODEL_PATH="$MODELS_DIR/$cand"
+      break
+    fi
+  done
+fi
+MODEL_PATH="${FREETOKEN_MODEL_PATH:-$MODELS_DIR/DeepSeek-V4-Flash-REAP-145B}"
 SERVER_HOST="${FREETOKEN_HOST:-127.0.0.1}"
 SERVER_PORT="${FREETOKEN_PORT:-1919}"
 
