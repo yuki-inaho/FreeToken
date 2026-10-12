@@ -25,13 +25,38 @@ from .utils import (
 
 BuildFn = Callable[[pathlib.Path], object]
 
+
+def _fast_index_copy_size_compilable(feature_size: int) -> bool:
+    """Whether fast_index_copy can actually be compiled for this bank-row size.
+
+    load_vec/store_vec in csrc/jit/fast_index_copy.cuh assert
+    ``kWorkersFeatures % (package_bytes * worker_threads) == 0``, and the default
+    worker args for a size are derived in kernel/fast_index_copy.py. A few bank
+    row sizes violate that invariant (the NVFP4 scale rows 240/400 of
+    RadixArk/Qwen3.8-Flash-Next-NVFP4 among them): JIT would hit the exact same
+    static_assert, so building the AOT spec for them only breaks the whole
+    kernel-cache build. Drop exactly those sizes instead; every size the check
+    accepts still ships prebuilt SASS.
+    """
+    from .fast_index_copy import default_worker_args
+
+    worker_threads, worker_feature_size, _ = default_worker_args(feature_size)
+    if feature_size % worker_feature_size != 0:
+        return False
+    return worker_feature_size % (16 * worker_threads) == 0
+
+
 # Shape coverage is generated from the explicit per-model support table in
 # kernel/aot_models.py; add new models/formats there, not here.
 DEFAULT_STORE_ELEMENT_SIZES = aggregate_store_element_sizes()
 DEFAULT_INDEX_VARIANTS = aggregate_index_variants()
 # Closed, model-independent set: max_k = next_pow2(top_k) capped at
 # ENSURE_MAX_K_CAP=16, so these four buckets cover any top_k in [1, 16].
-DEFAULT_FAST_INDEX_COPY_FEATURE_SIZES = aggregate_fast_index_copy_feature_sizes()
+DEFAULT_FAST_INDEX_COPY_FEATURE_SIZES = tuple(
+    size
+    for size in aggregate_fast_index_copy_feature_sizes()
+    if _fast_index_copy_size_compilable(size)
+)
 
 
 @dataclass(frozen=True)
