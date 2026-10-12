@@ -1,0 +1,37 @@
+[workspace]
+channels = ["conda-forge"]
+name = "ft-pixi"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+# 使い方: このディレクトリで `pixi run <task>`
+# パスはすべて環境変数で上書き可能 (FREETOKEN_DIR / FREETOKEN_MODELS / FREETOKEN_FT_BIN など)。
+
+[tasks]
+# --- 環境チェック ---
+doctor = { cmd = "bash scripts/doctor.sh", description = "GPU/ドライバ/CUDA/Python/torch/モデル/ディスクの健全性チェック" }
+deps = { cmd = "pip install \"torch==2.11.0\" \"setuptools>=77\" wheel \"apache-tvm-ffi==0.1.13.post3\" huggingface_hub", description = "ビルド/実行の基本 Python 依存をインストール" }
+
+# --- ビルド & 配布 ---
+build-wheels = { cmd = "bash scripts/build-wheels.sh", description = "FreeToken + kernel-cache wheel を複数アーキ(8.0/8.6/8.9/9.0/10.0/12.0)でビルド → dist/" }
+install-wheels = { cmd = "bash scripts/install-wheels.sh", description = "dist/ のビルド済み wheel をこの環境へ導入 (accel 依存込み)" }
+release = { cmd = "bash scripts/release.sh", description = "dist/ の wheel を GitHub Releases に公開" }
+install-from-release = { cmd = "bash scripts/install-from-release.sh", description = "GitHub Releases から wheel を取得して導入 (他マシン/別環境用)" }
+
+# --- 実行 ---
+serve = { cmd = "bash scripts/serve-dsv4f.sh", description = "DeepSeek-V4-Flash-0731 を配信 (OpenAI API 127.0.0.1:1919)" }
+guard = { cmd = "bash scripts/mem-guard.sh", description = "cgroup メモリ監視 + page cache 追い出し + 緊急停止 (serve が自動起動)" }
+evict = { cmd = "python scripts/evict-cache.py \"${FREETOKEN_MODELS:-$HOME/Desktop/ft-models}\"", description = "モデルファイルの page cache を手動で追い出す" }
+serve-dsv41 = { cmd = "bash scripts/serve-dsv41.sh", description = "DeepSeek-V4.1-Flash を配信 (要件未達なら理由を表示して停止)" }
+status = { cmd = "bash scripts/status.sh", description = "サーバー /v1/models と GPU の状態表示" }
+stop = { cmd = "pkill -f 'ft serve' >/dev/null 2>&1 || true; echo stopped", description = "稼働中の ft serve を停止" }
+chat = { cmd = "bash scripts/chat.sh", description = "簡単なチャット疎通 (curl)" }
+bench = { cmd = "python scripts/chat-bench.py", description = "API 経由のデコード tok/s 計測 (FT_BENCH_RUNS / FT_BENCH_TOKENS で調整)" }
+
+[dependencies]
+python = "3.12.*"
+pip = ">=26.2.1,<27"
+cuda-nvcc = "13.3.73.*"
+cuda-cudart-dev = ">=13.3.29,<14"
+cuda-cccl = ">=13.3.3.4.1,<14"
+gxx_linux-64 = "13.*"
