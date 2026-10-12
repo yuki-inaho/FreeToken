@@ -30,14 +30,22 @@ done <<< "$URLS"
 echo "runtime: $FT_URL"
 echo "kernel : $KC_URL"
 
+# jit-cache は flashinfer-python ([accel] が 0.6.x に固定) と一致させる。
+# flashinfer-cubin は PyPI に 0.6.18 が無いため最新 (0.7.1) を使い、実行時は
+# FLASHINFER_DISABLE_VERSION_CHECK=1 でバージョンチェックを無効化する。
 pip install "${FT_URL}[accel]" "$KC_URL" \
-  flashinfer-cubin flashinfer-jit-cache \
+  "flashinfer-jit-cache==0.6.18.post1+cu130" \
   --extra-index-url https://download.pytorch.org/whl/cu130 \
   --extra-index-url https://docs.sglang.io/whl/cu130 \
   --extra-index-url https://flashinfer.ai/whl \
   --extra-index-url https://flashinfer.ai/whl/cu130
 
 python3 - <<'PY'
+import os
+os.environ.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
 import freetoken
 print("freetoken ok:", freetoken.__file__)
 PY
+echo
+echo "起動例 (FLASHINFER_DISABLE_VERSION_CHECK=1 を忘れずに):"
+echo "  FLASHINFER_DISABLE_VERSION_CHECK=1 ft serve --model-path <checkpoint> --moe-backend hybrid --moe-cache-auto"
